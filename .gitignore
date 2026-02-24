@@ -1,0 +1,9 @@
+config/.env
+venv/
+*.pt
+*.db
+*.pkl
+__pycache__/
+*.pyc
+logs/
+.DS_Store
