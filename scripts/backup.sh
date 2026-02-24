@@ -10,7 +10,7 @@ mkdir -p "$BACKUP_DIR"
 echo "$(date '+%Y-%m-%d %H:%M:%S') [BACKUP] Starting daily backup..."
 
 # Backup MEMORY.md
-cp ~/openclaw/MEMORY.md "$BACKUP_DIR/MEMORY.md"
+cp ~/trading-system/openclaw/MEMORY.md "$BACKUP_DIR/MEMORY.md"
 
 # Backup trade database
 if [ -f ~/trading-system/data/trades.db ]; then
@@ -20,6 +20,11 @@ fi
 # Backup candles database
 if [ -f ~/trading-system/data/candles.db ]; then
     cp ~/trading-system/data/candles.db "$BACKUP_DIR/candles.db"
+fi
+
+# Backup marketing metrics
+if [ -f ~/marketing/data/metrics.db ]; then
+    cp ~/marketing/data/metrics.db "$BACKUP_DIR/metrics.db"
 fi
 
 # Keep only last 30 days of backups
