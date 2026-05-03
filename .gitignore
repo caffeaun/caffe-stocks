@@ -1,9 +1,60 @@
+# Secrets
 config/.env
-venv/
-*.pt
-*.db
-*.pkl
+*.env
+.env
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+venv/
+.venv/
+
+# OpenClaw — going away with migration
+openclaw/
+
+# Runtime state (not source)
+backups/
 logs/
+*.log
+.ml-improve.lock
+
+# Data files — transferred separately during migration
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.csv
+*.parquet
+*.h5
+*.pkl
+*.pt
+data/ml-data-requests.txt
+data/training_data*
+
+# Editor / OS
 .DS_Store
+.vscode/
+.idea/
+
+# Claude Code agent state
+.claude/worktrees/
+.claude/settings.local.json
+
+# Extra data/state patterns
+*.npz
+data/sequences_cache_*
+data/ml-data-requests-*.txt
+data/ml-feedback*.json
+data/ml-improvements*.json
+data/backtest_results/
+data/*.bak.*
+data/headlines.json
+data/economic_calendar.json
+data/vix_sentiment.json
+data/latest_signal.json
+data/system-status.json
+data/paper-status.json
+data/portfolio_history.json
+data/debug_*.json
+data/modal_budget.json

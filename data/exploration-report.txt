@@ -1,0 +1,19 @@
+Weekly Data Source Exploration Report
+Date: Sun Apr 26 15:38:20 +07 2026
+
+Checking yfinance health...
+	COM7.BK: 1 rows
+	JMART.BK: 1 rows
+	SAWAD.BK: 1 rows
+	MTC.BK: 1 rows
+	JMT.BK: 1 rows
+	TIDLOR.BK: 1 rows
+	AAPL: 1 rows
+	MSFT: 1 rows
+	GOOG: 1 rows
+
+Checking database freshness...
+350
+
+Checking alternative sources...
+15

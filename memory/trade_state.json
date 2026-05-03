@@ -1,0 +1,13 @@
+{
+  "state": "IDLE",
+  "portfolio_value": 10000.0,
+  "cash": 10000.0,
+  "symbol": null,
+  "signal_id": null,
+  "fill_price": null,
+  "entry_date": null,
+  "stop_loss": null,
+  "target": null,
+  "peak_price": null,
+  "trailing_active": false
+}

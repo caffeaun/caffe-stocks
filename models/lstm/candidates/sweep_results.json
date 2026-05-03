@@ -1,0 +1,259 @@
+{
+  "timestamp": "2026-04-28T19:06:59.652817",
+  "device": "cuda",
+  "n_configs": 20,
+  "n_splits": 7,
+  "best_config": {
+    "hidden_size": 32,
+    "num_layers": 2,
+    "dropout": 0.4,
+    "lr": 0.001,
+    "batch_size": 32
+  },
+  "best_avg_val_loss": 0.4277534573861855,
+  "test_metrics": {
+    "accuracy": 0.5138339920948617,
+    "precision": 0.12060682680151706,
+    "recall": 0.4038950042337002,
+    "precision_at_live": 0.1111111111111111,
+    "n_preds_live": 1953,
+    "tp": 477,
+    "fp": 3478,
+    "fn": 704,
+    "tn": 3943,
+    "positive_rate": 0.13729365170001984
+  },
+  "train_metrics": {
+    "best_val_loss": 0.45853817098190625,
+    "selector_used": "best val_loss=0.4585",
+    "epochs": 21,
+    "hidden_size": 32,
+    "num_layers": 2,
+    "dropout": 0.4,
+    "lr": 0.001,
+    "use_attention": true,
+    "survival_weight": 1.0,
+    "fp_weight": 1.0,
+    "sequence_normalize": false,
+    "mixup_alpha": 0.3,
+    "swa_snapshots": 1,
+    "calibration": {
+      "applied": true,
+      "chosen_threshold_raw": 0.39541942987478135,
+      "b_shift": 0.4150265019351993,
+      "b_shift_raw": 0.4150265019351993,
+      "b_shift_clipped": false,
+      "post_selectivity": 0.029790660225442835,
+      "post_precision": 0.3243243098258972,
+      "post_mean_pnl": NaN,
+      "post_ev": NaN,
+      "temperature": 0.5,
+      "strategy": "precision_targeted",
+      "base_rate_val": 0.15056361258029938,
+      "precision_target": 0.3,
+      "best_val_precision": 0.3243243098258972,
+      "best_threshold_raw": 0.39541942987478135,
+      "best_n_flags": 37,
+      "min_flags": 24,
+      "max_flags": 310,
+      "n_thresholds_scanned": 47,
+      "N_val": 1242
+    },
+    "optimizer": "Adam",
+    "covariate_shift": {
+      "applied": false,
+      "reason": "disabled by flag or non-BCE path"
+    },
+    "dann": {
+      "applied": false,
+      "reason": "not active"
+    },
+    "ss_pretrain": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "supcon_pretrain": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "mean_teacher": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "daily_rank": {
+      "applied": false,
+      "reason": "superseded by window warping (this attempt #334)"
+    },
+    "curriculum": {
+      "applied": false,
+      "reason": "no pnl_train"
+    },
+    "curriculum_epoch_log": [],
+    "gce": {
+      "applied": false,
+      "q": null,
+      "reason": "disabled by flag"
+    },
+    "quantile_aux": {
+      "applied": false,
+      "weight": null,
+      "levels": null,
+      "clip_low": null,
+      "clip_high": null,
+      "reason": "disabled by flag"
+    },
+    "temporal_consist": {
+      "applied": false,
+      "weight": null,
+      "trunc": null,
+      "rampup_epochs": null,
+      "reason": "disabled by flag"
+    },
+    "multifold_select": {
+      "applied": false,
+      "n_folds_requested": 4,
+      "n_folds_used": 0,
+      "min_fold_size": 64,
+      "fold_sizes": [],
+      "n_val_total": 1242,
+      "aggregator": "median",
+      "reason": "val too small for K folds"
+    },
+    "selective_head": {
+      "applied": false,
+      "target_coverage": null,
+      "lambda": null,
+      "alpha": null,
+      "reason": "disabled by flag"
+    },
+    "time_decay": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "recent_finetune": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "irm": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "pnl_smooth_labels": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "sortino_aux": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "r_drop": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "stationarity_mask": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "temperature_scaling": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "manifold_mixup": {
+      "applied": false,
+      "reason": "disabled by flag",
+      "mixup_alpha": 0.3,
+      "manifold_mixup_p": null
+    },
+    "target_aux": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "brier": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "label_cleaning": {
+      "applied": false,
+      "reason": "disabled by flag"
+    },
+    "window_warp": {
+      "applied": true,
+      "reason": "active",
+      "p": 0.5,
+      "window_frac": 0.2,
+      "scale_low": 0.5,
+      "scale_high": 2.0
+    },
+    "grad_noise": {
+      "applied": false,
+      "reason": "disabled by flag",
+      "n_steps_total": 4536,
+      "n_steps_diag_sampled": 0,
+      "avg_grad_norm_first_200": null,
+      "avg_noise_norm_first_200": null,
+      "noise_to_grad_ratio_first_200": null
+    },
+    "loss_mode": "bce_window_warp",
+    "distill_alpha": null,
+    "pnl_loss_scale": null,
+    "pnl_budget_lambda": null,
+    "pnl_target_selectivity": null,
+    "pnl_commission": null,
+    "daily_rank_lambda": null,
+    "daily_rank_margin": null,
+    "daily_rank_min_per_day": null
+  },
+  "top_5": [
+    {
+      "config": {
+        "hidden_size": 32,
+        "num_layers": 2,
+        "dropout": 0.4,
+        "lr": 0.001,
+        "batch_size": 32
+      },
+      "avg_val_loss": 0.4277534573861855
+    },
+    {
+      "config": {
+        "hidden_size": 48,
+        "num_layers": 2,
+        "dropout": 0.3,
+        "lr": 0.001,
+        "batch_size": 64
+      },
+      "avg_val_loss": 0.43030720310871995
+    },
+    {
+      "config": {
+        "hidden_size": 128,
+        "num_layers": 2,
+        "dropout": 0.4,
+        "lr": 0.0003,
+        "batch_size": 64
+      },
+      "avg_val_loss": 0.4309904129816937
+    },
+    {
+      "config": {
+        "hidden_size": 32,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "lr": 0.002,
+        "batch_size": 64
+      },
+      "avg_val_loss": 0.4327478754864247
+    },
+    {
+      "config": {
+        "hidden_size": 128,
+        "num_layers": 2,
+        "dropout": 0.3,
+        "lr": 0.0005,
+        "batch_size": 128
+      },
+      "avg_val_loss": 0.437381690123879
+    }
+  ],
+  "total_time_s": 2212.8
+}

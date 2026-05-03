@@ -1,19 +1,5 @@
 #!/bin/bash
-# SET Market Daily Pipeline
-# Runs at 17:00 ICT (30 min after SET closes)
-
-set -euo pipefail
-set -a && source ~/trading-system/config/.env && set +a
-
-echo "$(date '+%Y-%m-%d %H:%M:%S') [SET] Starting daily pipeline..."
-
-# 1. Scrape closing data from Streaming app
-python ~/trading-system/openclaw/skills/set-trader/scraper.py
-
-# 2. Run feature pipeline
-python ~/trading-system/models/features/pipeline.py
-
-# 3. Generate signals
-python ~/trading-system/openclaw/skills/set-trader/signal.py
-
-echo "$(date '+%Y-%m-%d %H:%M:%S') [SET] Pipeline complete."
+SCRIPTS_DIR="/home/kanoonth-ai/projects/caffe-stocks/scripts"
+/home/kanoonth-ai/shared-venv/bin/python "$SCRIPTS_DIR/fetch_ohlcv.py"
+/home/kanoonth-ai/shared-venv/bin/python "$SCRIPTS_DIR/compute_indicators.py"
+/home/kanoonth-ai/shared-venv/bin/python "$SCRIPTS_DIR/score_signals.py"
