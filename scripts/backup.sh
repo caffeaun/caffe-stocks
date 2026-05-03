@@ -23,8 +23,8 @@ if [ -f ~/projects/caffe-stocks/data/candles.db ]; then
 fi
 
 # Backup marketing metrics
-if [ -f ~/projects/marketing-content/data/metrics.db ]; then
-    cp ~/projects/marketing-content/data/metrics.db "$BACKUP_DIR/metrics.db"
+if [ -f ~/projects/content-calendar/data/metrics.db ]; then
+    cp ~/projects/content-calendar/data/metrics.db "$BACKUP_DIR/metrics.db"
 fi
 
 # Keep only last 30 days of backups
