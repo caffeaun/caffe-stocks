@@ -164,7 +164,7 @@ Output ONLY the 4 sections, no preamble."""
     try:
         env = os.environ.copy()
         env.pop('CLAUDECODE', None)
-        env['PATH'] = f"{HOME}/.local/bin:{HOME}/shared-venv/bin:" + env.get('PATH', '')
+        env['PATH'] = f"{HOME}/.local/bin:{HOME}/projects/caffe-stocks/venv/bin:" + env.get('PATH', '')
         result = subprocess.run(
             [claude_bin, '-p', '--model', 'claude-opus-4-7'],
             input=prompt, capture_output=True, text=True, timeout=60, env=env, cwd=HOME,
@@ -483,7 +483,7 @@ def main():
     parser.add_argument('--trainer-src', required=True)
     parser.add_argument('--candidate-path', required=True)
     parser.add_argument('--candidate-dir', required=True)
-    parser.add_argument('--python-path', default=os.path.expanduser('~/shared-venv/bin/python'))
+    parser.add_argument('--python-path', default=os.path.expanduser('~/projects/caffe-stocks/venv/bin/python'))
     parser.add_argument('--backtest-script', default=os.path.expanduser('~/projects/caffe-stocks/scripts/backtest_lstm.py'))
     parser.add_argument('--feature-eng', default=os.path.expanduser('~/projects/caffe-stocks/models/feature_eng.py'))
     args = parser.parse_args()

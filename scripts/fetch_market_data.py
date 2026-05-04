@@ -8,7 +8,7 @@ Three data sources:
 
 Stores data in candles.db in separate tables, merged by compute_indicators.py.
 
-Run: ~/shared-venv/bin/python ~/projects/caffe-stocks/scripts/fetch_market_data.py [--backfill]
+Run: ~/projects/caffe-stocks/venv/bin/python ~/projects/caffe-stocks/scripts/fetch_market_data.py [--backfill]
 """
 import os
 import sys

@@ -1,4 +1,4 @@
-#!/home/kanoonth-ai/shared-venv/bin/python
+#!/home/kanoonth-ai/projects/caffe-stocks/venv/bin/python
 """Day-by-day paper trading simulation using real candles data."""
 import argparse
 import sqlite3

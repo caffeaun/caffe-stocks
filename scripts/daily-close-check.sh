@@ -14,7 +14,7 @@ source "$HOME/kanoonth/scripts/telegram.conf"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN//\"/}"
 CHAT_ID="${TELEGRAM_CHAT_ID//\"/}"
 
-PYTHON="$HOME/shared-venv/bin/python"
+PYTHON="$HOME/projects/caffe-stocks/venv/bin/python"
 STATE_FILE="$HOME/projects/caffe-stocks/memory/trade_state.json"
 CANDLES_DB="$HOME/projects/caffe-stocks/data/candles.db"
 

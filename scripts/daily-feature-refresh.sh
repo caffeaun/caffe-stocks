@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LOGFILE="$HOME/projects/caffe-stocks/logs/feature-refresh.log"
-PYTHON="$HOME/shared-venv/bin/python"
+PYTHON="$HOME/projects/caffe-stocks/venv/bin/python"
 SCRIPT="$HOME/projects/caffe-stocks/scripts/compute_indicators.py"
 
 # Telegram config

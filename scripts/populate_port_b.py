@@ -1,4 +1,4 @@
-#!/home/kanoonth-ai/shared-venv/bin/python
+#!/home/kanoonth-ai/projects/caffe-stocks/venv/bin/python
 import sqlite3
 import random
 from datetime import datetime, timedelta

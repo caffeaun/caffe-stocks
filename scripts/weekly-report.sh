@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PYTHON="$HOME/shared-venv/bin/python"
+PYTHON="$HOME/projects/caffe-stocks/venv/bin/python"
 TRADE_STATE="$HOME/projects/caffe-stocks/memory/trade_state.json"
 PORTFOLIO_HISTORY="$HOME/projects/caffe-stocks/data/portfolio_history.json"
 SYSTEM_STATUS="$HOME/projects/caffe-stocks/data/system-status.json"

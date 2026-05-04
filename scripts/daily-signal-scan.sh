@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LOGFILE="$HOME/projects/caffe-stocks/logs/signal-scan.log"
-PYTHON="$HOME/shared-venv/bin/python"
+PYTHON="$HOME/projects/caffe-stocks/venv/bin/python"
 SCRIPT="$HOME/projects/caffe-stocks/scripts/signal_generator.py"
 
 # Telegram config

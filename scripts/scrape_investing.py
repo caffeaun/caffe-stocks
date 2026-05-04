@@ -7,7 +7,7 @@ Supplements yfinance (primary) with sentiment/macro data not available there:
 - Economic calendar — upcoming TH/US macro events
 - SET index via yfinance (^SET.BK) — more reliable than Investing.com scraping
 
-Run: ~/shared-venv/bin/python ~/projects/caffe-stocks/scripts/scrape_investing.py
+Run: ~/projects/caffe-stocks/venv/bin/python ~/projects/caffe-stocks/scripts/scrape_investing.py
 """
 import json
 import os

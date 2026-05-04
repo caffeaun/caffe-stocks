@@ -23,7 +23,7 @@ fi
 BASE="$HOME/projects/caffe-stocks"
 LOCKFILE="$BASE/models/.ml-improve.lock"
 LOGFILE="$BASE/logs/ml-improve.log"
-PYTHON="$HOME/shared-venv/bin/python"
+PYTHON="$HOME/projects/caffe-stocks/venv/bin/python"
 CLAUDE_BIN="$HOME/.local/bin/claude"
 CANDIDATE_DIR="$BASE/models/lstm/candidates"
 PROD_MODEL="$BASE/models/lstm/trading_model.h5"
@@ -261,13 +261,13 @@ RECOVERY STRATEGY (in priority order):
    scaler.pkl. Run 'file' on them, try opening with h5py, check size, check
    if it's actually a torch.save zip instead of HDF5.
 3. If model file is corrupt: re-train fresh by running
-   ~/shared-venv/bin/python ~/projects/caffe-stocks/scripts/lstm_trainer.py
+   ~/projects/caffe-stocks/venv/bin/python ~/projects/caffe-stocks/scripts/lstm_trainer.py
    --output-dir ~/projects/caffe-stocks/models/lstm
    This produces a valid baseline. The hyperparameter improvement loop will
    tune from there.
 4. If features mismatch: check feature_eng.py CURATED_FEATURES vs what the
    saved model expects. Either revert features or retrain.
-5. After recovery, verify: ~/shared-venv/bin/python ~/projects/caffe-stocks/scripts/ml_health_check.py
+5. After recovery, verify: ~/projects/caffe-stocks/venv/bin/python ~/projects/caffe-stocks/scripts/ml_health_check.py
    should exit 0.
 6. Save a forensic copy of the corrupt file as
    trading_model.h5.corrupted-\$(date +%Y%m%d) before overwriting it.

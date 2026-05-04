@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Weekly data source exploration — checks health of existing sources and probes new ones.
 
-Run: ~/shared-venv/bin/python ~/projects/caffe-stocks/scripts/explore_data_sources.py
+Run: ~/projects/caffe-stocks/venv/bin/python ~/projects/caffe-stocks/scripts/explore_data_sources.py
 Cron: Sunday 02:00 ICT via OpenClaw (developer agent)
 """
 import json

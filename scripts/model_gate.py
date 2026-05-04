@@ -181,7 +181,7 @@ def run_backtest_with_model(model_h5, scaler_pkl):
         tmp_results = tf.name
 
     try:
-        python = os.path.join(os.path.expanduser('~'), 'shared-venv', 'bin', 'python')
+        python = os.path.join(os.path.expanduser('~'), 'projects', 'caffe-stocks', 'venv', 'bin', 'python')
         result = subprocess.run(
             [python, BACKTEST_SCRIPT,
              '--model', model_h5,

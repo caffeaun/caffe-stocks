@@ -61,7 +61,7 @@ def check_retrain_needed():
 
 
 def trigger_retrain():
-    subprocess.run(['/home/kanoonth-ai/shared-venv/bin/python',
+    subprocess.run(['/home/kanoonth-ai/projects/caffe-stocks/venv/bin/python',
                     '/home/kanoonth-ai/projects/caffe-stocks/scripts/circuit_breaker.py',
                     '--trigger', 'retrain'],
                    check=True)
