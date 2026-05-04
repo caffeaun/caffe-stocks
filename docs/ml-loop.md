@@ -32,10 +32,11 @@ A model-agnostic, self-iterating ML loop that:
 
 **What it owns:** **code changes** — anything HP search can't reach.
 
-- Reads `data/ml-feedback.json` (last K entries, summarized) + the whitepaper + current trainer source
+- Reads recent iteration history from `ml-feedback.db` (SQLite) + the whitepaper + current trainer source
+- Has **WebSearch + WebFetch** allowed — can pull in new ML techniques from arXiv, papers, blog posts, GitHub. Not restricted to the families listed in this doc; if a 2026 paper proposes something better, Claude mode is allowed to bring it in.
 - Calls `claude -p` with a structured prompt asking for ONE specific code change per run
 - Allowed surface area:
-  1. Add new trainer to `models/trainers.py` (e.g., `LSTMTrainer`, `RLTrainer`, ensembles)
+  1. Add new trainer to `models/trainers.py` (any family — listed examples are not exhaustive)
   2. Add/modify search space in `models/search_spaces.py`
   3. Modify `models/feature_eng.py` (add/drop features) — only when train mode hits a feature-shaped wall
   4. Modify `models/labels.py` (label definition, friction model)
@@ -43,7 +44,7 @@ A model-agnostic, self-iterating ML loop that:
   6. Modify `scripts/return_gate.py` gate criteria — only when whitepaper §9 needs to change
   7. Submit a *data request* (text file → Telegram) when no code change can help
 - Output: a candidate `models/{trainer}/candidates/` from the new code, gate-evaluated, feedback entry tagged `mode=claude`
-- Expensive: ~30 min per run (Opus + train + gate)
+- Hard wall-time: **30 min per run** (timeout-killed if exceeded)
 - **Cannot tune HPs.** That's train mode's job.
 
 This boundary is intentional. The LSTM-era loop blurred them — Claude was tuning hyperparameters AND structural changes in the same run, which made it impossible to attribute wins. With the boundary:
@@ -197,58 +198,141 @@ SEARCH_SPACES = {
 
 Train mode samples N configs from these ranges, gates each, picks winners.
 
-## Feedback log schema
+## Feedback store — SQLite
 
-`data/ml-feedback.json` is an append-only list. Schema per entry:
+`data/ml-feedback.db`. JSON couldn't handle concurrent reads/writes once we have train mode running every hour while Claude mode reads it. SQLite gives us proper indexing for "top 3 in last 30 days" queries and append-safety with WAL mode.
 
-```json
-{
-  "id": 336,
-  "timestamp": "2026-05-04T15:30:00",
-  "mode": "claude" | "train",
-  "trainer": "xgboost",
-  "hyperparams": { "max_depth": 6, "learning_rate": 0.05, ... },
-  "code_changes": [
-    "models/trainers.py: added EnsembleTrainer",
-    "models/search_spaces.py: new entry for ensemble"
-  ],
-  "hypothesis": "Ensemble of 3 XGB + 1 LSTM smooths the worst-split variance",
-  "gate_result": {
-    "passed": false,
-    "windows_passed": 1,
-    "windows_total": 7,
-    "avg_annualized_return": -0.04,
-    "avg_win_rate": 0.27,
-    "avg_max_dd": 0.12,
-    "total_trades": 38
-  },
-  "lessons": "Ensemble didn't help — variance shifted but mean unchanged. Single best XGB was actually better. Don't try further ensembles unless we're combining genuinely different model families."
-}
+```sql
+-- One row per gate run, regardless of mode.
+CREATE TABLE iterations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT NOT NULL,                       -- ISO 8601
+    finished_at     TEXT NOT NULL,
+    mode            TEXT NOT NULL CHECK(mode IN ('train', 'claude')),
+    trainer         TEXT NOT NULL,                        -- registry key
+    hyperparams     TEXT NOT NULL,                        -- JSON blob
+    code_changes    TEXT,                                 -- JSON list, claude mode only
+    hypothesis      TEXT,                                 -- claude mode only
+    backbone        TEXT,                                 -- for PEFT trainers
+    git_sha         TEXT,                                 -- exact code revision
+    -- Aggregate gate metrics
+    gate_passed         INTEGER NOT NULL,                  -- 0/1
+    windows_passed      INTEGER NOT NULL,
+    windows_total       INTEGER NOT NULL,
+    avg_annualized_return REAL,
+    avg_win_rate          REAL,
+    avg_max_dd            REAL,
+    total_trades          INTEGER,
+    -- Artifacts + provenance
+    model_dir       TEXT NOT NULL,                        -- candidate dir path
+    elapsed_seconds INTEGER,
+    full_result     TEXT,                                  -- JSON of return_gate output
+    lessons         TEXT                                   -- claude mode only
+);
+
+CREATE INDEX idx_iter_finished        ON iterations(finished_at);
+CREATE INDEX idx_iter_passed_return   ON iterations(gate_passed, avg_annualized_return);
+CREATE INDEX idx_iter_mode_finished   ON iterations(mode, finished_at);
+
+-- Per-window detail for top runs (don't store for losers — keep db small).
+CREATE TABLE iteration_windows (
+    iteration_id  INTEGER NOT NULL REFERENCES iterations(id),
+    window_idx    INTEGER NOT NULL,
+    train_start   TEXT, train_end TEXT,
+    test_start    TEXT, test_end  TEXT,
+    threshold     REAL,
+    n_trades      INTEGER,
+    win_rate      REAL,
+    avg_pnl       REAL,
+    avg_win       REAL,
+    avg_loss      REAL,
+    annualized_return REAL,
+    max_drawdown  REAL,
+    final_equity  REAL,
+    PRIMARY KEY (iteration_id, window_idx)
+);
+
+-- The 3 currently-paper-trading models. Refreshed monthly.
+CREATE TABLE production_panel (
+    rank          INTEGER PRIMARY KEY CHECK(rank IN (1, 2, 3)),
+    iteration_id  INTEGER NOT NULL REFERENCES iterations(id),
+    promoted_at   TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,                          -- promoted_at + 30 days
+    UNIQUE(iteration_id)
+);
+
+CREATE TABLE data_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    iteration_id  INTEGER NOT NULL REFERENCES iterations(id),
+    requested_at  TEXT NOT NULL,
+    request_text  TEXT NOT NULL,
+    fulfilled     INTEGER DEFAULT 0
+);
+
+-- WAL for concurrent reads while writes are in flight.
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 ```
 
-Pre-existing 335 entries from the LSTM era stay intact (treated as legacy).
+`scripts/feedback.py` wraps it with a small API:
+
+```python
+record_iteration(...)              # called at end of every gate run
+top_n_recent(n, days)              # used by promotion + claude-mode prompt
+get_promotion_panel()              # current 3 + their iterations
+refresh_promotion_panel()          # called by monthly cron
+recent_lessons(k)                  # last K claude-mode lessons → prompt
+log_data_request(text)             # claude mode → Telegram
+```
+
+The pre-existing 335 entries from `data/ml-feedback.json` (LSTM era) get migrated into this schema as a one-time seed step so historical lessons remain queryable.
 
 ## Schedule
 
-| When | What | Cost |
-|---|---|---|
-| Every 30 min (active hours) | Train mode, 1 config | ~30s |
-| Daily at 04:00 ICT | Train mode, 20 configs (full sweep) | ~10 min |
-| Daily at 06:00 ICT | Claude mode, 1 structural attempt | ~30 min, ~$2-5 |
-| Weekly | Promote best candidate from week's runs (manual review) | minutes |
-| Auto-pause | If 5 consecutive runs fail to improve, both modes pause until manual reset | — |
+Two cadences with deliberate non-overlap on the hour boundary.
 
-The auto-pause is the lesson from 327 LSTM attempts. Grinding without progress is *worse* than not running — it pollutes the feedback log with noise.
+| When (Asia/Bangkok) | Mode | Wall-time | Notes |
+|---|---|---|---|
+| `0 */3 * * *` (00:00, 03:00, 06:00, … every 3h, top of hour) | **Claude** | hard kill at 30 min | 1 attempt per slot |
+| `30 * * * *` (every hour at :30) | **Train** | uncapped, but must finish before next :30 | 1 process at a time |
+| `1 0 1 * *` (1st of month, 00:01) | **Promotion refresh** | seconds | Re-pick top-3 from last 30 days |
 
-## Promotion criteria
+**Conflict and lock priority:**
 
-A candidate auto-promotes to production if:
+- Both modes acquire `models/.ml-loop.lock` via `flock`.
+- **Claude > Train.** If Claude's slot fires while Train is running, Train is killed (matches the old `ml-improve.sh` priority hierarchy). After Claude finishes (≤ 30 min), the next :30 trigger reruns Train.
+- If Claude's run is still active when its next 3-hour slot fires, the new slot is skipped (single concurrent Claude).
+- If Train's run is still active when the next :30 fires, the new fire is skipped — but the previous run gets a soft warning logged. If three :30 slots in a row are skipped, an alert goes to Telegram (Train is taking too long; Claude should reduce HP search scope).
 
-1. Gate passes (≥ 5 of 7 windows meet whitepaper §9 criteria)
-2. Improvement is monotonic (avg annualized return ≥ current production by ≥ 10%)
-3. Trader hasn't manually flagged "freeze" via Telegram
+**Cost:**
 
-Manual override always allowed. The bot has `t freeze` (block auto-promote) and `t promote <run-id>` (force promote a specific run).
+We're on the Claude Max 20× plan, so no per-run cost cap is needed. The 30-minute wall-time is the only hard limit per Claude run.
+
+**Auto-pause:**
+
+If 5 consecutive iterations across BOTH modes fail to produce a gate-passing model, both modes pause until manual reset (`t resume-ml` over Telegram). This is the lesson from 327 LSTM attempts — grinding without progress pollutes the feedback log.
+
+## Promotion criteria — top-3 paper-trading panel
+
+We don't promote to a single "production" model. Instead, we keep a **panel of 3 currently-paper-trading models**, refreshed monthly. The panel is a stable A/B/C set so the strategy team can compare.
+
+**Panel selection rules:**
+
+1. Eligible iterations: `gate_passed = 1` AND `finished_at > now - 30 days`
+2. Sort by `avg_annualized_return DESC` (primary), `avg_max_dd ASC` (tiebreaker)
+3. Pick top 3 distinct trainer/hyperparam combinations
+4. Write rows 1, 2, 3 to `production_panel` table
+5. Each panel slot expires 30 days after promotion → next monthly refresh re-picks
+
+**Paper trading the panel:**
+
+- All 3 models score signals concurrently each session
+- Each Telegram signal includes which panel model fired it (`signal from rank-1 / rank-2 / rank-3`)
+- After a month of live paper performance, the strategy team reviews and decides which (if any) graduates to half-size real money — that's whitepaper Phase C, not auto-decided
+
+**Manual override:** the bot supports `t freeze` (block monthly refresh), `t panel show` (current 3), `t panel promote <iter_id>` (force a specific iteration into the panel).
+
+The "1 monolithic production model" approach was wrong for the LSTM era — it created winner-take-all dynamics where any single bad month would destroy the only model. With 3, we get diversification of model risk for ~3× the inference cost (which is cheap).
 
 ## What this fixes vs the old `ml-improve.sh`
 
@@ -288,18 +372,25 @@ If signed off, implement in this order so each step produces a runnable artifact
 
 Each step ends with a runnable artifact that we can hand-execute and check. We don't wire cron until step 6 is verified working.
 
-## Open questions / decisions before implementation
+## Decisions locked (per 2026-05-04 review)
 
-1. **`base_dir`** — current default is `~/projects/caffe-stocks`. Native install path will differ; should be a config var.
-2. **Auto-pause threshold** — 5 consecutive fails, OR a moving-average-based detector? Start with 5; revise if it triggers too eagerly.
-3. **Promotion ceremony** — auto-promote, or always require Telegram confirmation? Default: auto for tier-1 improvement, Telegram-confirm for tier-2.
-4. **Cost cap on Claude mode** — daily $ limit before pause? Yes; suggest $20/day default.
-5. **Search space for NN/RL** — defer until those trainers are added; can't define ranges before knowing the model.
+- ✓ Boundary: train mode = HP search, Claude mode = code changes
+- ✓ Claude mode internet access: WebSearch + WebFetch enabled — not restricted to listed model families
+- ✓ Feedback store: SQLite (`data/ml-feedback.db`) with WAL mode, not JSON
+- ✓ Schedule: Claude every 3h on the hour (max 30 min); Train every hour at :30 (uncapped but must finish in <1h)
+- ✓ Conflict priority: Claude preempts Train (kills running train if needed)
+- ✓ Cost cap: none (Claude Max 20× plan)
+- ✓ Promotion: top-3 paper-trade panel, monthly refresh
+- ✓ Auto-pause: 5 consecutive failures across both modes → pause until `t resume-ml`
 
-## Sign-off needed before implementation
+## Still open
 
-- Does the train/Claude boundary feel right, or do you want a third "data" mode for ingestion changes?
-- 5-fail auto-pause: too eager, too lax, or right?
-- Auto-promote threshold (10% improvement over production): right number?
-- Cost cap for Claude mode: $20/day OK?
-- Implementation order — start with steps 1-3 (build train mode end-to-end first), then 4-6 (Claude mode), or all at once?
+1. **`base_dir`** — currently hardcoded `~/projects/caffe-stocks`. Native install may want this configurable. Defer to migration.
+2. **First trainer family for Claude to add** — start with LSTM (validates the abstraction with a non-tree model), or jump to PEFT (LoRA on a public time-series foundation model)? Recommendation: LSTM first because it's a known quantity from the legacy era; PEFT second once the abstraction is proven.
+3. **Top-3 panel mid-month behavior** — if a brand-new iteration has +30% better gate result mid-month, does it bump the worst panel member immediately or wait for the monthly refresh? Recommend monthly to reduce churn during paper trade evaluation.
+
+These can be decided as we hit them; not blockers for starting implementation.
+
+## Implementation gate
+
+Implementation can start. Suggest steps 1-3 first (search_space + feedback.py SQLite + train_mode end-to-end with cron) so we have a closed loop running on its own before adding Claude mode complexity. Then 4-6 (prompt builder + Claude mode + ml_loop.sh wrapper). Then trainer families per #2 above.
