@@ -58,3 +58,8 @@ data/paper-status.json
 data/portfolio_history.json
 data/debug_*.json
 data/modal_budget.json
+
+# v1 ML loop — runtime artifacts
+models/.ml-loop.lock
+models/lgbm/
+models/lstm/candidates/

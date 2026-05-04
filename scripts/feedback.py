@@ -1,0 +1,316 @@
+"""SQLite-backed iteration log + promotion panel.
+
+Single source of truth for the ML loop. Both train_mode and claude_mode
+write iteration rows; promotion script and the bot read.
+
+WAL mode is enabled so the bot can read while train_mode is mid-iteration.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+
+BASE_PATH = Path(os.path.expanduser('~/projects/caffe-stocks'))
+DB_PATH = BASE_PATH / 'data' / 'ml-feedback.db'
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS iterations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode IN ('train', 'claude')),
+    trainer TEXT NOT NULL,
+    hyperparams TEXT NOT NULL,
+    code_changes TEXT,
+    hypothesis TEXT,
+    backbone TEXT,
+    git_sha TEXT,
+    gate_passed INTEGER NOT NULL,
+    windows_passed INTEGER NOT NULL,
+    windows_total INTEGER NOT NULL,
+    avg_annualized_return REAL,
+    avg_win_rate REAL,
+    avg_max_dd REAL,
+    total_trades INTEGER,
+    model_dir TEXT,
+    elapsed_seconds INTEGER,
+    full_result TEXT,
+    lessons TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_iter_finished      ON iterations(finished_at);
+CREATE INDEX IF NOT EXISTS idx_iter_passed_return ON iterations(gate_passed, avg_annualized_return);
+CREATE INDEX IF NOT EXISTS idx_iter_mode_finished ON iterations(mode, finished_at);
+
+CREATE TABLE IF NOT EXISTS iteration_windows (
+    iteration_id INTEGER NOT NULL REFERENCES iterations(id),
+    window_idx INTEGER NOT NULL,
+    train_start TEXT, train_end TEXT,
+    test_start TEXT,  test_end TEXT,
+    threshold REAL,
+    n_trades INTEGER,
+    win_rate REAL,
+    avg_pnl REAL,
+    avg_win REAL,
+    avg_loss REAL,
+    annualized_return REAL,
+    max_drawdown REAL,
+    final_equity REAL,
+    PRIMARY KEY (iteration_id, window_idx)
+);
+
+CREATE TABLE IF NOT EXISTS production_panel (
+    rank INTEGER PRIMARY KEY CHECK(rank IN (1, 2, 3)),
+    iteration_id INTEGER NOT NULL REFERENCES iterations(id),
+    promoted_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    UNIQUE(iteration_id)
+);
+
+CREATE TABLE IF NOT EXISTS data_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    iteration_id INTEGER NOT NULL REFERENCES iterations(id),
+    requested_at TEXT NOT NULL,
+    request_text TEXT NOT NULL,
+    fulfilled INTEGER DEFAULT 0
+);
+"""
+
+
+@contextmanager
+def get_conn():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute('PRAGMA journal_mode = WAL')
+    conn.execute('PRAGMA synchronous = NORMAL')
+    conn.execute('PRAGMA foreign_keys = ON')
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Idempotent schema creation."""
+    with get_conn() as conn:
+        conn.executescript(SCHEMA)
+
+
+def _git_sha() -> Optional[str]:
+    try:
+        out = subprocess.check_output(
+            ['git', '-C', str(BASE_PATH), 'rev-parse', 'HEAD'],
+            stderr=subprocess.DEVNULL, timeout=2)
+        return out.decode().strip()
+    except Exception:
+        return None
+
+
+def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
+                      gate_result: dict, model_dir: str,
+                      started_at: str, finished_at: str,
+                      elapsed_seconds: int,
+                      code_changes: Optional[list] = None,
+                      hypothesis: Optional[str] = None,
+                      backbone: Optional[str] = None,
+                      lessons: Optional[str] = None) -> int:
+    """Append an iteration row + per-window detail. Returns iteration id."""
+    init_db()
+    agg = _aggregate(gate_result)
+    with get_conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO iterations
+            (started_at, finished_at, mode, trainer, hyperparams, code_changes,
+             hypothesis, backbone, git_sha, gate_passed, windows_passed,
+             windows_total, avg_annualized_return, avg_win_rate, avg_max_dd,
+             total_trades, model_dir, elapsed_seconds, full_result, lessons)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            started_at, finished_at, mode, trainer,
+            json.dumps(hyperparams, default=str),
+            json.dumps(code_changes) if code_changes else None,
+            hypothesis, backbone, _git_sha(),
+            int(bool(gate_result.get('gate_passed'))),
+            int(gate_result.get('windows_passed', 0)),
+            int(gate_result.get('windows_total', 0)),
+            agg['avg_annualized_return'], agg['avg_win_rate'],
+            agg['avg_max_dd'], agg['total_trades'],
+            str(model_dir), int(elapsed_seconds),
+            json.dumps(gate_result, default=str), lessons,
+        ))
+        iter_id = cur.lastrowid
+
+        for idx, r in enumerate(gate_result.get('results', []), 1):
+            best = r.get('best') or {}
+            conn.execute("""
+                INSERT INTO iteration_windows
+                (iteration_id, window_idx, train_start, train_end, test_start, test_end,
+                 threshold, n_trades, win_rate, avg_pnl, avg_win, avg_loss,
+                 annualized_return, max_drawdown, final_equity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                iter_id, idx,
+                *_split_period(r.get('train', '')),
+                *_split_period(r.get('test', '')),
+                best.get('threshold'),
+                best.get('n_trades'),
+                best.get('win_rate'),
+                best.get('avg_pnl'),
+                best.get('avg_win'),
+                best.get('avg_loss'),
+                best.get('annualized_return'),
+                best.get('max_drawdown'),
+                best.get('final_equity'),
+            ))
+        return iter_id
+
+
+def _split_period(s: str) -> tuple[Optional[str], Optional[str]]:
+    """'2023-05-01..2023-10-31' → ('2023-05-01', '2023-10-31')."""
+    if not s or '..' not in s:
+        return None, None
+    a, b = s.split('..', 1)
+    return a, b
+
+
+def _aggregate(gate_result: dict) -> dict:
+    valid = [r for r in gate_result.get('results', []) if 'best' in r]
+    if not valid:
+        return {'avg_annualized_return': 0.0, 'avg_win_rate': 0.0,
+                'avg_max_dd': 0.0, 'total_trades': 0}
+    bests = [r['best'] for r in valid]
+    return {
+        'avg_annualized_return': float(sum(b.get('annualized_return', 0) for b in bests) / len(bests)),
+        'avg_win_rate':          float(sum(b.get('win_rate', 0) for b in bests) / len(bests)),
+        'avg_max_dd':            float(sum(b.get('max_drawdown', 0) for b in bests) / len(bests)),
+        'total_trades':          int(sum(b.get('n_trades', 0) for b in bests)),
+    }
+
+
+# ---------------------- query helpers ----------------------
+
+def top_n_recent(n: int = 3, days: int = 30, only_passed: bool = False) -> list[dict]:
+    """Return up to n recent iterations sorted by avg_annualized_return DESC,
+    then avg_max_dd ASC. Returns dict rows for ergonomics."""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    where = ['finished_at >= ?']
+    params = [cutoff]
+    if only_passed:
+        where.append('gate_passed = 1')
+    sql = f"""
+        SELECT * FROM iterations
+        WHERE {' AND '.join(where)}
+        ORDER BY avg_annualized_return DESC, avg_max_dd ASC
+        LIMIT ?
+    """
+    init_db()
+    with get_conn() as conn:
+        rows = conn.execute(sql, [*params, n]).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_promotion_panel() -> list[dict]:
+    """Return current panel ordered by rank."""
+    init_db()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT pp.rank, pp.iteration_id, pp.promoted_at, pp.expires_at,
+                   it.trainer, it.hyperparams, it.avg_annualized_return,
+                   it.avg_win_rate, it.avg_max_dd, it.total_trades, it.model_dir
+            FROM production_panel pp
+            JOIN iterations it ON it.id = pp.iteration_id
+            ORDER BY pp.rank
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def refresh_promotion_panel(days: int = 30) -> list[dict]:
+    """Refresh the panel: pick top 3 distinct (trainer, hyperparams) iterations
+    from the last `days` days. Returns new panel rows."""
+    init_db()
+    candidates = top_n_recent(n=50, days=days, only_passed=False)
+    # de-dupe by (trainer, hyperparams) — keep best per signature
+    seen = set()
+    unique = []
+    for c in candidates:
+        sig = (c['trainer'], c['hyperparams'])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(c)
+        if len(unique) == 3:
+            break
+    if not unique:
+        return []
+    now = datetime.now().isoformat()
+    expires = (datetime.now() + timedelta(days=30)).isoformat()
+    with get_conn() as conn:
+        conn.execute('DELETE FROM production_panel')
+        for rank, it in enumerate(unique, 1):
+            conn.execute("""
+                INSERT INTO production_panel (rank, iteration_id, promoted_at, expires_at)
+                VALUES (?, ?, ?, ?)
+            """, (rank, it['id'], now, expires))
+    return get_promotion_panel()
+
+
+def consecutive_failures(limit: int = 10) -> int:
+    """Count consecutive trailing iterations where gate_passed = 0."""
+    init_db()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT gate_passed FROM iterations
+            ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+    streak = 0
+    for r in rows:
+        if r['gate_passed'] == 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def log_data_request(iteration_id: int, request_text: str) -> None:
+    init_db()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO data_requests (iteration_id, requested_at, request_text)
+            VALUES (?, ?, ?)
+        """, (iteration_id, datetime.now().isoformat(), request_text))
+
+
+def stats() -> dict:
+    init_db()
+    with get_conn() as conn:
+        total = conn.execute('SELECT COUNT(*) FROM iterations').fetchone()[0]
+        passed = conn.execute('SELECT COUNT(*) FROM iterations WHERE gate_passed = 1').fetchone()[0]
+        by_mode = dict(conn.execute(
+            'SELECT mode, COUNT(*) FROM iterations GROUP BY mode').fetchall())
+        by_trainer = dict(conn.execute(
+            'SELECT trainer, COUNT(*) FROM iterations GROUP BY trainer').fetchall())
+        last_pass = conn.execute(
+            'SELECT finished_at FROM iterations WHERE gate_passed = 1 '
+            'ORDER BY finished_at DESC LIMIT 1').fetchone()
+    return {
+        'total': total,
+        'passed': passed,
+        'by_mode': by_mode,
+        'by_trainer': by_trainer,
+        'last_pass': last_pass[0] if last_pass else None,
+        'consecutive_failures': consecutive_failures(),
+    }
+
+
+if __name__ == '__main__':
+    init_db()
+    print(json.dumps(stats(), indent=2))
