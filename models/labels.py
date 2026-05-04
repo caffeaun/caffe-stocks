@@ -27,7 +27,17 @@ def check_early_stop(lows, entry_price, stop_pct=STOP_PCT, days=3):
     return bool(np.min(lows[:n]) <= stop_loss)
 
 
-COMMISSION_PCT = 0.011  # 1.1% round trip (฿50 min on ฿10K, requirements §1.3)
+COMMISSION_PCT = 0.0055  # 0.55% round trip — actual BLS Cash Balance rate.
+# Source: bualuang.co.th — Cash Balance via i-Trading commission is 0.157% per side
+# (entry tier, +7% VAT, no minimum for e-confirmation). SET fees 0.005% trading +
+# 0.001% clearing + 0.001% regulatory = 0.007% per side. Slippage 0.05-0.10%
+# per side on SET50/100. Round trip:
+#   commission+VAT: 0.157% × 2 × 1.07 = 0.336%
+#   fees:           0.007% × 2         = 0.014%
+#   slippage:       0.05-0.10% × 2     = 0.10-0.20%
+#   total:                              = 0.45-0.55%
+# Use mid-estimate 0.55%. Was 0.011 (1.1%, too conservative); briefly 0.004 (0.4%,
+# too optimistic). Updated 2026-05-04.
 
 # Minimum net profit for positive label (after commission).
 # Reverted 0.06 → 0.04: the 0.06 cutoff (attempt #271) collapsed the pipeline.

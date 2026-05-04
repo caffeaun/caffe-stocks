@@ -135,12 +135,13 @@ def telegram(text: str):
             break
     if not (bot_token and chat_id):
         return
+    # Send as plain text — Claude's lessons often contain stray * _ ` chars that
+    # break Markdown parse mode (HTTP 400 entity parsing errors).
     try:
         import urllib.request, urllib.parse
         data = urllib.parse.urlencode({
             'chat_id': chat_id,
             'text': text[:4000],
-            'parse_mode': 'Markdown',
             'disable_web_page_preview': 'true',
         }).encode()
         urllib.request.urlopen(

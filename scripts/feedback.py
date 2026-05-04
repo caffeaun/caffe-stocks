@@ -264,7 +264,11 @@ def refresh_promotion_panel(days: int = 30) -> list[dict]:
 
 
 def consecutive_failures(limit: int = 10) -> int:
-    """Count consecutive trailing iterations where gate_passed = 0."""
+    """Count consecutive trailing iterations where gate_passed = 0.
+
+    Counts ALL rows (including manual_resume markers) — manual_resume rows
+    are inserted with gate_passed=1 specifically to clear the streak.
+    """
     init_db()
     with get_conn() as conn:
         rows = conn.execute("""
@@ -290,16 +294,18 @@ def log_data_request(iteration_id: int, request_text: str) -> None:
 
 
 def stats() -> dict:
+    """Aggregate stats. Excludes synthetic 'manual_resume' marker rows."""
     init_db()
+    real = "trainer != 'manual_resume'"
     with get_conn() as conn:
-        total = conn.execute('SELECT COUNT(*) FROM iterations').fetchone()[0]
-        passed = conn.execute('SELECT COUNT(*) FROM iterations WHERE gate_passed = 1').fetchone()[0]
+        total = conn.execute(f'SELECT COUNT(*) FROM iterations WHERE {real}').fetchone()[0]
+        passed = conn.execute(f'SELECT COUNT(*) FROM iterations WHERE gate_passed = 1 AND {real}').fetchone()[0]
         by_mode = dict(conn.execute(
-            'SELECT mode, COUNT(*) FROM iterations GROUP BY mode').fetchall())
+            f'SELECT mode, COUNT(*) FROM iterations WHERE {real} GROUP BY mode').fetchall())
         by_trainer = dict(conn.execute(
-            'SELECT trainer, COUNT(*) FROM iterations GROUP BY trainer').fetchall())
+            f'SELECT trainer, COUNT(*) FROM iterations WHERE {real} GROUP BY trainer').fetchall())
         last_pass = conn.execute(
-            'SELECT finished_at FROM iterations WHERE gate_passed = 1 '
+            f'SELECT finished_at FROM iterations WHERE gate_passed = 1 AND {real} '
             'ORDER BY finished_at DESC LIMIT 1').fetchone()
     return {
         'total': total,
