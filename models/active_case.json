@@ -1,12 +1,12 @@
 {
-  "trainer": "bagged_xgb_regressor",
+  "trainer": "xgb_win_ranker",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Newly added in this iter; default HPs already match xgb_regressor's best 3/7 pass rate. Train mode should sweep conf_lambda \u2208 [0,3] and bootstrap_frac \u2208 [0.7,1.0] \u2014 the structural lever for cross-window stability is the score = mean - \u03bb*std blend, not yet HP-tuned.",
-  "claude_iter_id": 369,
-  "designated_at": "2026-05-08T21:12:22"
+  "rationale": "New trainer at default HPs already passes 3/7 windows with WR 41-46% in the passers (the exact bar bagged_xgb_regressor's 8-iter sweep never cleared in ANY window). Pivot from bagged_xgb_regressor \u2014 that family's sweep is exhausted at WR<37%. xgb_win_ranker has structural fit; train mode should sweep ndcg_at \u2208 {1,2,3} plus regularization (gamma, reg_alpha, min_child_weight) to attack the high-DD W2/W3/W7 failures.",
+  "claude_iter_id": 379,
+  "designated_at": "2026-05-09T00:14:40"
 }

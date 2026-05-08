@@ -202,6 +202,28 @@ SEARCH_SPACES: dict[str, dict] = {
         'sample_type':        ['uniform', 'weighted'],
         'normalize_type':     ['tree', 'forest'],
     },
+    # Win-ranker head: rank:ndcg with BINARY win label as relevance + ndcg@K
+    # eval. Same XGB tree-family HP space as xgb_ranker (HP intuitions carry
+    # over from the pairwise-ranking sibling) plus one new knob:
+    #   ndcg_at ∈ {1, 2, 3} — top-K position the LambdaRank loss puts gradient
+    #     weight on. K=2 matches MAX_OPEN_POSITIONS in return_gate.simulate_window
+    #     (the gate picks top-K-per-date with K=2). K=1 = "single best of the
+    #     day" (more aggressive top-of-list focus, but smaller effective gradient
+    #     since only one row per date "matters"). K=3 = mild slack, useful if
+    #     the pred top-2 sometimes shifts to top-3 on val. The sweep should
+    #     find which K produces the cleanest gate alignment.
+    'xgb_win_ranker': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.5),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'ndcg_at':            [1, 2, 3],
+    },
     # LightGBM lambdarank head: same date-grouped ranking task as xgb_ranker
     # but with leaf-wise tree growth + GOSS + delta-NDCG-weighted pairs that
     # emphasize top-of-list ordering. HP space mirrors 'lightgbm_regressor'

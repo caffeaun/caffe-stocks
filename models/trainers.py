@@ -1732,6 +1732,141 @@ class XGBoostRankerDartTrainer(XGBoostRankerTrainer):
 
 
 # --------------------------------------------------------------------- #
+# XGBoost WinRanker — date-grouped LambdaRank with BINARY win relevance
+# --------------------------------------------------------------------- #
+# Motivation: xgb_ranker / xgb_ranker_dart use within-group rank of pnl as the
+# relevance label, so the lambdarank loss is dominated by magnitude — putting
+# +14% (target hit) above +5% (trailing) carries the same gradient as putting
+# +5% above -3% (stop). The gate, however, scores WR≥40% per window — it does
+# not care whether the picked symbol gained 5% or 14%, only whether pnl >
+# MIN_PROFIT_PCT (0.04). The pnl-rank ranker therefore optimizes a strictly
+# stronger objective than the gate cares about, and the extra capacity goes
+# into chasing tail-magnitude patterns that don't generalize across regimes.
+#
+# Train mode just spent 8 iterations sweeping bagged_xgb_regressor HPs (#371-
+# #378): WR landed in [27%, 37%], never clearing the 40% per-window gate
+# despite +22.6% ann in the best-WR run. The bottleneck is a discrimination
+# problem — the regression head can't separate winners from losers, only
+# extrapolate magnitude — and HP tuning won't fix it.
+#
+# This trainer uses the BINARY y label (1 if pnl > MIN_PROFIT_PCT else 0) as
+# relevance directly, with rank:ndcg + ndcg@2 evaluation. NDCG@2 matches
+# MAX_OPEN_POSITIONS=2 in return_gate.simulate_window — it scores a perfect 1.0
+# when both top-2 picks per date are winners, and degrades smoothly as winners
+# fall out of the top-2. Since the gate picks top-K-per-date, this is the
+# closest objective the modeling layer can express to the gate's actual
+# scoreboard.
+#
+# Three properties make this distinct from the existing rankers:
+#   1. Binary relevance: pairwise gradients are uniform — winner > loser is the
+#      *only* signal. No tail-chasing toward +15% targets, no penalty for
+#      misranking two winners against each other.
+#   2. NDCG@K objective: gradient is concentrated on top-K positions per group.
+#      With ~30-60 candidates per date and K=2, ~95% of pairs the loss "sees"
+#      involve at least one row that's currently in or near the top-2.
+#   3. ndcg_at HP: Sweep [1, 2, 3] lets train mode test whether the gate's
+#      effective K (via the [0.30..0.70] threshold sweep + max_open=2 cap) is
+#      best matched by single-symbol-of-the-day, top-2, or a slight slack.
+#
+# SIGMOID_SCALE=10 mirrors xgb_ranker — raw rank:ndcg scores live in roughly
+# the same magnitude range, and reusing the scale lets the gate's
+# SCORE_THRESHOLDS work without per-trainer calibration.
+class XGBoostWinRankerTrainer(XGBoostRankerTrainer):
+    name = 'xgb_win_ranker'
+
+    SIGMOID_SCALE = 10.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 ndcg_at: int = 2,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        BaseTrainer.__init__(self)
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            ndcg_at=int(ndcg_at),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for date-group ranking.')
+
+        order_tr, groups_tr = self._group_counts(dates_train)
+        order_va, groups_va = self._group_counts(dates_val)
+        X_tr_sorted = np.asarray(X_train)[order_tr]
+        y_tr_sorted = np.asarray(y_train, dtype=np.int32)[order_tr]
+        X_va_sorted = np.asarray(X_val)[order_va]
+        y_va_sorted = np.asarray(y_val, dtype=np.int32)[order_va]
+
+        if (groups_tr < 2).all():
+            raise ValueError(f'{self.name}: no train date has >=2 samples — '
+                             'pairwise ranking is impossible')
+        # rank:ndcg with all-zero (or all-one) groups gives zero gradient for
+        # those groups, which is fine — the loss simply ignores them and
+        # focuses signal on the groups where at least one winner coexists with
+        # at least one loser.
+
+        p = self._params
+        # ndcg_exp_gain=False forces linear gain g(rel)=rel; with binary
+        # {0,1} relevance this is equivalent to the default exp gain
+        # 2^rel - 1, but it is the explicit choice we want documented (no
+        # implicit non-linearity on top of an already-binary signal).
+        self.clf = xgb.XGBRanker(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='rank:ndcg',
+            eval_metric=f'ndcg@{p["ndcg_at"]}',
+            ndcg_exp_gain=False,
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            X_tr_sorted, y_tr_sorted,
+            group=groups_tr,
+            eval_set=[(X_va_sorted, y_va_sorted)],
+            eval_group=[groups_va],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+
+# --------------------------------------------------------------------- #
 # LightGBM LambdaRank — date-grouped listwise ranking with leaf-wise+GOSS bias
 # --------------------------------------------------------------------- #
 # Motivation: xgb_ranker (#80) was the most consistent claude-mode result —
@@ -2233,6 +2368,7 @@ TRAINERS = {
     'xgb_dual_quantile': XGBoostDualQuantileTrainer,
     'xgb_ranker': XGBoostRankerTrainer,
     'xgb_ranker_dart': XGBoostRankerDartTrainer,
+    'xgb_win_ranker': XGBoostWinRankerTrainer,
     'stacked_ranker': StackedRankerTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
