@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_win_ranker",
+  "trainer": "ev_gated_ranker",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "New trainer at default HPs already passes 3/7 windows with WR 41-46% in the passers (the exact bar bagged_xgb_regressor's 8-iter sweep never cleared in ANY window). Pivot from bagged_xgb_regressor \u2014 that family's sweep is exhausted at WR<37%. xgb_win_ranker has structural fit; train mode should sweep ndcg_at \u2208 {1,2,3} plus regularization (gamma, reg_alpha, min_child_weight) to attack the high-DD W2/W3/W7 failures.",
-  "claude_iter_id": 379,
-  "designated_at": "2026-05-09T00:14:40"
+  "rationale": "New trainer composes a binary-win XGBRanker with a XGBRegressor EV gate \u2014 the only architectural class to historically clear 6/7 windows (claude #159, avg WR 65.5%). Default HPs (ev_floor=0.1, ev_scale=30) over-compress final scores so the threshold sweep degrades to thr=0.0 in 4/7 windows; W6 still cleared at WR 42.1% / +142.1% ann / 10.4% DD, proving the structural concept. Train mode should sweep ev_floor\u2208[0.0, 0.5] (widen score headroom), ev_scale\u2208[10, 100] (gate steepness), and ndcg_at\u2208{1,2,3} jointly with tree HPs. Higher ev_floor (~0.3-0.5) is the priority direction because the current 0.1 squashes too many days below thr=0.30.",
+  "claude_iter_id": 395,
+  "designated_at": "2026-05-09T03:12:52"
 }

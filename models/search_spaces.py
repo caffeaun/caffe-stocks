@@ -224,6 +224,37 @@ SEARCH_SPACES: dict[str, dict] = {
         'reg_lambda':         (0.5, 2.0),
         'ndcg_at':            [1, 2, 3],
     },
+    # EV-Gated Ranker: composes a binary-win XGBRanker (same tree-family HPs as
+    # xgb_win_ranker) with a XGBRegressor predicting per-trade pnl, multiplied
+    # at inference: final = ranker_prob × (ev_floor + (1-ev_floor) × σ(ev_scale ×
+    # ev_pred)). The ranker contributes top-K-per-day ordering; the EV regressor
+    # contributes regime abstention (negative-EV days squashed below the
+    # threshold sweep). Sub-models share tree HPs for parsimony — joint sweep
+    # first, split later if attribution is informative. Three new knobs:
+    #   ev_scale ∈ [10, 100]: sigmoid steepness. ev_scale=30 means a +5% EV
+    #     pred maps to gate≈0.82 and a -3% EV pred maps to gate≈0.29 — gentle
+    #     enough to keep gradients meaningful, sharp enough to cleanly abstain.
+    #     Below 10 the gate becomes too soft (negative-EV days still admit
+    #     trades); above 100 the gate is essentially a hard step.
+    #   ev_floor ∈ [0.0, 0.5]: minimum gate value. Lower floor = more
+    #     aggressive abstention (negative-EV trades scored ≈ 0 × ranker_prob).
+    #     0.5 disables abstention; 0.0 makes negative-EV trades unselectable.
+    #   ndcg_at ∈ {1, 2, 3}: top-K position the LambdaRank loss weights.
+    #     K=2 matches MAX_OPEN_POSITIONS in return_gate.simulate_window.
+    'ev_gated_ranker': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.5),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'ev_scale':           (10.0, 100.0),
+        'ev_floor':           (0.0, 0.5),
+        'ndcg_at':            [1, 2, 3],
+    },
     # LightGBM lambdarank head: same date-grouped ranking task as xgb_ranker
     # but with leaf-wise tree growth + GOSS + delta-NDCG-weighted pairs that
     # emphasize top-of-list ordering. HP space mirrors 'lightgbm_regressor'

@@ -1867,6 +1867,266 @@ class XGBoostWinRankerTrainer(XGBoostRankerTrainer):
 
 
 # --------------------------------------------------------------------- #
+# EV-Gated Ranker — date-grouped win-relevance ranker × EV-regressor gate
+# --------------------------------------------------------------------- #
+# Motivation: the xgb_win_ranker / xgb_ranker family produces a top-K-per-day
+# ordering signal but cannot abstain in regimes where every candidate is
+# negative-EV. Recent xgb_win_ranker HP sweep (#387-#394) is stuck at WR
+# 26-35% — well below the 40% per-window gate — even when annualized return
+# is high (#389: ann=+52.7% but WR=33%, only 2/7 windows pass). The model
+# picks the best of a bad bunch on regime-shift dates because the listwise
+# objective only sees within-date pairs, not absolute EV.
+#
+# The closest any iteration has come to a candidate was claude #159
+# (ev_gated_ranker, avg WR 65.5%, 6/7 windows passed; gate failed only on
+# Split 2 where ev_blend=1.0 still admitted 31 negative-EV trades). Its
+# trainer code was inadvertently dropped from trainers.py during a prior
+# cleanup — only its .pyc remains. This reconstruction implements the same
+# core idea with explicit gating semantics.
+#
+# Architecture: compose a date-grouped XGBRanker (binary-win relevance,
+# rank:ndcg + ndcg@K eval) with a XGBRegressor predicting per-trade pnl
+# (reg:squarederror). At inference the two outputs combine multiplicatively:
+#
+#     ranker_prob = sigmoid(SIGMOID_SCALE * ranker_raw)        # [0, 1]
+#     ev_gate_raw = sigmoid(ev_scale * ev_pred)                # [0, 1], hinge at ev_pred=0
+#     ev_gate     = ev_floor + (1 - ev_floor) * ev_gate_raw    # [ev_floor, 1]
+#     final       = ranker_prob * ev_gate
+#
+# Behaviour:
+#   ev_pred → +∞ : ev_gate → 1, final → ranker_prob (pure ranker, no shrinkage)
+#   ev_pred = 0  : ev_gate = ev_floor + (1 - ev_floor)/2 (intermediate)
+#   ev_pred → -∞ : ev_gate → ev_floor, final ≤ ev_floor (regime abstention)
+#
+# This means: when the EV regressor predicts negative pnl, the gate compresses
+# the ranker score toward `ranker_prob × ev_floor`, dropping it below the
+# threshold sweep's [0.30..0.70] range and effectively skipping that date.
+# When EV is positive, the ranker's ordering is preserved unchanged.
+#
+# HPs (sweep target for train mode):
+#   ev_scale ∈ [10, 100]: sigmoid steepness around ev_pred=0. Large = sharp
+#     gate (small EV moves flip from 0→1); small = gentle gate (smooth
+#     gradient). 30 ≈ "5% pnl gives gate ≈ 0.82, -3% pnl gives gate ≈ 0.29".
+#   ev_floor ∈ [0.0, 0.5]: minimum gate value. 0.0 = hard gate (negative-EV
+#     trades scored ≈ 0); 0.5 = soft gate (negative-EV trades penalized but
+#     still selectable). Lower floor = more aggressive abstention.
+#   ndcg_at ∈ {1, 2, 3}: top-K position the LambdaRank loss puts gradient
+#     weight on. Same as xgb_win_ranker — K=2 matches MAX_OPEN_POSITIONS.
+#
+# Both sub-models share tree-family HPs (max_depth, learning_rate,
+# n_estimators, subsample, colsample_bytree, reg_alpha, reg_lambda,
+# min_child_weight, gamma) for parsimony — joint sweep first; if attribution
+# becomes informative, split the HP space later. The regressor uses
+# random_state+1 to break seed-correlation between the two sub-models.
+class EVGatedRankerTrainer(XGBoostRankerTrainer):
+    name = 'ev_gated_ranker'
+
+    # Mirrors xgb_win_ranker — empirical raw-score range ±0.2 maps to
+    # sigmoid(±2) ≈ (0.12, 0.88), spanning the gate's [0.30, 0.70] sweep.
+    SIGMOID_SCALE = 10.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 ev_scale: float = 30.0,
+                 ev_floor: float = 0.1,
+                 ndcg_at: int = 2,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        BaseTrainer.__init__(self)
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            ev_scale=float(ev_scale),
+            ev_floor=float(ev_floor),
+            ndcg_at=int(ndcg_at),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.ranker = None
+        self.regressor = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L).')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for date-group ranking.')
+
+        # --- Stage 1: ranker (binary-win relevance, ndcg@K) ---
+        order_tr, groups_tr = self._group_counts(dates_train)
+        order_va, groups_va = self._group_counts(dates_val)
+        X_tr_sorted = np.asarray(X_train)[order_tr]
+        y_tr_sorted = np.asarray(y_train, dtype=np.int32)[order_tr]
+        X_va_sorted = np.asarray(X_val)[order_va]
+        y_va_sorted = np.asarray(y_val, dtype=np.int32)[order_va]
+
+        if (groups_tr < 2).all():
+            raise ValueError(f'{self.name}: no train date has >=2 samples — '
+                             'pairwise ranking is impossible')
+
+        p = self._params
+        self.ranker = xgb.XGBRanker(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='rank:ndcg',
+            eval_metric=f'ndcg@{p["ndcg_at"]}',
+            ndcg_exp_gain=False,
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.ranker.fit(
+            X_tr_sorted, y_tr_sorted,
+            group=groups_tr,
+            eval_set=[(X_va_sorted, y_va_sorted)],
+            eval_group=[groups_va],
+            verbose=verbose,
+        )
+
+        # --- Stage 2: EV regressor (squared error, ungrouped) ---
+        # The regressor predicts per-trade pnl directly. No date grouping —
+        # squared-error loss is row-independent. Different random_state breaks
+        # seed-correlation with the ranker so the two sub-models contribute
+        # genuine diversity at inference.
+        pnl_tr = np.asarray(pnl_train, dtype=np.float32)
+        pnl_va = np.asarray(pnl_val, dtype=np.float32)
+        self.regressor = xgb.XGBRegressor(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:squarederror',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'] + 1,
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.regressor.fit(
+            np.asarray(X_train), pnl_tr,
+            eval_set=[(np.asarray(X_val), pnl_va)],
+            verbose=verbose,
+        )
+        bi_r = getattr(self.ranker, 'best_iteration', None) or p['n_estimators']
+        bi_e = getattr(self.regressor, 'best_iteration', None) or p['n_estimators']
+        self._best_iteration = int(max(bi_r, bi_e))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.ranker is None or self.regressor is None:
+            raise RuntimeError('Model not fit')
+        ranker_raw = self.ranker.predict(X)
+        ranker_prob = 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * ranker_raw))
+        ev_pred = self.regressor.predict(X)
+        p = self._params
+        # Clip the linear part of the sigmoid to avoid float32 overflow on
+        # large ev_scale × |ev_pred| products; -700 is well past the point
+        # where np.exp underflows to 0 in IEEE doubles.
+        z = np.clip(p['ev_scale'] * ev_pred, -700.0, 700.0)
+        ev_gate_raw = 1.0 / (1.0 + np.exp(-z))
+        ev_gate = p['ev_floor'] + (1.0 - p['ev_floor']) * ev_gate_raw
+        return ranker_prob * ev_gate
+
+    def predict_score(self, X) -> np.ndarray:
+        """Final composite score (same as predict_proba). For diagnostics."""
+        return self.predict_proba(X)
+
+    def feature_importance(self):
+        if self.ranker is None:
+            return None
+        # Average ranker + regressor importances after per-model normalization
+        # (each XGB model normalizes differently, so re-normalize before mixing).
+        fi_r = self.ranker.feature_importances_
+        fi_e = self.regressor.feature_importances_ if self.regressor is not None else None
+        if fi_e is None:
+            return fi_r
+        sr = fi_r.sum(); se = fi_e.sum()
+        nr = fi_r / sr if sr > 0 else fi_r
+        ne = fi_e / se if se > 0 else fi_e
+        return 0.5 * (nr + ne)
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        ranker_path = os.path.join(output_dir, 'ranker.json')
+        regressor_path = os.path.join(output_dir, 'regressor.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.ranker.save_model(ranker_path)
+        self.regressor.save_model(regressor_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'ranker': ranker_path, 'regressor': regressor_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        ranker_path = os.path.join(output_dir, 'ranker.json')
+        regressor_path = os.path.join(output_dir, 'regressor.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.ranker = xgb.XGBRanker()
+        inst.ranker.load_model(ranker_path)
+        inst.regressor = xgb.XGBRegressor()
+        inst.regressor.load_model(regressor_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # LightGBM LambdaRank — date-grouped listwise ranking with leaf-wise+GOSS bias
 # --------------------------------------------------------------------- #
 # Motivation: xgb_ranker (#80) was the most consistent claude-mode result —
@@ -2369,6 +2629,7 @@ TRAINERS = {
     'xgb_ranker': XGBoostRankerTrainer,
     'xgb_ranker_dart': XGBoostRankerDartTrainer,
     'xgb_win_ranker': XGBoostWinRankerTrainer,
+    'ev_gated_ranker': EVGatedRankerTrainer,
     'stacked_ranker': StackedRankerTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
