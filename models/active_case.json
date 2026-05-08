@@ -1,0 +1,12 @@
+{
+  "trainer": "bagged_xgb_regressor",
+  "feature_set": "default",
+  "dataset": {
+    "seq_len": 20,
+    "lookahead": 10,
+    "label": "v1"
+  },
+  "rationale": "Newly added in this iter; default HPs already match xgb_regressor's best 3/7 pass rate. Train mode should sweep conf_lambda \u2208 [0,3] and bootstrap_frac \u2208 [0.7,1.0] \u2014 the structural lever for cross-window stability is the score = mean - \u03bb*std blend, not yet HP-tuned.",
+  "claude_iter_id": 369,
+  "designated_at": "2026-05-08T21:12:22"
+}

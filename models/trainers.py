@@ -24,7 +24,16 @@ class BaseTrainer:
 
     name: str = 'base'
 
-    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False):
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        """Fit the model. pnl_train/pnl_val carry per-trade realized P&L
+        (fraction; 0.05 = +5%) so regression-head trainers can predict EV
+        directly. Classifier trainers ignore them — the binary y_train remains
+        the canonical target for them. dates_train/dates_val carry the entry
+        date strings so ranker-head trainers can group rows by date for
+        pairwise loss; other trainers ignore them. All extras are always
+        passed by the gate so trainers can opt in without API churn."""
         raise NotImplementedError
 
     def predict_proba(self, X) -> np.ndarray:
@@ -91,7 +100,9 @@ class LightGBMTrainer(BaseTrainer):
         self.clf = None
         self._best_iteration = None
 
-    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False):
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
         import lightgbm as lgb
 
         if len(set(y_train)) < 2:
@@ -216,7 +227,9 @@ class XGBoostTrainer(BaseTrainer):
         self.clf = None
         self._best_iteration = None
 
-    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False):
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
         import xgboost as xgb
 
         if len(set(y_train)) < 2:
@@ -308,11 +321,1919 @@ class XGBoostTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# XGBoost Regressor — predicts realized pnl, not P(win)
+# --------------------------------------------------------------------- #
+# Motivation (from claude iter #10 lesson): every classifier in the loop has
+# pinned WR ~30-42% with avg_pnl mildly negative. P(win)-ranking doesn't
+# translate to positive EV because clean-win cap squeezes 1-class wins to
+# +0.02 while losses keep -0.04 (commission + stop). Selection by predicted
+# pnl directly optimises EV — a 60%-WR trade with 1% avg_pnl loses to a
+# 35%-WR trade with 4% avg_pnl, and only a regression head sees that.
+#
+# predict_proba returns sigmoid(pred_pnl * SIGMOID_SCALE) so the existing
+# SCORE_THRESHOLDS [0.30..0.70] in return_gate.py still carve a meaningful
+# slice of the prediction range (typical pred_pnl ∈ [-0.05, +0.10] → score
+# ∈ [0.27, 0.88]). Rank order within a date is preserved exactly.
+class XGBoostRegressorTrainer(BaseTrainer):
+    name = 'xgb_regressor'
+
+    SIGMOID_SCALE = 20.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L). '
+                'The gate must pass them through trainer.fit().')
+
+        p = self._params
+        self.clf = xgb.XGBRegressor(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:squarederror',
+            eval_metric='rmse',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            X_train, np.asarray(pnl_train, dtype=np.float32),
+            eval_set=[(X_val, np.asarray(pnl_val, dtype=np.float32))],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        pred_pnl = self.clf.predict(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * pred_pnl))
+
+    def predict_pnl(self, X) -> np.ndarray:
+        """Raw predicted P&L (fraction). Useful for diagnostics."""
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict(X)
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = xgb.XGBRegressor()
+        inst.clf.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# Bagged XGBoost Regressor — variance-reducing ensemble with confidence-
+# penalized scoring.
+# --------------------------------------------------------------------- #
+# Motivation: single-model xgb_regressor produces high cross-window variance
+# (recent iters #361-#368 wp=0..4/7 with ann swinging from -27% to +49%
+# across HPs that are nearly identical). The 100%-pass gate rejects every
+# such model. The same booster that hits ann=+48.9% in one HP config (#365)
+# also crashes to wp=3/7 — meaning per-window picks are unstable, not the HP.
+#
+# Bagging K=5 xgb_regressor learners with different seeds AND row-bootstrap
+# subsamples reduces prediction variance by ~1/K on independent components and
+# leaves correlated bias unchanged (classic Breiman 1996). On its own this
+# helps but doesn't necessarily move the per-window pass rate; what does is
+# the confidence-penalized scoring:
+#
+#     score(row) = mean_k(pred_k(row)) - conf_lambda * std_k(pred_k(row))
+#
+# Rows where the K bags AGREE on a positive EV survive the penalty; rows
+# where bags disagree (one bag predicts +5%, another predicts -2% — the
+# lottery-ticket signature) are pushed down by the std term. Combined with
+# the gate's top-K-per-day selection, this filters trades by *consensus*
+# rather than by *aggressive single-model conviction*. The expected effect:
+# fewer big-ann/low-wp HP configs, more cross-window stability around a
+# slightly lower per-window ann — exactly the trade the 100%-pass gate
+# requires.
+#
+# Same XGBoost-tree HP space as xgb_regressor (sub-bag HP intuitions carry
+# over) plus three ensemble knobs: n_bags ∈ [3,5,7], conf_lambda ∈ [0.0, 3.0],
+# bootstrap_frac ∈ [0.7, 1.0]. conf_lambda=0 collapses to plain bagging
+# (variance reduction without confidence gating); >2.0 makes the scorer
+# heavily defensive (often produces 0 trades on noisy windows). The sweep
+# should find the slope where consensus filtering peaks WR without starving
+# trade count below the 20-trade-per-window floor.
+class BaggedXGBRegressorTrainer(BaseTrainer):
+    name = 'bagged_xgb_regressor'
+
+    SIGMOID_SCALE = 20.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 early_stopping_rounds: int = 30,
+                 n_bags: int = 5,
+                 conf_lambda: float = 1.0,
+                 bootstrap_frac: float = 0.85,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            early_stopping_rounds=early_stopping_rounds,
+            n_bags=n_bags,
+            conf_lambda=conf_lambda,
+            bootstrap_frac=bootstrap_frac,
+            random_state=random_state,
+        )
+        self.bags: list = []
+        self._best_iteration = None
+
+    def _make_bag(self, seed: int):
+        import xgboost as xgb
+        p = self._params
+        return xgb.XGBRegressor(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:squarederror',
+            eval_metric='rmse',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=seed,
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (regression-on-pnl head).')
+
+        p = self._params
+        n_train = len(X_train)
+        n_sample = max(int(round(p['bootstrap_frac'] * n_train)), 200)
+        rs_root = np.random.RandomState(p['random_state'])
+        pnl_train_arr = np.asarray(pnl_train, dtype=np.float32)
+        pnl_val_arr = np.asarray(pnl_val, dtype=np.float32)
+
+        self.bags = []
+        best_iters = []
+        for k in range(p['n_bags']):
+            # Row-level bootstrap (with replacement) — classic bagging. Each bag
+            # sees a different ~bootstrap_frac slice of train rows, which in
+            # combination with per-bag seeds + XGBoost's internal subsample
+            # produces decorrelated predictors without over-shrinking individual
+            # train sets (which would hurt early stopping signal quality).
+            sample_seed = int(rs_root.randint(0, 2**31 - 1))
+            sub_idx = np.random.RandomState(sample_seed).choice(
+                n_train, size=n_sample, replace=True)
+            X_sub = X_train[sub_idx]
+            pnl_sub = pnl_train_arr[sub_idx]
+
+            booster_seed = int(rs_root.randint(0, 2**31 - 1))
+            clf = self._make_bag(booster_seed)
+            clf.fit(
+                X_sub, pnl_sub,
+                eval_set=[(X_val, pnl_val_arr)],
+                verbose=verbose,
+            )
+            self.bags.append(clf)
+            best_iters.append(getattr(clf, 'best_iteration', None) or p['n_estimators'])
+
+        self._best_iteration = int(np.mean(best_iters))
+        return self
+
+    def _bag_predictions(self, X) -> np.ndarray:
+        if not self.bags:
+            raise RuntimeError('Model not fit')
+        preds = np.stack([clf.predict(X) for clf in self.bags], axis=0)
+        return preds  # shape (n_bags, n_rows)
+
+    def predict_proba(self, X) -> np.ndarray:
+        preds = self._bag_predictions(X)
+        mean_pred = preds.mean(axis=0)
+        std_pred = preds.std(axis=0, ddof=0)
+        score = mean_pred - self._params['conf_lambda'] * std_pred
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * score))
+
+    def predict_pnl(self, X) -> np.ndarray:
+        """Confidence-penalized predicted P&L (fraction). Useful for diagnostics."""
+        preds = self._bag_predictions(X)
+        mean_pred = preds.mean(axis=0)
+        std_pred = preds.std(axis=0, ddof=0)
+        return mean_pred - self._params['conf_lambda'] * std_pred
+
+    def feature_importance(self):
+        if not self.bags:
+            return None
+        # Average of bag-level importances. Each bag normalized to sum=1 so the
+        # average is in comparable units regardless of n_estimators per bag.
+        fis = []
+        for clf in self.bags:
+            fi = getattr(clf, 'feature_importances_', None)
+            if fi is None:
+                continue
+            s = fi.sum()
+            fis.append(fi / s if s > 0 else fi)
+        if not fis:
+            return None
+        return np.mean(np.stack(fis, axis=0), axis=0)
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        bag_paths = []
+        for k, clf in enumerate(self.bags):
+            bag_path = os.path.join(output_dir, f'bag_{k:02d}.json')
+            clf.save_model(bag_path)
+            bag_paths.append(bag_path)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+            'n_bags_saved': len(bag_paths),
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'bags': bag_paths, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        n_saved = meta.get('n_bags_saved', 0)
+        inst.bags = []
+        for k in range(n_saved):
+            bag_path = os.path.join(output_dir, f'bag_{k:02d}.json')
+            clf = xgb.XGBRegressor()
+            clf.load_model(bag_path)
+            inst.bags.append(clf)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# XGBoost Huber Regressor — pseudo-Huber loss, outlier-robust EV head
+# --------------------------------------------------------------------- #
+# Motivation: xgb_regressor uses reg:squarederror, which is convex but its
+# gradient grows linearly with residual magnitude — a single +15% target hit
+# (mean pnl ≈ +13.9% net) produces 5× the gradient of a -3% stop. On thin
+# 2024 train chunks the squared-error model chases the few rare big wins,
+# producing high-variance picks (recent iters #346-#353: ann swings -24%..
+# +27% across HPs while WR stays stuck at 28-39%, never clearing the 40%
+# per-window floor).
+#
+# Pseudo-Huber loss (reg:pseudohubererror, slope δ) is quadratic for
+# residuals |r|<δ and linear beyond — same convexity / efficiency as MSE in
+# the dense middle of the pnl distribution but bounded gradient on the
+# 15%-target / -3%-stop tails. The expected effect: fewer "lottery-ticket"
+# picks, more density in the 4-7% gain zone where MIN_PROFIT_PCT=0.04
+# decides the WR floor.
+#
+# huber_slope ∈ [0.02, 0.10] spans the relevant regime: 0.02 ≈ MIN_PROFIT_PCT/2
+# (treats almost every trade as a tail event), 0.10 ≈ trailing-trigger / max-pnl
+# bounds (close to plain L2). The sweep should find a slope where the gradient
+# transitions right around the win/loss boundary.
+#
+# Identical sigmoid-on-prediction trick as xgb_regressor so SCORE_THRESHOLDS
+# in return_gate.py keep working without changes. Distinct from
+# xgb_quantile (P70 instead of robust mean) and xgb_dual_quantile (asymmetric
+# upper-vs-lower estimators) — all three approach the right-skew problem
+# differently, giving the pipeline genuine algorithmic diversity.
+class XGBoostHuberRegressorTrainer(BaseTrainer):
+    name = 'xgb_huber_regressor'
+
+    SIGMOID_SCALE = 20.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 huber_slope: float = 0.05,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            huber_slope=huber_slope,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L). '
+                'The gate must pass them through trainer.fit().')
+
+        p = self._params
+        self.clf = xgb.XGBRegressor(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:pseudohubererror',
+            huber_slope=p['huber_slope'],
+            eval_metric='mphe',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            X_train, np.asarray(pnl_train, dtype=np.float32),
+            eval_set=[(X_val, np.asarray(pnl_val, dtype=np.float32))],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        pred_pnl = self.clf.predict(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * pred_pnl))
+
+    def predict_pnl(self, X) -> np.ndarray:
+        """Raw predicted P&L (fraction). Useful for diagnostics."""
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict(X)
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = xgb.XGBRegressor()
+        inst.clf.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# XGBoost Quantile Regressor — predicts an upper quantile of pnl
+# --------------------------------------------------------------------- #
+# Motivation (from claude iter #31 lesson): xgb_regressor with squared-error
+# loss was the best run to date (WR 44%, DD 9.9%, 5/7 windows positive) but
+# blew up in early-2024 windows where WR fell to 23-29%. Squared-error
+# regression predicts the conditional MEAN E[pnl|X], which gets dragged by
+# rare big wins in the right tail; in noisy regimes the mean stays mildly
+# positive even when the bulk of trades lose.
+#
+# Quantile regression at alpha=0.7 instead predicts P70(pnl|X). A positive
+# P70 means at least 70% of conditional outcomes are above zero, which bakes
+# in a precision filter aligned with the gate's MIN_WR=30% (alpha=0.7 → at
+# least 30% of trades must be wins for the prediction to be positive).
+# This should reject noisy-regime trades the squared-error model accepted.
+#
+# Identical sigmoid-on-prediction trick as xgb_regressor so SCORE_THRESHOLDS
+# in return_gate.py keep working without changes.
+class XGBoostQuantileTrainer(BaseTrainer):
+    name = 'xgb_quantile'
+
+    SIGMOID_SCALE = 20.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 quantile_alpha: float = 0.7,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            quantile_alpha=quantile_alpha,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L). '
+                'The gate must pass them through trainer.fit().')
+
+        p = self._params
+        self.clf = xgb.XGBRegressor(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:quantileerror',
+            quantile_alpha=p['quantile_alpha'],
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            X_train, np.asarray(pnl_train, dtype=np.float32),
+            eval_set=[(X_val, np.asarray(pnl_val, dtype=np.float32))],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        pred_q = self.clf.predict(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * pred_q))
+
+    def predict_pnl(self, X) -> np.ndarray:
+        """Raw predicted quantile of P&L (fraction). Useful for diagnostics."""
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict(X)
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = xgb.XGBRegressor()
+        inst.clf.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# LightGBM Regressor — predicts realized pnl, leaf-wise growth + GOSS
+# --------------------------------------------------------------------- #
+# Motivation: xgb_regressor (#31) is the best structural change to date —
+# 5/7 positive windows, 44% WR, 9.9% DD — confirming EV-ranking beats
+# P(win)-ranking. Three of four registered trainers are XGBoost variants;
+# all share level-wise tree growth and the same histogram binning. The model
+# space has algorithmic monoculture even after adding the regression head.
+#
+# LightGBM's leaf-wise growth picks the leaf with max delta-loss (more
+# aggressive splits, better at finding rare-event patterns) and GOSS keeps
+# all large-gradient samples while sub-sampling small-gradient ones — both
+# diverge from XGBoost's defaults in ways that matter on noisy ~200-1000 row
+# train chunks. An EV-prediction head built on this different bias should
+# disagree with xgb_regressor on the marginal trades, which is exactly the
+# diversity that fails the simple avg-prob ensemble (#10) needed.
+#
+# Same sigmoid-on-prediction trick as xgb_regressor so SCORE_THRESHOLDS in
+# return_gate.py keep working without changes.
+class LightGBMRegressorTrainer(BaseTrainer):
+    name = 'lightgbm_regressor'
+
+    SIGMOID_SCALE = 20.0
+
+    def __init__(self,
+                 num_leaves: int = 31,
+                 max_depth: int = 6,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 500,
+                 min_child_samples: int = 50,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.8,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 0.1,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            num_leaves=num_leaves,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            min_child_samples=min_child_samples,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import lightgbm as lgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L). '
+                'The gate must pass them through trainer.fit().')
+
+        p = self._params
+        self.clf = lgb.LGBMRegressor(
+            objective='regression',
+            num_leaves=p['num_leaves'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            n_estimators=p['n_estimators'],
+            min_child_samples=p['min_child_samples'],
+            subsample=p['subsample'],
+            subsample_freq=1,
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            verbose=-1,
+        )
+        callbacks = [lgb.early_stopping(stopping_rounds=p['early_stopping_rounds'],
+                                          verbose=verbose)]
+        if verbose:
+            callbacks.append(lgb.log_evaluation(period=50))
+
+        self.clf.fit(
+            X_train, np.asarray(pnl_train, dtype=np.float32),
+            eval_set=[(X_val, np.asarray(pnl_val, dtype=np.float32))],
+            eval_metric='rmse',
+            callbacks=callbacks,
+        )
+        self._best_iteration = (self.clf.best_iteration_
+                                  if self.clf.best_iteration_ else self.clf.n_estimators)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        pred_pnl = self.clf.predict(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * pred_pnl))
+
+    def predict_pnl(self, X) -> np.ndarray:
+        """Raw predicted P&L (fraction). Useful for diagnostics."""
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict(X)
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.booster_.feature_importance(importance_type='gain')
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.txt')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.booster_.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import lightgbm as lgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.txt')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = lgb.LGBMRegressor()
+        inst.clf._Booster = lgb.Booster(model_file=booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# XGBoost Dual-Quantile — joint upper + lower quantile, downside-aware ranking
+# --------------------------------------------------------------------- #
+# Motivation (from claude iter #32 lesson, finally getting around to it):
+# xgb_quantile@0.7 (#32) was a precision filter — fixed window 4 (+16% → +65%)
+# but regressed on windows 5, 7. The single-tail view captured upside but was
+# blind to the left tail: when right-tail signal is real but downside is
+# unbounded (the noisy ~200-1000 row train chunks are most exposed to this),
+# alpha=0.7 still picked bets whose P25 was deeply negative.
+#
+# Dual quantile fits TWO XGBRegressors at alpha_lower (e.g. 0.25) and
+# alpha_upper (e.g. 0.75). Ranking score combines:
+#     score = pred_upper - dd_penalty * max(0, -pred_lower)
+# When pred_lower is negative (likely loss in the lower 25% of cases), the
+# penalty subtracts from upside; when pred_lower is positive (clean upside-
+# only bet), full upper passes through. This is the conditional-VaR-aware
+# selection rule explicitly proposed in #32's lesson — it should reject the
+# noisy-regime trades that single-quantile and squared-error regressors picked
+# even when downside was uncomfortable.
+#
+# Two independent XGBRegressor objects (XGBoost can't fit two quantiles in a
+# single model with reg:quantileerror — only one alpha per call). Sigmoid trick
+# preserved so SCORE_THRESHOLDS in return_gate.py keep working.
+class XGBoostDualQuantileTrainer(BaseTrainer):
+    name = 'xgb_dual_quantile'
+
+    SIGMOID_SCALE = 20.0
+
+    def __init__(self,
+                 max_depth: int = 6,
+                 learning_rate: float = 0.07,
+                 n_estimators: int = 400,
+                 subsample: float = 0.7,
+                 colsample_bytree: float = 0.78,
+                 reg_alpha: float = 0.37,
+                 reg_lambda: float = 1.46,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.01,
+                 alpha_lower: float = 0.35,
+                 alpha_upper: float = 0.65,
+                 dd_penalty: float = 1.0,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        # Defaults seeded from iter #58's best tree HPs + tight quantiles + low
+        # dd_penalty=1.0 (symmetric weighting). Wider tails (0.25/0.75) with
+        # dd_penalty=2.0 aggressively over-penalized noisy 200-1000 row chunks
+        # at the gate (avg ann -28.7% at first probe). Train mode will sweep
+        # the full ranges in models/search_spaces.py.
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            alpha_lower=alpha_lower,
+            alpha_upper=alpha_upper,
+            dd_penalty=dd_penalty,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf_lower = None
+        self.clf_upper = None
+        self._best_iteration = None
+
+    def _make_regressor(self, alpha):
+        import xgboost as xgb
+        p = self._params
+        return xgb.XGBRegressor(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:quantileerror',
+            quantile_alpha=alpha,
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L). '
+                'The gate must pass them through trainer.fit().')
+
+        p = self._params
+        pnl_tr = np.asarray(pnl_train, dtype=np.float32)
+        pnl_va = np.asarray(pnl_val, dtype=np.float32)
+
+        self.clf_lower = self._make_regressor(p['alpha_lower'])
+        self.clf_lower.fit(X_train, pnl_tr, eval_set=[(X_val, pnl_va)], verbose=verbose)
+
+        self.clf_upper = self._make_regressor(p['alpha_upper'])
+        self.clf_upper.fit(X_train, pnl_tr, eval_set=[(X_val, pnl_va)], verbose=verbose)
+
+        bi_lower = getattr(self.clf_lower, 'best_iteration', None) or p['n_estimators']
+        bi_upper = getattr(self.clf_upper, 'best_iteration', None) or p['n_estimators']
+        self._best_iteration = max(bi_lower, bi_upper)
+        return self
+
+    def _combined_score(self, X) -> np.ndarray:
+        pred_lower = self.clf_lower.predict(X)
+        pred_upper = self.clf_upper.predict(X)
+        downside = np.maximum(0.0, -pred_lower)
+        return pred_upper - self._params['dd_penalty'] * downside
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf_lower is None or self.clf_upper is None:
+            raise RuntimeError('Model not fit')
+        score = self._combined_score(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * score))
+
+    def predict_pnl(self, X) -> np.ndarray:
+        """Raw combined score (upper_q - dd_penalty * downside). Diagnostics."""
+        if self.clf_lower is None or self.clf_upper is None:
+            raise RuntimeError('Model not fit')
+        return self._combined_score(X)
+
+    def feature_importance(self):
+        if self.clf_upper is None:
+            return None
+        # Average of two heads — both contribute to the ranking score.
+        fi_upper = self.clf_upper.feature_importances_
+        fi_lower = self.clf_lower.feature_importances_
+        return 0.5 * (fi_upper + fi_lower)
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        lower_path = os.path.join(output_dir, 'booster_lower.json')
+        upper_path = os.path.join(output_dir, 'booster_upper.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf_lower.save_model(lower_path)
+        self.clf_upper.save_model(upper_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model_lower': lower_path, 'model_upper': upper_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        lower_path = os.path.join(output_dir, 'booster_lower.json')
+        upper_path = os.path.join(output_dir, 'booster_upper.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf_lower = xgb.XGBRegressor()
+        inst.clf_lower.load_model(lower_path)
+        inst.clf_upper = xgb.XGBRegressor()
+        inst.clf_upper.load_model(upper_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# XGBoost Pairwise Ranker — date-grouped learning-to-rank
+# --------------------------------------------------------------------- #
+# Motivation: at gate time the deployment task is per-date ranking — pick the
+# highest-scoring symbol on each trading date, only trade when score >=
+# threshold. Every prior head (classifier, EV regressor, quantile, dual-
+# quantile) predicts an absolute magnitude (P(win), E[pnl], Q_alpha(pnl),
+# upper_q - penalty * downside) and *hopes* good rankings emerge. A direct
+# pairwise ranking loss trains on the actual ranking task: minimize the count
+# of pairs (a, b) within a date group where pred(less-pnl) > pred(more-pnl).
+#
+# Structurally distinct from xgb_dual_quantile (#64, the best result to date
+# at avg ann +41.9%, WR 45.7%, DD 11.6% but only 2/7 windows passing): same
+# tree family but the loss only sees *relative ordering within each date
+# group*, never absolute pnl. Robustness arguments:
+#   - regime pnl-scale shifts: a +2% bull day and a -1% chop day are the same
+#     per-date ranking problem; mean/quantile losses see them as different
+#     prediction tasks because the conditional means/quantiles shift.
+#   - outlier-driven mean drag: pairwise loss is bounded per-pair (logistic-
+#     style on margin), not dominated by a single +15% target hit pulling the
+#     conditional mean upward.
+#   - cross-day calibration noise: ranker scores need not be on a consistent
+#     absolute scale across dates — dual_quantile/regressor heads need to
+#     predict on a coherent absolute scale across all regimes for the gate's
+#     SCORE_THRESHOLDS sweep to work, the ranker only needs within-date order.
+#
+# Group structure: dates_train / dates_val arrays passed via fit() are bucketed
+# into per-date groups (consecutive same-date rows after stable sort). XGBRanker
+# learns pairwise comparisons of pnl across rows within each date.
+#
+# Predict-time: raw ranker output → sigmoid(SIGMOID_SCALE * pred). Output is
+# unbounded but typically O(1) magnitude with default tree HPs, so SIGMOID_SCALE
+# = 1.0 maps the practical [-3, +3] range to roughly (0.05, 0.95) which spans
+# the gate's SCORE_THRESHOLDS [0.30..0.70]. Order is preserved exactly so the
+# gate's per-date highest-score selection works correctly.
+class XGBoostRankerTrainer(BaseTrainer):
+    name = 'xgb_ranker'
+
+    # Ranker output is unbounded; empirically scores have std ~0.05-0.3 on real
+    # data depending on tree depth / n_estimators. SCALE=10 maps a typical
+    # ±0.2 range onto sigmoid(±2) → roughly (0.12, 0.88) which spans the
+    # gate's SCORE_THRESHOLDS [0.30..0.70] with discrimination at every level.
+    SIGMOID_SCALE = 10.0
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    @staticmethod
+    def _group_counts(dates):
+        """Sort indices by date and return contiguous-group counts.
+
+        XGBRanker requires `group=[count_g0, count_g1, ...]` where rows are
+        already laid out so each group's rows are contiguous. We achieve that
+        with a stable sort on dates, then run-length-encode the sorted dates.
+        Returns (sort_order, group_counts).
+        """
+        d = np.asarray(dates)
+        order = np.argsort(d, kind='stable')
+        # np.unique on the sorted array gives counts in sorted order — exactly
+        # what XGBoost expects since after `[order]` the rows are contiguous.
+        _, counts = np.unique(d[order], return_counts=True)
+        return order, counts.astype(np.int64)
+
+    @staticmethod
+    def _within_group_rank(values, group_counts):
+        """Replace each value with its 0-indexed rank within its group.
+
+        XGBoost ranking requires integer relevance labels. For pairwise loss
+        the absolute scale doesn't matter — only ordinal position within
+        each group does. So per-group rank IS the natural relevance: the
+        row with highest pnl in a date gets rank=cnt-1, lowest gets rank=0.
+        """
+        out = np.empty_like(values, dtype=np.int32)
+        idx = 0
+        for cnt in group_counts:
+            chunk = values[idx:idx + cnt]
+            # argsort(argsort(...)) gives 0..cnt-1 ordinal ranks
+            ranks = np.argsort(np.argsort(chunk, kind='stable'), kind='stable')
+            out[idx:idx + cnt] = ranks.astype(np.int32)
+            idx += cnt
+        return out
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L).')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for date-group ranking. '
+                'The gate must pass them through trainer.fit().')
+
+        order_tr, groups_tr = self._group_counts(dates_train)
+        order_va, groups_va = self._group_counts(dates_val)
+        X_tr_sorted = np.asarray(X_train)[order_tr]
+        pnl_tr_sorted = np.asarray(pnl_train, dtype=np.float32)[order_tr]
+        X_va_sorted = np.asarray(X_val)[order_va]
+        pnl_va_sorted = np.asarray(pnl_val, dtype=np.float32)[order_va]
+
+        # Pairwise ranking needs at least one group with >= 2 samples; in
+        # practice the ML pipeline has ~10-50 rows per date so this never trips.
+        if (groups_tr < 2).all():
+            raise ValueError(f'{self.name}: no train date has >=2 samples — '
+                             'pairwise ranking is impossible')
+
+        # XGBoost requires non-negative integer relevance labels (NDCG eval is
+        # the default for ranker even with rank:pairwise objective). Per-group
+        # rank of pnl gives the model exactly the within-date ordering signal it
+        # needs without leaking absolute pnl scale.
+        rel_tr = self._within_group_rank(pnl_tr_sorted, groups_tr)
+        rel_va = self._within_group_rank(pnl_va_sorted, groups_va)
+
+        p = self._params
+        # ndcg_exp_gain=False — default exponential gain caps relevance at 31,
+        # but per-group rank exceeds this on dates with >32 stocks (typical SET
+        # universe). Linear DCG gain has no cap and works equally well as the
+        # eval metric for early stopping.
+        self.clf = xgb.XGBRanker(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='rank:pairwise',
+            ndcg_exp_gain=False,
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            X_tr_sorted, rel_tr,
+            group=groups_tr,
+            eval_set=[(X_va_sorted, rel_va)],
+            eval_group=[groups_va],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        pred = self.clf.predict(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * pred))
+
+    def predict_score(self, X) -> np.ndarray:
+        """Raw ranker score (unbounded). Useful for diagnostics."""
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict(X)
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = xgb.XGBRanker()
+        inst.clf.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# XGBoost Ranker (DART booster) — pairwise ranker with stochastic tree dropout
+# --------------------------------------------------------------------- #
+# Motivation: HP sweeping on xgb_ranker (#136-#143) plateaus at 5/7 windows
+# with avg WR ~45% and DD <10% — never 7/7. The two failing windows are
+# regime-specific: the model latches onto patterns that don't transfer
+# across the calendar splits. This is overfitting expressed as regime
+# variance, not training-set variance — early stopping caught the latter
+# already.
+#
+# DART (Dropouts meet Multiple Additive Regression Trees, Rashmi & Gilad-
+# Bachrach, AISTATS 2015) is XGBoost's native answer to this. Each boosting
+# round drops a random subset of already-grown trees (rate_drop) before
+# fitting the new tree against the *partial* ensemble's residuals; with
+# probability skip_drop the round skips dropping entirely (so training
+# remains progressive). Effects:
+#   - Forces each tree to encode a redundant, broadly-useful signal rather
+#     than a specialized correction to a specific narrow residual pattern.
+#   - Acts like a stochastic deep ensemble inside the single booster: at
+#     inference, all trees are kept, but they were trained against many
+#     random sub-ensembles.
+#   - Empirically reduces train/test divergence on small/noisy tabular data
+#     where standard GBT overfits the latest few residual patterns.
+#
+# Why this trainer (not just a flag on xgb_ranker): DART introduces two
+# extra HPs (rate_drop, skip_drop) and changes the inference path subtly —
+# e.g. early stopping on DART evaluates against the dropped sub-ensemble,
+# so its best_iteration semantics differ. Keeping it as a sibling trainer
+# lets train mode HP-sweep DART independently without contaminating the
+# xgb_ranker search space, and lets feedback attribute wins cleanly to
+# either standard boosting or DART regularization.
+#
+# Inherits all the date-group ranking machinery from XGBoostRankerTrainer:
+# same _group_counts / _within_group_rank helpers, same SIGMOID_SCALE
+# mapping (DART scores have similar magnitude to GBT ranker scores —
+# trees are merged at inference, only the training schedule differs).
+class XGBoostRankerDartTrainer(XGBoostRankerTrainer):
+    name = 'xgb_ranker_dart'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 rate_drop: float = 0.1,
+                 skip_drop: float = 0.5,
+                 sample_type: str = 'uniform',
+                 normalize_type: str = 'tree',
+                 early_stopping_rounds: int = 50,
+                 random_state: int = 42):
+        # Skip the XGBoostRankerTrainer __init__ — we own _params layout.
+        # rate_drop ∈ [0, 1]: fraction of existing trees to drop each round.
+        #   0.0 collapses to GBT; >0.3 is unstable on small data. Default 0.1
+        #   is the value Rashmi & Gilad-Bachrach found best across UCI tasks.
+        # skip_drop ∈ [0, 1]: probability a round skips dropping entirely.
+        #   0.5 means half the rounds train against the full prior ensemble
+        #   (fast progress); the other half against random sub-ensembles
+        #   (regularization). Decoupling these two knobs is what gives DART
+        #   its tuneable expressiveness vs plain bagging.
+        # sample_type: 'uniform' draws drop set uniformly; 'weighted' favors
+        #   trees with larger residual contribution — usually slightly better
+        #   on noisy data, but more sensitive to outliers. Default 'uniform'.
+        # normalize_type: 'tree' rescales each surviving tree by 1/(k+1) where
+        #   k = #dropped trees that round, preserving total tree weight.
+        #   'forest' rescales by 1/(k+lr); typically marginal effect.
+        # early_stopping_rounds raised 30→50: DART's stochastic dropout means
+        #   eval-loss curves are noisier than GBT's, so early stopping needs
+        #   a wider patience window to avoid stopping on noise.
+        BaseTrainer.__init__(self)
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            rate_drop=rate_drop,
+            skip_drop=skip_drop,
+            sample_type=sample_type,
+            normalize_type=normalize_type,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L).')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for date-group ranking. '
+                'The gate must pass them through trainer.fit().')
+
+        order_tr, groups_tr = self._group_counts(dates_train)
+        order_va, groups_va = self._group_counts(dates_val)
+        X_tr_sorted = np.asarray(X_train)[order_tr]
+        pnl_tr_sorted = np.asarray(pnl_train, dtype=np.float32)[order_tr]
+        X_va_sorted = np.asarray(X_val)[order_va]
+        pnl_va_sorted = np.asarray(pnl_val, dtype=np.float32)[order_va]
+
+        if (groups_tr < 2).all():
+            raise ValueError(f'{self.name}: no train date has >=2 samples — '
+                             'pairwise ranking is impossible')
+
+        rel_tr = self._within_group_rank(pnl_tr_sorted, groups_tr)
+        rel_va = self._within_group_rank(pnl_va_sorted, groups_va)
+
+        p = self._params
+        self.clf = xgb.XGBRanker(
+            booster='dart',
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            rate_drop=p['rate_drop'],
+            skip_drop=p['skip_drop'],
+            sample_type=p['sample_type'],
+            normalize_type=p['normalize_type'],
+            objective='rank:pairwise',
+            ndcg_exp_gain=False,
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            X_tr_sorted, rel_tr,
+            group=groups_tr,
+            eval_set=[(X_va_sorted, rel_va)],
+            eval_group=[groups_va],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+
+# --------------------------------------------------------------------- #
+# LightGBM LambdaRank — date-grouped listwise ranking with leaf-wise+GOSS bias
+# --------------------------------------------------------------------- #
+# Motivation: xgb_ranker (#80) was the most consistent claude-mode result —
+# avg WR 49.5% (best of any iter to date), avg DD 10.7%, ZERO negative-ann
+# windows — but only 1/7 windows cleared the 50% annualized gate. The
+# regime-variance bottleneck remains: WR 49.5% × ~3-5% avg per-trade × ~10
+# trades / 4mo gives 15-20% raw return, short of the 50% gate.
+#
+# Two structural levers stack here:
+#   1. lambdarank vs rank:pairwise — LightGBM's lambdarank objective re-weights
+#      each pair by its delta-NDCG contribution, putting ~10-100x more loss
+#      gradient on swaps near the top of the list than swaps in the middle.
+#      The gate selects exactly one symbol per date (the highest score), so
+#      top-of-list ranking is *the* objective. Pairwise loss treats all swaps
+#      equally and "wastes" capacity on mid-list ordering that the gate never
+#      sees.
+#   2. leaf-wise growth + GOSS — #48's lesson confirmed LightGBM finds signals
+#      XGBoost misses (split 4: +168.6% ann at 66.7% WR). Pairing the proven
+#      ranker-loss insight (#80) with the proven LGB algorithmic-diversity
+#      insight (#48) targets two independent failure modes simultaneously.
+#
+# Implementation notes:
+#   - Same _group_counts / _within_group_rank helpers as xgb_ranker (sort by
+#     date, run-length-encode, integer rank-within-group as relevance).
+#   - LightGBM's default label_gain is exponential and tops out at ~30; on
+#     SET universe dates with up to ~70 stocks, max relevance can exceed this.
+#     Solution: pass label_gain=list(range(max_rel+1)) (linear gain), which is
+#     the lambdarank-equivalent of XGBoost's ndcg_exp_gain=False.
+#   - SIGMOID_SCALE=10 mirrors xgb_ranker — raw lambdarank scores have similar
+#     magnitude to XGBRanker's scores, both empirically O(±0.2) on this data,
+#     so the same scale maps to the gate's [0.30, 0.70] threshold range.
+class LightGBMRankerTrainer(BaseTrainer):
+    name = 'lightgbm_ranker'
+
+    SIGMOID_SCALE = 10.0
+
+    def __init__(self,
+                 num_leaves: int = 31,
+                 max_depth: int = 6,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 min_child_samples: int = 50,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.8,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 0.1,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            num_leaves=num_leaves,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            min_child_samples=min_child_samples,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    @staticmethod
+    def _group_counts(dates):
+        """Sort indices by date and return (sort_order, group_counts).
+        Mirrors XGBoostRankerTrainer._group_counts — same contract."""
+        d = np.asarray(dates)
+        order = np.argsort(d, kind='stable')
+        _, counts = np.unique(d[order], return_counts=True)
+        return order, counts.astype(np.int64)
+
+    @staticmethod
+    def _within_group_rank(values, group_counts):
+        """0-indexed integer rank of each value within its date group.
+        Mirrors XGBoostRankerTrainer — pairwise/listwise loss only sees ordinal
+        position within each group, not absolute pnl scale."""
+        out = np.empty_like(values, dtype=np.int32)
+        idx = 0
+        for cnt in group_counts:
+            chunk = values[idx:idx + cnt]
+            ranks = np.argsort(np.argsort(chunk, kind='stable'), kind='stable')
+            out[idx:idx + cnt] = ranks.astype(np.int32)
+            idx += cnt
+        return out
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import lightgbm as lgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L).')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for date-group ranking.')
+
+        order_tr, groups_tr = self._group_counts(dates_train)
+        order_va, groups_va = self._group_counts(dates_val)
+        X_tr_sorted = np.asarray(X_train)[order_tr]
+        pnl_tr_sorted = np.asarray(pnl_train, dtype=np.float32)[order_tr]
+        X_va_sorted = np.asarray(X_val)[order_va]
+        pnl_va_sorted = np.asarray(pnl_val, dtype=np.float32)[order_va]
+
+        if (groups_tr < 2).all():
+            raise ValueError(f'{self.name}: no train date has >=2 samples — '
+                             'pairwise ranking is impossible')
+
+        rel_tr = self._within_group_rank(pnl_tr_sorted, groups_tr)
+        rel_va = self._within_group_rank(pnl_va_sorted, groups_va)
+
+        # Linear label_gain replaces LightGBM's default exponential gain (which
+        # caps at ~30 levels). With per-date stock counts up to ~70, integer
+        # ranks can exceed the default cap; linear gain avoids the silent
+        # truncation that would corrupt the lambdarank loss.
+        max_rel = int(max(rel_tr.max(), rel_va.max()))
+        label_gain = list(range(max_rel + 1))
+
+        p = self._params
+        self.clf = lgb.LGBMRanker(
+            objective='lambdarank',
+            num_leaves=p['num_leaves'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            n_estimators=p['n_estimators'],
+            min_child_samples=p['min_child_samples'],
+            subsample=p['subsample'],
+            subsample_freq=1,
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            verbose=-1,
+            label_gain=label_gain,
+        )
+        callbacks = [lgb.early_stopping(stopping_rounds=p['early_stopping_rounds'],
+                                          verbose=verbose)]
+        if verbose:
+            callbacks.append(lgb.log_evaluation(period=50))
+
+        self.clf.fit(
+            X_tr_sorted, rel_tr,
+            group=groups_tr,
+            eval_set=[(X_va_sorted, rel_va)],
+            eval_group=[groups_va],
+            callbacks=callbacks,
+        )
+        self._best_iteration = (self.clf.best_iteration_
+                                  if self.clf.best_iteration_ else self.clf.n_estimators)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        pred = self.clf.predict(X)
+        return 1.0 / (1.0 + np.exp(-self.SIGMOID_SCALE * pred))
+
+    def predict_score(self, X) -> np.ndarray:
+        """Raw lambdarank score (unbounded). Useful for diagnostics."""
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict(X)
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.booster_.feature_importance(importance_type='gain')
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.txt')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.booster_.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'sigmoid_scale': self.SIGMOID_SCALE,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import lightgbm as lgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.txt')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = lgb.LGBMRanker()
+        inst.clf._Booster = lgb.Booster(model_file=booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# Stacked Ranker — validation-fold-weighted ensemble of three diverse heads
+# --------------------------------------------------------------------- #
+# Motivation: per-window analysis of the three best claude iterations shows
+# the heads disagree by REGIME, not by quality:
+#   w1 (2023-Q4): only xgb_ranker(#80) +; dual_quantile(#64) and lgb_ranker(#96) deeply -
+#   w3 (2024-summer): xgb_dual_quantile(#64) +42%; xgb_ranker(#80) -1%
+#   w5 (2025-Q1): xgb_ranker(#80) +26%; lgb_ranker(#96) -27%
+#   w6 (2025-summer): dual_quantile(#64) +99% / lgb_ranker(#96) +71%; xgb_ranker(#80) +2%
+# A regime-aware ensemble that learns per-fold weights from the held-out
+# validation slice should systematically pick the right head per regime,
+# converting the loop's "1/7 windows pass" plateau into a higher pass rate.
+#
+# Distinct from the failed avg-prob ensemble (#10):
+#   - #10 averaged TWO classifiers at default HPs with EQUAL weights
+#   - This stacks THREE different loss functions (rank:pairwise / lambdarank /
+#     dual-quantile EV) with VALIDATION-LEARNED weights
+#   - Weight objective: Spearman ρ(weighted_score, pnl_val) — directly aligned
+#     with the gate's per-date highest-score selection task
+#
+# Sub-trainer HPs are seeded from the published best-of-loop configs:
+#   xgb_ranker: #80's HPs (depth=3, lr=0.03, n_est=800, min_child_weight=20)
+#   lgb_ranker: #96's HPs (num_leaves=15, depth=4, lr=0.03, n_est=1000, min_child=100)
+#   dual_quantile: defaults (which are #58's best HPs + tight quantiles)
+# These sub-HPs are FROZEN — train mode tunes the stacker's own knobs
+# (weight grid resolution, sub-trainer subset toggles) per search_spaces.py.
+#
+# Output: weighted avg of sub-trainer predict_proba outputs. Each sub-trainer
+# already maps its raw output through a sigmoid into [0,1], so the weighted
+# avg is also in [0,1] and SCORE_THRESHOLDS [0.30..0.70] keep working.
+class StackedRankerTrainer(BaseTrainer):
+    name = 'stacked_ranker'
+
+    # Sub-trainer HPs frozen at best-known configs; only the random_state is
+    # exposed (so train mode can do seed-stability sweeps).
+    XGB_RANKER_HP = dict(max_depth=3, learning_rate=0.03, n_estimators=800,
+                         min_child_weight=20.0, gamma=0.1, subsample=0.8,
+                         colsample_bytree=0.6, reg_alpha=0.1, reg_lambda=1.0)
+    LGB_RANKER_HP = dict(num_leaves=15, max_depth=4, learning_rate=0.03,
+                         n_estimators=1000, min_child_samples=100,
+                         subsample=0.8, colsample_bytree=0.8,
+                         reg_alpha=0.1, reg_lambda=0.5)
+    DUAL_QUANTILE_HP = dict(max_depth=6, learning_rate=0.07, n_estimators=400,
+                            subsample=0.7, colsample_bytree=0.78,
+                            reg_alpha=0.37, reg_lambda=1.46,
+                            min_child_weight=5.0, gamma=0.01,
+                            alpha_lower=0.35, alpha_upper=0.65, dd_penalty=1.0)
+
+    def __init__(self,
+                 weight_grid_step: float = 0.1,
+                 use_uniform_fallback: bool = True,
+                 min_concordance: float = 0.0,
+                 aggregation: str = 'weighted_max',
+                 random_state: int = 42,
+                 early_stopping_rounds: int = 30):
+        # weight_grid_step: resolution of the simplex grid search (0.1 → ~66 combos)
+        # use_uniform_fallback: when val concordance for the best learned combo
+        #   is below min_concordance, fall back to equal weights (safer than
+        #   over-fitting to a small noisy val fold)
+        # min_concordance: Spearman ρ floor for accepting learned weights
+        # aggregation: 'weighted_avg' compresses scores around 0.5 when sub-models
+        #   disagree (gate run #1 result: 0 trades in 4/7 splits because avg of
+        #   3 sigmoids stayed under thr=0.30). 'weighted_max' takes the
+        #   weight-scaled max per row — preserves spread, lets the most-confident
+        #   sub-model on each row drive the prediction, but uses learned weights
+        #   to *attenuate* low-quality sub-models rather than zero them out:
+        #     score(row) = max_i (w_i * p_i(row))
+        #   When all three w_i are similar, behaves close to plain max
+        #   (high-confidence picks survive). When learned weights are skewed
+        #   to one model, behaves close to that model (winner-take-all).
+        self._params = dict(
+            weight_grid_step=weight_grid_step,
+            use_uniform_fallback=use_uniform_fallback,
+            min_concordance=min_concordance,
+            aggregation=aggregation,
+            random_state=random_state,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+        self.xgb_ranker = None
+        self.lgb_ranker = None
+        self.dual_quantile = None
+        self.weights = None  # (w_xgb_ranker, w_lgb_ranker, w_dual_quantile)
+        self._best_iteration = None
+        self._val_concordance = None
+        self._learned_weights = None  # weights chosen by grid search before fallback
+
+    @staticmethod
+    def _spearman(a, b):
+        """Spearman ρ via Pearson on ranks. Returns 0.0 if either input is constant."""
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        if a.std() == 0 or b.std() == 0:
+            return 0.0
+        ra = np.argsort(np.argsort(a, kind='stable'), kind='stable').astype(np.float64)
+        rb = np.argsort(np.argsort(b, kind='stable'), kind='stable').astype(np.float64)
+        ra -= ra.mean()
+        rb -= rb.mean()
+        denom = np.sqrt((ra * ra).sum() * (rb * rb).sum())
+        if denom == 0:
+            return 0.0
+        return float((ra * rb).sum() / denom)
+
+    def _aggregate(self, p1, p2, p3, weights):
+        w1, w2, w3 = weights
+        if self._params['aggregation'] == 'weighted_avg':
+            return w1 * p1 + w2 * p2 + w3 * p3
+        # weighted_max: row-wise maximum of weight-scaled component probabilities
+        stacked = np.vstack([w1 * p1, w2 * p2, w3 * p3])
+        return stacked.max(axis=0)
+
+    def _learn_weights(self, p1, p2, p3, pnl_val):
+        """Grid search on the 3-simplex for weights maximising Spearman ρ(score, pnl).
+
+        Returns (best_weights, best_rho).
+        """
+        step = self._params['weight_grid_step']
+        n_steps = int(round(1.0 / step))
+        best_w = (1/3, 1/3, 1/3)
+        best_rho = -2.0
+        for i in range(n_steps + 1):
+            for j in range(n_steps + 1 - i):
+                k = n_steps - i - j
+                w1, w2, w3 = i * step, j * step, k * step
+                score = self._aggregate(p1, p2, p3, (w1, w2, w3))
+                rho = self._spearman(score, pnl_val)
+                if rho > best_rho:
+                    best_rho = rho
+                    best_w = (w1, w2, w3)
+        return best_w, best_rho
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train/pnl_val (its xgb_dual_quantile component '
+                'predicts EV directly).')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train/dates_val (its ranker components '
+                'use date-grouped pairwise/listwise ranking loss).')
+
+        rs = self._params['random_state']
+        esr = self._params['early_stopping_rounds']
+
+        self.xgb_ranker = XGBoostRankerTrainer(
+            random_state=rs, early_stopping_rounds=esr,
+            **self.XGB_RANKER_HP)
+        self.xgb_ranker.fit(X_train, y_train, X_val, y_val, verbose=verbose,
+                            pnl_train=pnl_train, pnl_val=pnl_val,
+                            dates_train=dates_train, dates_val=dates_val)
+
+        self.lgb_ranker = LightGBMRankerTrainer(
+            random_state=rs, early_stopping_rounds=esr,
+            **self.LGB_RANKER_HP)
+        self.lgb_ranker.fit(X_train, y_train, X_val, y_val, verbose=verbose,
+                            pnl_train=pnl_train, pnl_val=pnl_val,
+                            dates_train=dates_train, dates_val=dates_val)
+
+        self.dual_quantile = XGBoostDualQuantileTrainer(
+            random_state=rs, early_stopping_rounds=esr,
+            **self.DUAL_QUANTILE_HP)
+        self.dual_quantile.fit(X_train, y_train, X_val, y_val, verbose=verbose,
+                               pnl_train=pnl_train, pnl_val=pnl_val,
+                               dates_train=dates_train, dates_val=dates_val)
+
+        # Learn weights on the validation fold using Spearman concordance
+        p_xgb = self.xgb_ranker.predict_proba(X_val)
+        p_lgb = self.lgb_ranker.predict_proba(X_val)
+        p_dual = self.dual_quantile.predict_proba(X_val)
+        pnl_arr = np.asarray(pnl_val, dtype=np.float64)
+
+        learned, rho = self._learn_weights(p_xgb, p_lgb, p_dual, pnl_arr)
+        self._learned_weights = learned
+        self._val_concordance = float(rho)
+
+        # Fallback: when val concordance is too weak (small/noisy fold), uniform
+        # weights are a safer prior than over-fitting to a single fold's quirks.
+        if (self._params['use_uniform_fallback']
+                and rho < self._params['min_concordance']):
+            self.weights = (1/3, 1/3, 1/3)
+        else:
+            self.weights = learned
+
+        # Composite best_iteration: max of components (used for logging only).
+        bi_xgb = self.xgb_ranker.best_iteration or 0
+        bi_lgb = self.lgb_ranker.best_iteration or 0
+        bi_dual = self.dual_quantile.best_iteration or 0
+        self._best_iteration = max(bi_xgb, bi_lgb, bi_dual)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.xgb_ranker is None or self.lgb_ranker is None or self.dual_quantile is None:
+            raise RuntimeError('Model not fit')
+        if self.weights is None:
+            raise RuntimeError('Stacker weights not set — fit() must run first')
+        p1 = self.xgb_ranker.predict_proba(X)
+        p2 = self.lgb_ranker.predict_proba(X)
+        p3 = self.dual_quantile.predict_proba(X)
+        return self._aggregate(p1, p2, p3, self.weights)
+
+    def feature_importance(self):
+        if self.xgb_ranker is None:
+            return None
+        # Stacker's importance is a weighted blend of component importances —
+        # treats sub-trainer absent importance arrays as zero contributions.
+        w1, w2, w3 = self.weights
+        fi_xgb = self.xgb_ranker.feature_importance()
+        fi_lgb = self.lgb_ranker.feature_importance()
+        fi_dual = self.dual_quantile.feature_importance()
+        if fi_xgb is None or fi_lgb is None or fi_dual is None:
+            return None
+        # Each sub-trainer normalizes importances differently; normalize each
+        # to sum=1 before weighting so the blend is in comparable units.
+        def _norm(fi):
+            s = fi.sum()
+            return fi / s if s > 0 else fi
+        return w1 * _norm(fi_xgb) + w2 * _norm(fi_lgb) + w3 * _norm(fi_dual)
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        xgb_dir = os.path.join(output_dir, 'xgb_ranker')
+        lgb_dir = os.path.join(output_dir, 'lgb_ranker')
+        dual_dir = os.path.join(output_dir, 'dual_quantile')
+        self.xgb_ranker.save(xgb_dir)
+        self.lgb_ranker.save(lgb_dir)
+        self.dual_quantile.save(dual_dir)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'weights': list(self.weights),
+            'learned_weights': list(self._learned_weights) if self._learned_weights else None,
+            'val_concordance': self._val_concordance,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {
+            'xgb_ranker_dir': xgb_dir,
+            'lgb_ranker_dir': lgb_dir,
+            'dual_quantile_dir': dual_dir,
+            'metadata': meta_path,
+        }
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.xgb_ranker = XGBoostRankerTrainer.load(os.path.join(output_dir, 'xgb_ranker'))
+        inst.lgb_ranker = LightGBMRankerTrainer.load(os.path.join(output_dir, 'lgb_ranker'))
+        inst.dual_quantile = XGBoostDualQuantileTrainer.load(os.path.join(output_dir, 'dual_quantile'))
+        inst.weights = tuple(meta.get('weights', (1/3, 1/3, 1/3)))
+        lw = meta.get('learned_weights')
+        inst._learned_weights = tuple(lw) if lw else None
+        inst._val_concordance = meta.get('val_concordance')
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
+    'lightgbm_regressor': LightGBMRegressorTrainer,
+    'lightgbm_ranker': LightGBMRankerTrainer,
     'xgboost': XGBoostTrainer,
+    'xgb_regressor': XGBoostRegressorTrainer,
+    'bagged_xgb_regressor': BaggedXGBRegressorTrainer,
+    'xgb_huber_regressor': XGBoostHuberRegressorTrainer,
+    'xgb_quantile': XGBoostQuantileTrainer,
+    'xgb_dual_quantile': XGBoostDualQuantileTrainer,
+    'xgb_ranker': XGBoostRankerTrainer,
+    'xgb_ranker_dart': XGBoostRankerDartTrainer,
+    'stacked_ranker': StackedRankerTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

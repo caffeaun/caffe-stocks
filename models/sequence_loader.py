@@ -23,6 +23,21 @@ from .labels import (
 BASE_PATH = os.path.expanduser('~/projects/caffe-stocks')
 DB_PATH = os.path.join(BASE_PATH, 'data', 'candles.db')
 
+# Minimum entry price (THB) for a sample to enter the training/eval set.
+# Why: SET tick size below 2 baht is 0.01 — at entry_price=0.01 that is a
+# 100% bid-ask granularity, so any one-tick upward move trivially clears
+# the +15% target with pnl capped at +14.45%. The result was inflated
+# windowed annualized returns up to 10^13 % (iter #172, WR=89% at threshold
+# 0.30 in window 7) driven by the model selecting penny stocks where
+# tick-size noise dominates. 22.8% of pre-filter candles have close<1 baht,
+# concentrated in 51 always-sub-baht symbols (TWZ, KC, EMC, MORE, …) that
+# are also untradable for a 10k-THB account: the BLS 100-share min lot
+# means a 0.01-baht "position" is literally 1 baht. Filtering at the
+# load-sequences boundary is the right layer because both train mode and
+# the gate share this loader, and the friction model in labels.py cannot
+# fix tick-quantized fills it never observes.
+MIN_TRADE_PRICE = 1.0
+
 
 def label_trade_with_hold(highs, lows, closes, entry_price,
                           stop_pct=STOP_PCT, target_pct=TARGET_PCT,
@@ -118,6 +133,7 @@ def load_sequences(seq_len=20, lookahead=10, db_path=DB_PATH, cache_dir=None,
         f'{seq_len},{lookahead}',
         f'{STOP_PCT},{TARGET_PCT},{TRAILING_TRIGGER},{TRAILING_FLOOR},{MAX_HOLD}',
         f'min_profit={MIN_PROFIT_PCT},clean_dd={CLEAN_WIN_MAX_DD},comm={COMMISSION_PCT}',
+        f'min_trade_price={MIN_TRADE_PRICE}',
         'v1_with_hold',
     ]
     cache_hash = hashlib.md5('|'.join(cache_key_parts).encode()).hexdigest()[:12]
@@ -149,6 +165,8 @@ def load_sequences(seq_len=20, lookahead=10, db_path=DB_PATH, cache_dir=None,
                 continue
 
             entry_price = sdf.iloc[i + seq_len - 1]['close']
+            if entry_price < MIN_TRADE_PRICE:
+                continue
             window = sdf.iloc[i + seq_len:i + seq_len + lookahead]
             label, pnl, hold, _reason = label_trade_with_hold(
                 window['high'].values, window['low'].values,
