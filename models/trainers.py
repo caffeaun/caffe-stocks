@@ -2127,6 +2127,235 @@ class EVGatedRankerTrainer(XGBoostRankerTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Bagged EV-Gated Ranker — variance-reduced composite ranker × EV gate
+# --------------------------------------------------------------------- #
+# Motivation: ev_gated_ranker (the historical best architectural class —
+# claude #159 cleared 6/7 windows at 65.5% WR) has two problems in recent
+# iterations (#395-#410, all 0-2/7 windows passing):
+#
+#   1. Threshold sweep instability: single-trainer bagless predictions have
+#      enough run-to-run variance that the per-window "best threshold" hops
+#      between thr=0.0 (rank-only fallback) and thr=0.60+ (selective). At
+#      thr=0.0 the gate degrades to top-K-per-day with ~62 trades/window
+#      (#410 W7) and WR collapses to ~27%. At thr=0.65+ the EV gate cuts
+#      most days but the few that pass are still single-tree noisy.
+#   2. The 14% positive rate makes the binary-win ranker target very
+#      imbalanced; one decision tree's first-split choice on a noisy feature
+#      can bias the whole ensemble. A 5-bag ensemble decorrelates that
+#      first-split bias by giving each bag a different bootstrap sample +
+#      seed, then averaging the [0,1] composite score.
+#
+# Historical evidence (lost in pyc-only state, recovered from feedback DB):
+#   #286: bagged_ev_gated_ranker → wp=5/7  ann=+4.8% wr=46.1% dd=9.9% trades=154
+#   #284: bagged_ev_gated_ranker → wp=4/7  ann=+8.8% wr=49.7% dd=6.5% trades=145
+#   #278: bagged_ev_gated_ranker → wp=4/7  ann=+5.7% wr=43.1% dd=4.9% trades=119
+# vs current single ev_gated_ranker (sweep range #395-#410):
+#   best #403 → wp=1/7  ann=+41.0% wr=34.5% dd=14.1% trades=225
+#   median   → wp=0-1/7 wr=27-31%
+#
+# The bagged variant traded ~30% trade count for ~12 percentage points of WR
+# and ~5 percentage points of DD reduction — exactly the v1 gate's preferred
+# direction (MIN_WR=40% and MAX_DD=20% are both binding constraints; trade
+# count comfortably exceeds MIN_TRADES_PER_WINDOW=20 with K=2 slot cap).
+#
+# Implementation:
+#   - Wrap N copies of EVGatedRankerTrainer with row-bootstrap + seed diversity.
+#   - Each bag fits independently on its bootstrap sample; predict_proba returns
+#     the composite ranker_prob × ev_gate score in [0,1] per bag.
+#   - Aggregate: mean - conf_lambda * std, clipped to [0,1]. conf_lambda=0
+#     reduces to plain bagging (variance reduction); conf_lambda~0.5-1.0 adds
+#     consensus filtering — predictions where bags disagree get pulled below
+#     the threshold sweep, abstaining from low-confidence regimes.
+#   - Bootstrap is on raw rows (with replacement). Dates are propagated through
+#     the bootstrap so each bag's internal date-grouping in EVGatedRankerTrainer
+#     still works on its bootstrapped subset.
+#
+# Wall-time: 5 bags × 2 sub-models × 7 windows ≈ 70 XGBoost fits at ~3-4s each
+# ≈ 4-5 min — well inside the 30 min iter budget.
+class BaggedEVGatedRankerTrainer(BaseTrainer):
+    name = 'bagged_ev_gated_ranker'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 ev_scale: float = 30.0,
+                 ev_floor: float = 0.1,
+                 ndcg_at: int = 2,
+                 early_stopping_rounds: int = 30,
+                 n_bags: int = 5,
+                 conf_lambda: float = 0.5,
+                 bootstrap_frac: float = 0.85,
+                 random_state: int = 42):
+        BaseTrainer.__init__(self)
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            ev_scale=float(ev_scale),
+            ev_floor=float(ev_floor),
+            ndcg_at=int(ndcg_at),
+            early_stopping_rounds=early_stopping_rounds,
+            n_bags=int(n_bags),
+            conf_lambda=float(conf_lambda),
+            bootstrap_frac=float(bootstrap_frac),
+            random_state=random_state,
+        )
+        self.bags: list = []
+        self._best_iteration = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L).')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for date-group ranking.')
+
+        p = self._params
+        X_tr_arr = np.asarray(X_train)
+        y_tr_arr = np.asarray(y_train)
+        pnl_tr_arr = np.asarray(pnl_train, dtype=np.float32)
+        dates_tr_arr = np.asarray(dates_train)
+
+        n_train = len(X_tr_arr)
+        n_sample = max(int(round(p['bootstrap_frac'] * n_train)), 200)
+        rs_root = np.random.RandomState(p['random_state'])
+
+        self.bags = []
+        best_iters = []
+        for k in range(p['n_bags']):
+            sample_seed = int(rs_root.randint(0, 2**31 - 1))
+            sub_idx = np.random.RandomState(sample_seed).choice(
+                n_train, size=n_sample, replace=True)
+            X_sub = X_tr_arr[sub_idx]
+            y_sub = y_tr_arr[sub_idx]
+            pnl_sub = pnl_tr_arr[sub_idx]
+            dates_sub = dates_tr_arr[sub_idx]
+
+            booster_seed = int(rs_root.randint(0, 2**31 - 1))
+            bag = EVGatedRankerTrainer(
+                max_depth=p['max_depth'],
+                learning_rate=p['learning_rate'],
+                n_estimators=p['n_estimators'],
+                subsample=p['subsample'],
+                colsample_bytree=p['colsample_bytree'],
+                reg_alpha=p['reg_alpha'],
+                reg_lambda=p['reg_lambda'],
+                min_child_weight=p['min_child_weight'],
+                gamma=p['gamma'],
+                ev_scale=p['ev_scale'],
+                ev_floor=p['ev_floor'],
+                ndcg_at=p['ndcg_at'],
+                early_stopping_rounds=p['early_stopping_rounds'],
+                random_state=booster_seed,
+            )
+            bag.fit(X_sub, y_sub, X_val, y_val, verbose=verbose,
+                    pnl_train=pnl_sub, pnl_val=pnl_val,
+                    dates_train=dates_sub, dates_val=dates_val)
+            self.bags.append(bag)
+            bi = bag.best_iteration if bag.best_iteration is not None else p['n_estimators']
+            best_iters.append(int(bi))
+
+        self._best_iteration = int(np.mean(best_iters)) if best_iters else None
+        return self
+
+    def _bag_predictions(self, X) -> np.ndarray:
+        if not self.bags:
+            raise RuntimeError('Model not fit')
+        # Each bag's predict_proba returns the composite ranker × ev_gate score
+        # already bounded in [0, 1]. Stack to (n_bags, n_rows).
+        return np.stack([bag.predict_proba(X) for bag in self.bags], axis=0)
+
+    def predict_proba(self, X) -> np.ndarray:
+        preds = self._bag_predictions(X)
+        mean_pred = preds.mean(axis=0)
+        std_pred = preds.std(axis=0, ddof=0)
+        # Confidence-penalised aggregate: when bags disagree, score is reduced.
+        # Both terms are in [0,1] so without clipping the result lies in
+        # [-conf_lambda, 1]; clipping to [0,1] keeps the score within the
+        # gate's threshold-sweep range (SCORE_THRESHOLDS ⊂ [0,1]).
+        score = mean_pred - self._params['conf_lambda'] * std_pred
+        return np.clip(score, 0.0, 1.0).astype(np.float64)
+
+    def predict_score(self, X) -> np.ndarray:
+        return self.predict_proba(X)
+
+    def feature_importance(self):
+        if not self.bags:
+            return None
+        fis = []
+        for bag in self.bags:
+            fi = bag.feature_importance()
+            if fi is None:
+                continue
+            s = float(fi.sum())
+            fis.append(fi / s if s > 0 else fi)
+        if not fis:
+            return None
+        return np.mean(np.stack(fis, axis=0), axis=0)
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        bag_dirs = []
+        for k, bag in enumerate(self.bags):
+            bag_dir = os.path.join(output_dir, f'bag_{k:02d}')
+            bag.save(bag_dir)
+            bag_dirs.append(bag_dir)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_bags_saved': len(bag_dirs),
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'bags': bag_dirs, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        n_saved = meta.get('n_bags_saved', 0)
+        inst.bags = []
+        for k in range(n_saved):
+            bag_dir = os.path.join(output_dir, f'bag_{k:02d}')
+            bag = EVGatedRankerTrainer.load(bag_dir)
+            inst.bags.append(bag)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # LightGBM LambdaRank — date-grouped listwise ranking with leaf-wise+GOSS bias
 # --------------------------------------------------------------------- #
 # Motivation: xgb_ranker (#80) was the most consistent claude-mode result —
@@ -2630,6 +2859,7 @@ TRAINERS = {
     'xgb_ranker_dart': XGBoostRankerDartTrainer,
     'xgb_win_ranker': XGBoostWinRankerTrainer,
     'ev_gated_ranker': EVGatedRankerTrainer,
+    'bagged_ev_gated_ranker': BaggedEVGatedRankerTrainer,
     'stacked_ranker': StackedRankerTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }

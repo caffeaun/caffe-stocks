@@ -255,6 +255,41 @@ SEARCH_SPACES: dict[str, dict] = {
         'ev_floor':           (0.0, 0.5),
         'ndcg_at':            [1, 2, 3],
     },
+    # Bagged EV-Gated Ranker: K=3..7 EV-gated rankers each fit on a bootstrap
+    # row sample with seed diversity, scored as mean - conf_lambda*std across
+    # bags. Same XGB tree-family + EV-gate HPs as ev_gated_ranker (HP intuitions
+    # carry over from the unbagged sibling) plus three ensemble knobs:
+    #   n_bags ∈ {3, 5, 7} — variance reduction is ~1/K with diminishing
+    #     returns past 5; at 7 bags the per-iter wall-time is ~6 min, well
+    #     under the 30 min budget.
+    #   conf_lambda ∈ [0.0, 1.5] — strength of std penalty. 0 = plain
+    #     bagging (pure variance reduction); ~0.5 = mild consensus filtering;
+    #     >1.0 = aggressive abstention when bags disagree. Tighter range than
+    #     bagged_xgb_regressor (which is in [0,3]) because predict_proba is
+    #     bounded [0,1] here, so the std term is also smaller in absolute
+    #     scale — λ=1.5 already pushes mean−std into clipped territory.
+    #   bootstrap_frac ∈ [0.7, 1.0] — fraction of train rows sampled per
+    #     bag (with replacement, dates propagated). 0.7 = aggressive
+    #     decorrelation but smaller train-per-bag (worse early-stopping
+    #     signal); 1.0 = classic bootstrap (~63% unique rows per bag, full
+    #     sample size).
+    'bagged_ev_gated_ranker': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.5),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'ev_scale':           (10.0, 100.0),
+        'ev_floor':           (0.0, 0.5),
+        'ndcg_at':            [1, 2, 3],
+        'n_bags':             [3, 5, 7],
+        'conf_lambda':        (0.0, 1.5),
+        'bootstrap_frac':     (0.7, 1.0),
+    },
     # LightGBM lambdarank head: same date-grouped ranking task as xgb_ranker
     # but with leaf-wise tree growth + GOSS + delta-NDCG-weighted pairs that
     # emphasize top-of-list ordering. HP space mirrors 'lightgbm_regressor'
