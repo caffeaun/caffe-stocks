@@ -2869,6 +2869,190 @@ class StackedRankerTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Magnitude-Weighted XGBoost Classifier
+# --------------------------------------------------------------------- #
+# Motivation: every existing classifier in the registry treats every train row
+# equally — a +14% target hit and a +4.5% trailing-stop exit both contribute
+# the same gradient. Recent train sweeps (#422-#429) on bagged_ev_gated_ranker
+# are stuck at WR ~30% because the binary loss has no way to tell the model
+# which "wins" matter. The regressors (xgb_regressor, xgb_huber) implicitly
+# weight by pnl² (squared loss) or |residual| (Huber), but they predict
+# unbounded pnl so their score distribution sigmoid-compresses through
+# SIGMOID_SCALE — leading to the threshold-sweep collapse we see in iter #428
+# where only thr=0.0 has any trades and WR craters.
+#
+# The clean middle ground: keep the binary y∈{0,1} target so predict_proba
+# stays naturally in [0,1] (no sigmoid compression), but pass per-row
+# sample_weight = (|pnl| × magnitude_scale) + base_weight to xgb.fit. The
+# gradient on each row is now scaled by trade impact:
+#   - +14% target hit gets ~3-4× the learning gradient of a +4.5% trailing
+#   - -3% stop loss gets ~1.5× the gradient of a marginal -0.5% close
+#   - Marginal trades (|pnl|<1%) get base_weight only — they're noise
+# So the model focuses on patterns that drive HIGH-MAGNITUDE outcomes, both
+# wins and losses. This is qualitatively different from class_weight (which
+# only scales the 0/1 ratio) and from regression heads (which predict pnl
+# directly and lose the [0,1] calibration).
+#
+# Why this hasn't been tried: every prior magnitude-aware approach in the
+# registry put the magnitude into the LABEL (rank: pnl-rank, regressor: pnl,
+# huber: pnl with capped gradient). Putting it into the per-row sample WEIGHT
+# while keeping the binary y is novel for this loop — and it's the only path
+# that combines "model focuses on high-impact rows" with "predict_proba
+# returns calibrated [0,1] scores that the threshold sweep can actually use."
+#
+# Implementation notes:
+#   - sample_weight scaled to mean ≈ 1.0 per row so XGBoost's per-leaf hessian
+#     normalization (min_child_weight) keeps its meaningful unit.
+#   - Three knobs: magnitude_scale ∈ [5, 30] (gradient amplification on high-
+#     pnl rows), base_weight ∈ [0.3, 1.5] (floor for marginal rows so the
+#     model doesn't collapse onto outliers only), pos_class_weight ∈ [1.0, 6.0]
+#     (existing scale_pos_weight tradition for the imbalanced ~12% pos rate).
+#   - val sample_weight mirrors train so early stopping evaluates on the same
+#     loss landscape the model is optimized for.
+class XGBoostMagnitudeWeightedTrainer(BaseTrainer):
+    name = 'xgb_magnitude_classifier'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 magnitude_scale: float = 15.0,
+                 base_weight: float = 0.6,
+                 pos_class_weight: float = 3.0,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            magnitude_scale=float(magnitude_scale),
+            base_weight=float(base_weight),
+            pos_class_weight=float(pos_class_weight),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+
+    def _build_weights(self, pnl):
+        """Per-row sample weight: |pnl|*scale + base. Normalised so mean=1
+        across the train set (preserves XGBoost's min_child_weight unit)."""
+        p = self._params
+        pnl_arr = np.asarray(pnl, dtype=np.float64)
+        raw = np.abs(pnl_arr) * p['magnitude_scale'] + p['base_weight']
+        m = raw.mean()
+        if m <= 0:
+            return np.ones_like(raw, dtype=np.float32)
+        return (raw / m).astype(np.float32)
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade realized P&L) '
+                'for magnitude weighting.')
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        sw_tr = self._build_weights(pnl_train)
+        sw_va = self._build_weights(pnl_val)
+
+        self.clf = xgb.XGBClassifier(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            scale_pos_weight=p['pos_class_weight'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='binary:logistic',
+            eval_metric='logloss',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            np.asarray(X_train), np.asarray(y_train),
+            sample_weight=sw_tr,
+            eval_set=[(np.asarray(X_val), np.asarray(y_val))],
+            sample_weight_eval_set=[sw_va],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict_proba(np.asarray(X))[:, 1]
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = xgb.XGBClassifier()
+        inst.clf.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -2887,6 +3071,7 @@ TRAINERS = {
     'ev_gated_ranker': EVGatedRankerTrainer,
     'bagged_ev_gated_ranker': BaggedEVGatedRankerTrainer,
     'stacked_ranker': StackedRankerTrainer,
+    'xgb_magnitude_classifier': XGBoostMagnitudeWeightedTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

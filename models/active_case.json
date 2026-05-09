@@ -1,12 +1,12 @@
 {
-  "trainer": "bagged_ev_gated_ranker",
+  "trainer": "xgb_magnitude_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Newly registered trainer reconstructs the architectural class that historically cleared 5/7 windows at 46-50% WR / 5-10% DD (#278/#284/#286, recorded in feedback DB but source lost in pyc-only state). Default conf_lambda=0.5 already shows the variance-reduction premise works (W6 cleared at 51.6% WR / 5.2% DD, the lowest DD of any iter since #286) but blows out W1/W3 by clipping too many bag-disagreement rows to score=0, which pulls the threshold sweep into thr=0.0 top-K-per-day mode. Train mode should prioritise sweeping conf_lambda \u2192 [0.0, 0.3] (drop the consensus penalty so ev_gate discrimination survives), ev_floor \u2192 [0.2, 0.5] (higher floor lifts negative-EV days above the abstain cliff so the threshold sweep doesn't collapse to 0 in noisy regimes \u2014 same direction the prior active_case called out), and n_bags \u2208 {5, 7} jointly with the existing tree HPs.",
-  "claude_iter_id": 411,
-  "designated_at": "2026-05-09T06:27:24"
+  "rationale": "New trainer at default HPs cleared W1 cleanly (thr=0.30, WR=46.9%, DD=8.1%, ann=+102%) and selected non-zero thresholds in 4/7 windows \u2014 score distribution is healthy unlike bagged_ev_gated_ranker which only worked at thr=0.0 fallback. W3 and W6 are near-misses (WR 30.8%/39.4%); train-mode HP sweep on magnitude_scale \u2208 [5,30] / base_weight \u2208 [0.3,1.5] / pos_class_weight \u2208 [1,6] is the natural next step.",
+  "claude_iter_id": 430,
+  "designated_at": "2026-05-09T12:15:01"
 }

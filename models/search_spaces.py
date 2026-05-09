@@ -327,6 +327,38 @@ SEARCH_SPACES: dict[str, dict] = {
         'aggregation':        ['weighted_avg', 'weighted_max'],
         'random_state':       [1, 7, 17, 42, 100, 2026],
     },
+    # Magnitude-Weighted XGBoost Classifier: binary y∈{0,1} target with per-row
+    # sample_weight = (|pnl|·magnitude_scale + base_weight) normalised to mean 1.
+    # Same XGBoost-tree HP space as xgb_huber_regressor (HP intuitions carry over)
+    # plus three weighting knobs:
+    #   magnitude_scale ∈ [5, 30] — gradient amplification on high-|pnl| rows.
+    #     5 ≈ marginal weighting (a +14% trade gets ~70% more weight than a +4%);
+    #     30 ≈ aggressive weighting (a +14% trade gets ~3.5× a +4% trade).
+    #     Beyond 30 the loss collapses onto target-hit rows only and other
+    #     wins become noise.
+    #   base_weight ∈ [0.3, 1.5] — floor for marginal-pnl rows. <0.3 starves
+    #     trees of marginal-pnl samples (loss only sees outliers); >1.5
+    #     drowns the magnitude signal back into uniform weighting.
+    #   pos_class_weight ∈ [1.0, 6.0] — XGBoost scale_pos_weight to address
+    #     the ~12% pos_rate from labels.py CLEAN_WIN constraint. Range tighter
+    #     than xgboost's [1.0, 8.0] because the magnitude weighting already
+    #     amplifies wins (which are typically larger |pnl| than losses post-
+    #     stop-loss-truncation), so additional class-level upweighting risks
+    #     redundant gradient.
+    'xgb_magnitude_classifier': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.5),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'magnitude_scale':    (5.0, 30.0),
+        'base_weight':        (0.3, 1.5),
+        'pos_class_weight':   (1.0, 6.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
