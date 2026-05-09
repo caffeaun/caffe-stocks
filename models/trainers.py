@@ -3053,6 +3053,53 @@ class XGBoostMagnitudeWeightedTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Strict-Win Classifier — magnitude-weighted, target = (pnl > 0)
+# --------------------------------------------------------------------- #
+# Motivation: the WR bottleneck across iters #438-#445 (xgb_magnitude_classifier
+# train sweep) is structural, not HP-shaped. The base classifier trains on
+# y_clean = (pnl > MIN_PROFIT_PCT AND max_adverse_excursion <= CLEAN_WIN_MAX_DD)
+# — sequence_loader's inline override produces ~12% positive rate. But the
+# gate's WR metric (scripts/return_gate.py L210: `wins = pnls > 0`) counts any
+# positive-pnl trade as a win, including rocky wins capped at MIN_PROFIT_PCT/2
+# (= +0.02). The base trainer therefore learns to discriminate clean wins vs
+# {real losses ∪ rocky wins} — the latter two are pooled into class 0 even
+# though rocky wins are class 1 at gate eval time. This blurs the loss
+# gradient: a "rocky win" pattern that the gate would score as a +2% gain
+# is told "you predicted wrong" during training.
+#
+# Fix: re-derive y from realized pnl with the gate's exact rule, y = (pnl > 0).
+# This raises the positive rate to ~22% (rocky wins flip from class 0 to 1),
+# halves the imbalance ratio (so pos_class_weight needs less amplification),
+# and aligns the training target with the metric the gate scores. Sample
+# weighting (|pnl|*scale + base_weight, normalized to mean=1) is preserved
+# unchanged from the base — magnitude weighting still emphasizes extreme
+# outcomes (-3% stops, +15% targets) regardless of the label boundary.
+#
+# Concretely the change is one line in fit(): override y_train/y_val with
+# (pnl > 0).astype(int32) before delegating to the base. All other behavior
+# (HP space, predict_proba, save/load) is inherited — train mode can sweep
+# the same HPs against this trainer with no further plumbing.
+class XGBoostStrictWinClassifierTrainer(XGBoostMagnitudeWeightedTrainer):
+    name = 'xgb_strict_win'
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade '
+                'realized P&L) to derive the strict-win label.')
+        y_train_strict = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_val_strict = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        return super().fit(
+            X_train, y_train_strict, X_val, y_val_strict,
+            verbose=verbose,
+            pnl_train=pnl_train, pnl_val=pnl_val,
+            dates_train=dates_train, dates_val=dates_val,
+        )
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -3072,6 +3119,7 @@ TRAINERS = {
     'bagged_ev_gated_ranker': BaggedEVGatedRankerTrainer,
     'stacked_ranker': StackedRankerTrainer,
     'xgb_magnitude_classifier': XGBoostMagnitudeWeightedTrainer,
+    'xgb_strict_win': XGBoostStrictWinClassifierTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

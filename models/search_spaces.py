@@ -359,6 +359,22 @@ SEARCH_SPACES: dict[str, dict] = {
         'base_weight':        (0.3, 1.5),
         'pos_class_weight':   (1.0, 6.0),
     },
+    # Strict-win: y = (pnl > 0) target, ~22% positive rate vs ~12% clean-win.
+    # Less imbalance → pos_class_weight centered lower (1.0..3.5).
+    'xgb_strict_win': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.5),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'magnitude_scale':    (5.0, 30.0),
+        'base_weight':        (0.3, 1.5),
+        'pos_class_weight':   (1.0, 3.5),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

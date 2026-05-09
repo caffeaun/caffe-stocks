@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_magnitude_classifier",
+  "trainer": "xgb_strict_win",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "New trainer at default HPs cleared W1 cleanly (thr=0.30, WR=46.9%, DD=8.1%, ann=+102%) and selected non-zero thresholds in 4/7 windows \u2014 score distribution is healthy unlike bagged_ev_gated_ranker which only worked at thr=0.0 fallback. W3 and W6 are near-misses (WR 30.8%/39.4%); train-mode HP sweep on magnitude_scale \u2208 [5,30] / base_weight \u2208 [0.3,1.5] / pos_class_weight \u2208 [1,6] is the natural next step.",
-  "claude_iter_id": 430,
-  "designated_at": "2026-05-09T12:15:01"
+  "rationale": "New strict-win target (y = pnl > 0) starts at 2/7 with default HPs and clears W2 cleanly at thr=0.7 (WR=52.4%, DD=7.0%, ann=+17%) \u2014 high-threshold calibration is responsive to the realigned target; sweep should explore higher pos_class_weight + tighter trees to lift other windows.",
+  "claude_iter_id": 446,
+  "designated_at": "2026-05-09T15:09:34"
 }
