@@ -3313,6 +3313,234 @@ class XGBoostFocalLossClassifierTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Group-Balanced Focal Loss XGBoost Classifier
+# --------------------------------------------------------------------- #
+# Motivation: xgb_focal_loss (#470-#477, 8 train iters) saturates at 4/7
+# windows. Default-HP run #477 reached ann=+1.6%, DD=11.3%, trades=187 — but
+# WR=36.1% with 3 windows under the 40% floor (W2 2024-Q1, W5 2025-Q1, W7
+# 2025Q4-2026Q1, all regime-shift periods). The focal-loss objective focuses
+# gradient on hard-classified rows WITHIN the training distribution, but does
+# not address the orthogonal failure mode: the training data is dominated by
+# 2024-H2 / 2025-H2 bullish quarters, and the learned discriminant projects
+# poorly onto chop / regime-shift quarters in the test windows.
+#
+# Hypothesis: combine focal loss (within-distribution hard-example focus) with
+# per-quarter GROUP-BALANCED sample weighting (across-distribution regime
+# balance). Weight each training row by w_i = (N_total / K_groups) / N_group,
+# so every calendar quarter contributes equal total gradient regardless of
+# how many rows fall in it. The classifier then cannot ignore Q1-style chop
+# quarters just because Q3 bull periods are over-represented in the training
+# panel. Focal loss still does its job inside each group; group balancing
+# does its job across groups. Two independent levers stacked.
+#
+# This is structurally distinct from existing trainers:
+#   - xgb_focal_loss: focal loss only (no regime balancing)
+#   - xgb_strict_win / xgb_magnitude_classifier: weighted CE, no regime balancing
+#   - bagged_*: row/date bootstrap diversity, but bags collapse back to the
+#     dominant-regime distribution on average
+#   - ev_gated_ranker: pairwise ranking, no per-row regime weighting
+#
+# Group balancing is also distinct from pos_class_weight (uniform scalar over
+# the positive class) and from focal_alpha (uniform scalar over class types) —
+# it is per-ROW and per-GROUP, attacking the regime-imbalance dimension that
+# none of the existing knobs touches.
+#
+# Group definition: YYYYQq derived from the date string. With ~6-month training
+# windows, this produces ~6 groups, giving the inverse-frequency weighting
+# enough granularity to differentiate Q1 vs Q3 patterns without splintering
+# into too-small per-group samples.
+def _quarter_group(date_val) -> str:
+    s = str(date_val)[:7]
+    yr, mo = s.split('-')
+    q = (int(mo) - 1) // 3 + 1
+    return f'{yr}Q{q}'
+
+
+def _group_balanced_weights(dates_arr, group_fn=_quarter_group) -> np.ndarray:
+    """Inverse-frequency sample weights so each group contributes equal total
+    weight. Returns float64 array same length as dates_arr; sum equals N.
+    """
+    groups = np.array([group_fn(d) for d in dates_arr])
+    uniq, counts = np.unique(groups, return_counts=True)
+    n_total = len(groups)
+    n_groups = max(1, len(uniq))
+    per_group = n_total / n_groups
+    g_to_w = {g: per_group / max(1, c) for g, c in zip(uniq, counts)}
+    weights = np.array([g_to_w[g] for g in groups], dtype=np.float64)
+    return weights
+
+
+class XGBoostGroupBalancedFocalLossTrainer(BaseTrainer):
+    name = 'xgb_group_balanced_focal'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 focal_alpha: float = 0.5,
+                 focal_gamma: float = 2.0,
+                 group_balance_strength: float = 1.0,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            focal_alpha=float(focal_alpha),
+            focal_gamma=float(focal_gamma),
+            group_balance_strength=float(group_balance_strength),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.booster = None
+        self._best_iteration = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade '
+                'realized P&L) to derive the strict-win label.')
+        if dates_train is None:
+            raise ValueError(
+                f'{self.name} requires dates_train for per-quarter group balancing.')
+
+        # Strict-win target — same alignment with the gate's WR metric as
+        # xgb_focal_loss. Group-balanced weighting is layered on top.
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+
+        # Per-quarter inverse-frequency weights, then optionally tempered toward
+        # uniform via group_balance_strength ∈ [0,1]. strength=0 → all weights
+        # 1.0 (no group balancing, falls back to plain focal loss);
+        # strength=1 → fully balanced inverse-frequency.
+        gb_w = _group_balanced_weights(np.asarray(dates_train), _quarter_group)
+        s = float(p['group_balance_strength'])
+        weights_tr = (1.0 - s) * np.ones_like(gb_w) + s * gb_w
+        # Renormalize so mean weight = 1.0 (preserves XGBoost's effective
+        # learning-rate scale; gradient magnitudes match the un-weighted run
+        # in expectation).
+        weights_tr = weights_tr * (len(weights_tr) / weights_tr.sum())
+
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+        dtrain = xgb.DMatrix(Xt, label=y_tr.astype(np.float32),
+                             weight=weights_tr.astype(np.float32))
+        dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+
+        params = {
+            'tree_method': 'hist',
+            'max_depth': int(p['max_depth']),
+            'learning_rate': float(p['learning_rate']),
+            'subsample': float(p['subsample']),
+            'colsample_bytree': float(p['colsample_bytree']),
+            'reg_alpha': float(p['reg_alpha']),
+            'reg_lambda': float(p['reg_lambda']),
+            'min_child_weight': float(p['min_child_weight']),
+            'gamma': float(p['gamma']),
+            'seed': int(p['random_state']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+            'disable_default_eval_metric': 0,
+        }
+        focal_obj = _make_focal_loss_obj(
+            alpha=float(p['focal_alpha']),
+            gamma=float(p['focal_gamma']),
+        )
+        self.booster = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=int(p['n_estimators']),
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            obj=focal_obj,
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.booster, 'best_iteration', 0))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.booster is None:
+            raise RuntimeError('Model not fit')
+        dmat = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        raw = self.booster.predict(dmat, output_margin=True)
+        return 1.0 / (1.0 + np.exp(-np.clip(raw, -50.0, 50.0)))
+
+    def feature_importance(self):
+        if self.booster is None or self._n_features is None:
+            return None
+        score = self.booster.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                out[int(k[1:])] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.booster.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.booster = xgb.Booster()
+        inst.booster.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -3334,6 +3562,7 @@ TRAINERS = {
     'xgb_magnitude_classifier': XGBoostMagnitudeWeightedTrainer,
     'xgb_strict_win': XGBoostStrictWinClassifierTrainer,
     'xgb_focal_loss': XGBoostFocalLossClassifierTrainer,
+    'xgb_group_balanced_focal': XGBoostGroupBalancedFocalLossTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

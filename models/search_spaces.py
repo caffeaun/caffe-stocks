@@ -405,6 +405,33 @@ SEARCH_SPACES: dict[str, dict] = {
         'focal_alpha':        (0.25, 0.75),
         'focal_gamma':        (0.5, 4.0),
     },
+    # Group-balanced focal-loss XGB classifier: stacks per-quarter
+    # inverse-frequency sample weighting on top of focal loss. Forces the
+    # classifier to weight every calendar quarter equally, attacking the
+    # regime-shift failure mode that plain focal loss cannot reach (W2/W5/W7
+    # WR<40% across 8 xgb_focal_loss iters #470-#477).
+    #
+    # Same XGB tree-family + focal-loss HP space as xgb_focal_loss, plus:
+    #   group_balance_strength ∈ [0.0, 1.0] — interpolation between uniform
+    #     weights (0.0 = falls back to plain focal loss) and full
+    #     inverse-frequency balancing (1.0). Mid-range values let the sweep
+    #     find a partial-balancing operating point if full rebalancing
+    #     over-corrects on training-period dominant regimes. Center near 1.0
+    #     to bias toward the structural hypothesis.
+    'xgb_group_balanced_focal': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'focal_alpha':            (0.25, 0.75),
+        'focal_gamma':            (0.5, 4.0),
+        'group_balance_strength': (0.4, 1.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
