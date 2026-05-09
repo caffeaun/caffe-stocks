@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_strict_win",
+  "trainer": "xgb_focal_loss",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "New strict-win target (y = pnl > 0) starts at 2/7 with default HPs and clears W2 cleanly at thr=0.7 (WR=52.4%, DD=7.0%, ann=+17%) \u2014 high-threshold calibration is responsive to the realigned target; sweep should explore higher pos_class_weight + tighter trees to lift other windows.",
-  "claude_iter_id": 446,
-  "designated_at": "2026-05-09T15:09:34"
+  "rationale": "New focal-loss classifier passes 4/7 at default HPs with a different failure pattern than 16-iter saturated xgb_strict_win \u2014 W5 now passes (was strict_win's chronic fail), W6 fails only on n_trades=16, W1/W2 fail because focal at gamma=2.0 sharpens predictions toward thr=0.6 with low-WR picks; sweeping focal_alpha (try 0.25-0.4 to balance the 22% pos_rate) and focal_gamma (try 0.5-1.5 for softer focus) should spread predictions and lift trade count without re-introducing strict_win's W5 weakness.",
+  "claude_iter_id": 462,
+  "designated_at": "2026-05-09T18:12:43"
 }

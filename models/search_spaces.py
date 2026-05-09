@@ -375,6 +375,36 @@ SEARCH_SPACES: dict[str, dict] = {
         'base_weight':        (0.3, 1.5),
         'pos_class_weight':   (1.0, 3.5),
     },
+    # Focal-loss XGBoost classifier: y = (pnl > 0) like xgb_strict_win, but the
+    # loss is FL = -alpha_t · (1 - p_t)^gamma · log(p_t) instead of weighted
+    # binary CE. Down-weights well-classified examples and forces gradient onto
+    # hard regime-edge cases — addresses the W2/W5/W7 WR<40% saturation across
+    # 16 strict_win HP sweeps. Same XGB tree-family HP space as xgb_strict_win
+    # (intuitions carry over) plus two focal-loss knobs:
+    #   focal_alpha ∈ [0.25, 0.75] — class-balance scalar. 0.5 = neutral; <0.5
+    #     down-weights positive class (rarely wanted at 22% pos_rate); >0.5
+    #     up-weights wins. The original Lin et al. paper uses 0.25 for highly
+    #     imbalanced detection; for our 22% pos_rate the literature suggests
+    #     a higher alpha (0.5-0.75) keeps the loss balanced after the focal
+    #     down-weighting kicks in.
+    #   focal_gamma ∈ [0.5, 4.0] — focusing strength. 0 = standard weighted
+    #     CE; 2.0 is the canonical default (object detection). At gamma=4
+    #     the loss becomes very peaky toward hard examples, which can starve
+    #     the easy-class gradient on small windows. The sweep should find
+    #     where the regime-generalization gain peaks before instability.
+    'xgb_focal_loss': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.5),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'focal_alpha':        (0.25, 0.75),
+        'focal_gamma':        (0.5, 4.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

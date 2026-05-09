@@ -3100,6 +3100,219 @@ class XGBoostStrictWinClassifierTrainer(XGBoostMagnitudeWeightedTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Focal-Loss XGBoost Classifier — y = (pnl > 0), focal binary CE
+# --------------------------------------------------------------------- #
+# Motivation: every xgb_strict_win HP sweep (#454-#461, 16 iters) saturates
+# at 4/7 windows. Failing windows (W2 2024-Q1, W5 2025-Q1, W7 2025Q4-2026Q1)
+# all fail on WR<40% — the top-K-per-day picks are losers in regime-shift
+# periods. Standard binary log-loss treats every (X, y=win) row as equally
+# important; the gradient is dominated by easy positives (clear bullish
+# setups in 2024-H2 training data) and the model overfits to those patterns.
+# When the test window's regime differs (Q1 chop, late-2025 reversal), the
+# learned discriminant fails because it never saw enough hard-case gradient.
+#
+# Focal loss (Lin et al. 2017, "Focal Loss for Dense Object Detection"):
+#   FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+# where p_t = p if y=1 else 1-p. The (1-p_t)^gamma factor multiplicatively
+# down-weights well-classified examples (p_t high) and up-weights hard ones
+# (p_t low). gamma=0 reduces to weighted binary CE; gamma=2 is the canonical
+# default for object-detection imbalance.
+#
+# Hypothesis: forcing the gradient onto regime-edge / ambiguous training rows
+# (instead of bullish-period easy wins) yields a more discriminative model
+# that holds up in W2/W5/W7. This is a structurally distinct knob from
+# pos_class_weight (uniform scalar) and magnitude_scale (|pnl|-driven row
+# weighting): focal loss is a per-row loss-shape modulation that depends on
+# the model's CURRENT prediction confidence, not the row's static properties.
+#
+# Implementation: subclass strict-win (so y = pnl > 0 alignment with the gate
+# is preserved) and override fit() to use xgb.train with a custom objective
+# closure. Hessian is approximated as p*(1-p) (the logistic CE hess) — the
+# exact focal hessian is unstable for p near 0/1 and standard implementations
+# use this simplification. predict_proba derives sigmoid from raw margin
+# since custom-objective boosters output margins, not probabilities.
+def _make_focal_loss_obj(alpha: float, gamma: float):
+    """Binary focal-loss custom objective for xgb.train.
+
+    xgb.train passes the closure `(y_pred, dtrain)` where y_pred is the raw
+    margin array and dtrain is a DMatrix carrying the labels. Per the analytic
+    derivation:
+      For y=1: g = alpha * (1-p)^gamma * (gamma * p * log(p) + p - 1)
+      For y=0: g = (1-alpha) * p^gamma * (p - gamma * (1-p) * log(1-p))
+    Hess uses logistic-CE approximation: h = max(p*(1-p), 1e-6).
+    """
+    def _obj(y_pred, dtrain):
+        z = np.clip(np.asarray(y_pred, dtype=np.float64), -50.0, 50.0)
+        p = 1.0 / (1.0 + np.exp(-z))
+        p_safe = np.clip(p, 1e-7, 1.0 - 1e-7)
+        one_minus_p = 1.0 - p_safe
+        log_p = np.log(p_safe)
+        log_1mp = np.log(one_minus_p)
+        y = np.asarray(dtrain.get_label(), dtype=np.float64)
+        pow_one_minus_p = np.power(one_minus_p, gamma)
+        pow_p = np.power(p_safe, gamma)
+        g_pos = alpha * pow_one_minus_p * (gamma * p_safe * log_p + p_safe - 1.0)
+        g_neg = (1.0 - alpha) * pow_p * (p_safe - gamma * one_minus_p * log_1mp)
+        grad = np.where(y == 1.0, g_pos, g_neg)
+        hess = np.maximum(p_safe * one_minus_p, 1e-6)
+        return grad.astype(np.float64), hess.astype(np.float64)
+    return _obj
+
+
+class XGBoostFocalLossClassifierTrainer(BaseTrainer):
+    name = 'xgb_focal_loss'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 focal_alpha: float = 0.5,
+                 focal_gamma: float = 2.0,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            focal_alpha=float(focal_alpha),
+            focal_gamma=float(focal_gamma),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.booster = None
+        self._best_iteration = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade '
+                'realized P&L) to derive the strict-win label.')
+
+        # Strict-win target: realized pnl > 0. Aligns with the gate's WR metric.
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+        dtrain = xgb.DMatrix(Xt, label=y_tr.astype(np.float32))
+        dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+
+        params = {
+            'tree_method': 'hist',
+            'max_depth': int(p['max_depth']),
+            'learning_rate': float(p['learning_rate']),
+            'subsample': float(p['subsample']),
+            'colsample_bytree': float(p['colsample_bytree']),
+            'reg_alpha': float(p['reg_alpha']),
+            'reg_lambda': float(p['reg_lambda']),
+            'min_child_weight': float(p['min_child_weight']),
+            'gamma': float(p['gamma']),
+            'seed': int(p['random_state']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+            # Disable_default_eval_metric prevents XGBoost from inferring an
+            # objective-tied default (which fails for custom objectives).
+            'disable_default_eval_metric': 0,
+        }
+        focal_obj = _make_focal_loss_obj(
+            alpha=float(p['focal_alpha']),
+            gamma=float(p['focal_gamma']),
+        )
+        self.booster = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=int(p['n_estimators']),
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            obj=focal_obj,
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.booster, 'best_iteration', 0))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.booster is None:
+            raise RuntimeError('Model not fit')
+        dmat = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        # Custom-objective boosters emit raw margins; apply sigmoid for P(y=1).
+        raw = self.booster.predict(dmat, output_margin=True)
+        return 1.0 / (1.0 + np.exp(-np.clip(raw, -50.0, 50.0)))
+
+    def feature_importance(self):
+        if self.booster is None or self._n_features is None:
+            return None
+        score = self.booster.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                out[int(k[1:])] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.booster.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.booster = xgb.Booster()
+        inst.booster.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -3120,6 +3333,7 @@ TRAINERS = {
     'stacked_ranker': StackedRankerTrainer,
     'xgb_magnitude_classifier': XGBoostMagnitudeWeightedTrainer,
     'xgb_strict_win': XGBoostStrictWinClassifierTrainer,
+    'xgb_focal_loss': XGBoostFocalLossClassifierTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 
