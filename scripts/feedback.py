@@ -198,23 +198,20 @@ def _aggregate(gate_result: dict) -> dict:
 
 # ---------------------- query helpers ----------------------
 
-def top_n_recent(n: int = 3, days: int = 30, only_passed: bool = False) -> list[dict]:
-    """Return up to n recent iterations sorted by avg_annualized_return DESC,
-    then avg_max_dd ASC. Returns dict rows for ergonomics."""
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-    where = ['finished_at >= ?']
-    params = [cutoff]
-    if only_passed:
-        where.append('gate_passed = 1')
-    sql = f"""
-        SELECT * FROM iterations
-        WHERE {' AND '.join(where)}
-        ORDER BY avg_annualized_return DESC, avg_max_dd ASC
-        LIMIT ?
+def top_n_recent(n: int = 3, days: int = 30) -> list[dict]:
+    """Return up to n recent iterations in the last `days`, sorted by
+    avg_annualized_return DESC then avg_max_dd ASC. No policy filtering —
+    callers (e.g. promotion.py) apply gate_passed / trainer filters as needed.
     """
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     init_db()
     with get_conn() as conn:
-        rows = conn.execute(sql, [*params, n]).fetchall()
+        rows = conn.execute("""
+            SELECT * FROM iterations
+            WHERE finished_at >= ?
+            ORDER BY avg_annualized_return DESC, avg_max_dd ASC
+            LIMIT ?
+        """, (cutoff, n)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -233,41 +230,46 @@ def get_promotion_panel() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def refresh_promotion_panel(days: int = 30) -> list[dict]:
-    """Refresh the panel: pick top 3 distinct (trainer, hyperparams) iterations
-    from the last `days` days. Returns new panel rows."""
+def set_panel(iteration_ids: list[int]) -> list[dict]:
+    """Replace the production panel with up to 3 iteration ids (rank by order).
+    Pure DB writer — eligibility / dedupe policy belongs in the caller
+    (see promotion.py). Pass [] to clear the panel.
+    """
     init_db()
-    candidates = top_n_recent(n=50, days=days, only_passed=False)
-    # de-dupe by (trainer, hyperparams) — keep best per signature
-    seen = set()
-    unique = []
-    for c in candidates:
-        sig = (c['trainer'], c['hyperparams'])
-        if sig in seen:
-            continue
-        seen.add(sig)
-        unique.append(c)
-        if len(unique) == 3:
-            break
-    if not unique:
-        return []
+    if len(iteration_ids) > 3:
+        raise ValueError(f'panel holds at most 3 entries, got {len(iteration_ids)}')
     now = datetime.now().isoformat()
     expires = (datetime.now() + timedelta(days=30)).isoformat()
     with get_conn() as conn:
         conn.execute('DELETE FROM production_panel')
-        for rank, it in enumerate(unique, 1):
+        for rank, iter_id in enumerate(iteration_ids, 1):
             conn.execute("""
                 INSERT INTO production_panel (rank, iteration_id, promoted_at, expires_at)
                 VALUES (?, ?, ?, ?)
-            """, (rank, it['id'], now, expires))
+            """, (rank, iter_id, now, expires))
     return get_promotion_panel()
+
+
+def best_candidate_ann_return() -> Optional[float]:
+    """Highest avg_annualized_return among prior gate-passing candidates.
+    Returns None if no candidate has passed yet — first candidate floor is then
+    applied by the caller (avg ann > 0)."""
+    init_db()
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT MAX(avg_annualized_return) FROM iterations
+            WHERE gate_passed = 1
+        """).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
 
 
 def consecutive_failures(limit: int = 10) -> int:
     """Count consecutive trailing iterations where gate_passed = 0.
 
-    Counts ALL rows (including manual_resume markers) — manual_resume rows
-    are inserted with gate_passed=1 specifically to clear the streak.
+    Informational only — surfaced in the claude_mode start alert. No longer
+    gates execution (auto-pause was removed).
     """
     init_db()
     with get_conn() as conn:
@@ -294,18 +296,17 @@ def log_data_request(iteration_id: int, request_text: str) -> None:
 
 
 def stats() -> dict:
-    """Aggregate stats. Excludes synthetic 'manual_resume' marker rows."""
+    """Aggregate iteration stats."""
     init_db()
-    real = "trainer != 'manual_resume'"
     with get_conn() as conn:
-        total = conn.execute(f'SELECT COUNT(*) FROM iterations WHERE {real}').fetchone()[0]
-        passed = conn.execute(f'SELECT COUNT(*) FROM iterations WHERE gate_passed = 1 AND {real}').fetchone()[0]
+        total = conn.execute('SELECT COUNT(*) FROM iterations').fetchone()[0]
+        passed = conn.execute('SELECT COUNT(*) FROM iterations WHERE gate_passed = 1').fetchone()[0]
         by_mode = dict(conn.execute(
-            f'SELECT mode, COUNT(*) FROM iterations WHERE {real} GROUP BY mode').fetchall())
+            'SELECT mode, COUNT(*) FROM iterations GROUP BY mode').fetchall())
         by_trainer = dict(conn.execute(
-            f'SELECT trainer, COUNT(*) FROM iterations WHERE {real} GROUP BY trainer').fetchall())
+            'SELECT trainer, COUNT(*) FROM iterations GROUP BY trainer').fetchall())
         last_pass = conn.execute(
-            f'SELECT finished_at FROM iterations WHERE gate_passed = 1 AND {real} '
+            'SELECT finished_at FROM iterations WHERE gate_passed = 1 '
             'ORDER BY finished_at DESC LIMIT 1').fetchone()
     return {
         'total': total,

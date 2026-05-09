@@ -23,11 +23,19 @@ sys.path.insert(0, str(BASE))
 
 from models.sequence_loader import load_sequences, aggregate_sequence, aggregated_feature_names
 from models.search_spaces import sample as sample_config, list_trainers
-from scripts import feedback as fb
+from scripts import active_case, feedback as fb
 from scripts.return_gate import (
-    SPLIT_DEFS, evaluate_window, MIN_ANNUAL_RETURN, MAX_DD,
+    SPLIT_DEFS, evaluate_window, MAX_DD,
     MIN_TRADES_PER_WINDOW, MIN_WR, PASS_FRACTION_REQUIRED,
+    avg_annualized_return, is_candidate,
 )
+
+# Sentinel used to detect "user did not pass --trainer". argparse can't
+# tell us whether a default fired vs the user typed the same string, so we
+# default to this sentinel and resolve it after parsing — if it's still the
+# sentinel we're free to consult models/active_case.json.
+_TRAINER_SENTINEL = '__from_active_case__'
+_FALLBACK_TRAINER = 'xgboost'
 
 
 LOCK_PATH = BASE / 'models' / '.ml-loop.lock'
@@ -70,14 +78,16 @@ def run_one_config(trainer_name, hp, X_tab, y, dates, symbols, pnl, hold_days,
     elapsed = time.time() - t0
 
     n_passed = sum(1 for r in results if r.get('passed'))
-    gate_passed = (n_passed / max(1, len(results))) >= PASS_FRACTION_REQUIRED
+    prior_best_ann = fb.best_candidate_ann_return()
+    gate_passed = is_candidate(results, prior_best_ann)
 
     return {
         'gate_passed': gate_passed,
         'pass_fraction_required': PASS_FRACTION_REQUIRED,
         'windows_passed': n_passed,
         'windows_total': len(results),
-        'min_annual_return': MIN_ANNUAL_RETURN,
+        'avg_annualized_return': avg_annualized_return(results),
+        'prior_best_ann_return': prior_best_ann,
         'max_dd': MAX_DD,
         'min_trades_per_window': MIN_TRADES_PER_WINDOW,
         'min_wr': MIN_WR,
@@ -89,14 +99,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--configs', type=int, default=10,
                         help='Number of HP configs to sample and evaluate')
-    parser.add_argument('--trainer', default='xgboost',
-                        choices=list_trainers(),
-                        help='Which trainer family to sweep within')
+    # Sentinel default lets us tell "user passed --trainer" apart from "default
+    # fired" without grovelling through sys.argv. choices is widened to include
+    # the sentinel; we resolve it before any choice-validation that matters.
+    parser.add_argument('--trainer', default=_TRAINER_SENTINEL,
+                        choices=list_trainers() + [_TRAINER_SENTINEL],
+                        help='Which trainer family to sweep within '
+                             '(default: read from models/active_case.json, '
+                             f'fall back to {_FALLBACK_TRAINER!r})')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for HP sampling (default: time-based)')
     parser.add_argument('--seq-len', type=int, default=20)
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
+
+    # Resolve trainer: explicit CLI > active_case.json > xgboost fallback.
+    if args.trainer == _TRAINER_SENTINEL:
+        case = active_case.read()
+        if case and case.get('trainer') in list_trainers():
+            print(f'train_mode: using trainer {case["trainer"]!r} '
+                  f'from models/active_case.json (claude_iter_id='
+                  f'{case.get("claude_iter_id")!r})')
+            args.trainer = case['trainer']
+        else:
+            if case:
+                print(f'train_mode: active_case trainer '
+                      f'{case.get("trainer")!r} not in registry — '
+                      f'falling back to {_FALLBACK_TRAINER!r}')
+            args.trainer = _FALLBACK_TRAINER
 
     # Acquire shared lock
     fd = acquire_lock(LOCK_PATH)
@@ -107,12 +137,6 @@ def main():
     try:
         print(f'=== train_mode: {args.configs} configs of {args.trainer} ===')
         fb.init_db()
-
-        # Pause gate
-        streak = fb.consecutive_failures()
-        if streak >= 5:
-            print(f'AUTO-PAUSED: {streak} consecutive failures. Reset with t resume-ml.')
-            sys.exit(0)
 
         # Load data once for all configs
         t0 = time.time()

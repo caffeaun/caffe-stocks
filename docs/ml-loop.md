@@ -56,6 +56,7 @@ This boundary is intentional. The LSTM-era loop blurred them — Claude was tuni
 - `return_gate.py` — the only scoreboard. Both modes pass/fail by the same criteria.
 - `data/ml-feedback.json` — structured log; both write, both read.
 - `docs/ml-training.md` — the whitepaper. Both treat it as constitutional. Claude mode can *propose* changes via Telegram, never edits unilaterally.
+- `models/active_case.json` — the **handoff state** between modes. Claude mode writes it at the end of each successful run (designating which trainer family / feature set / dataset config train mode should sweep within); train mode reads it at startup and uses it as the default for `--trainer`. An explicit `--trainer X` on the train-mode CLI still wins over the file. If the file is missing or malformed, train mode falls back to `xgboost`. See `scripts/active_case.py` for the read/write helpers and the JSON schema.
 
 ## File layout
 

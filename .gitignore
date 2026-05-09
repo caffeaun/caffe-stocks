@@ -63,3 +63,15 @@ data/modal_budget.json
 models/.ml-loop.lock
 models/lgbm/
 models/lstm/candidates/
+models/panel/
+models/xgb/
+models/stacked_ranker/
+models/torch_mlp_dual_head/
+models/claude-mode/
+
+# Multi-source data layer — runtime
+data/multi_source_logs/
+data/settrade/
+
+# active_case.json IS source of truth for train_mode; keep tracked.
+!models/active_case.json

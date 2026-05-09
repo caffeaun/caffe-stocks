@@ -27,7 +27,8 @@ from typing import Optional
 BASE = Path(os.path.expanduser('~/projects/caffe-stocks'))
 sys.path.insert(0, str(BASE))
 
-from scripts import feedback as fb
+from scripts import active_case, feedback as fb
+from scripts.return_gate import is_candidate, avg_annualized_return
 
 LOCK_PATH = BASE / 'models' / '.ml-loop.lock'
 PROMPT_BUILDER = BASE / 'scripts' / 'prompt_builder.py'
@@ -93,6 +94,75 @@ def release_lock(fd):
         fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+def commit_iteration(iter_id: int, trainer_name: str, gate_passed: bool,
+                     hypothesis: Optional[str] = None) -> Optional[str]:
+    """Commit claude_mode's source-edit changes after a successful iteration.
+
+    The whole point: prior trainers stay in git history so future iterations
+    can recover them via `git log -- models/trainers.py` even if a later run
+    rewrites the file. Self-healing — no manual restore needed.
+
+    Stages an explicit allowlist of paths (the surface area Claude is
+    contracted to modify in prompt_builder.py). New helper modules under
+    models/ are also caught via the *.py glob. Skips silently if there's
+    nothing staged. Wrapped by the caller in try/except so a failure here
+    never tanks the iteration record.
+
+    Returns the short commit SHA on success, None otherwise.
+    """
+    paths = [
+        'models/trainers.py',
+        'models/search_spaces.py',
+        'models/feature_eng.py',
+        'models/labels.py',
+        'models/sequence_loader.py',
+        'models/active_case.json',
+        'scripts/return_gate.py',
+    ]
+    # Also pick up any new .py files in models/ (a helper module Claude added)
+    extra_py = [str(p.relative_to(BASE)) for p in (BASE / 'models').glob('*.py')
+                if p.name not in ('__init__.py',) and str(p.relative_to(BASE)) not in paths]
+    paths.extend(extra_py)
+
+    add = subprocess.run(
+        ['git', '-C', str(BASE), 'add', '--'] + paths,
+        capture_output=True, text=True,
+    )
+    if add.returncode != 0:
+        print(f'auto-commit: git add failed: {add.stderr.strip()}', file=sys.stderr)
+        return None
+
+    # Anything actually staged?
+    diff = subprocess.run(
+        ['git', '-C', str(BASE), 'diff', '--cached', '--quiet'],
+        capture_output=True,
+    )
+    if diff.returncode == 0:
+        print('auto-commit: no changes to commit')
+        return None
+
+    flag = 'PASS' if gate_passed else 'FAIL'
+    msg_lines = [f'claude iter #{iter_id}: {trainer_name} ({flag})']
+    if hypothesis:
+        msg_lines.extend(['', hypothesis.strip()[:300]])
+    msg = '\n'.join(msg_lines)
+
+    commit = subprocess.run(
+        ['git', '-C', str(BASE), 'commit', '-m', msg],
+        capture_output=True, text=True,
+    )
+    if commit.returncode != 0:
+        print(f'auto-commit: git commit failed: {commit.stderr.strip()}', file=sys.stderr)
+        return None
+
+    sha = subprocess.run(
+        ['git', '-C', str(BASE), 'rev-parse', '--short', 'HEAD'],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    print(f'auto-commit: {sha} - {msg_lines[0]}')
+    return sha
 
 
 def parse_claude_report(stdout: str) -> Optional[dict]:
@@ -161,12 +231,7 @@ def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     fb.init_db()
 
-    streak = fb.consecutive_failures()
-    if streak >= 5 and not args.dry_run:
-        msg = f'AUTO-PAUSED: {streak} consecutive failures. `t resume-ml` to clear.'
-        print(msg)
-        telegram(f'⏸ ML loop paused — {streak} consecutive failures.')
-        sys.exit(0)
+    streak = fb.consecutive_failures()  # informational only; no longer gates the run
 
     # Build prompt
     venv_py = BASE / 'venv' / 'bin' / 'python'
@@ -210,6 +275,7 @@ def main():
         proc = subprocess.run(
             [str(CLAUDE_BIN), '-p',
              '--model', 'claude-opus-4-7',
+             '--effort', 'max',
              '--dangerously-skip-permissions',
              '--allowedTools', 'Bash Edit Write Read Glob Grep WebSearch WebFetch'],
             input=prompt,
@@ -245,6 +311,16 @@ def main():
             'results': [],
         }
 
+        # Authoritatively re-evaluate the model-level gate from the per-window
+        # data. Claude's reported gate_passed is advisory only — we own the
+        # decision to mark something a candidate.
+        results = gate_result.get('results') or []
+        if results:
+            prior_best_ann = fb.best_candidate_ann_return()
+            gate_result['gate_passed'] = is_candidate(results, prior_best_ann)
+            gate_result['avg_annualized_return'] = avg_annualized_return(results)
+            gate_result['prior_best_ann_return'] = prior_best_ann
+
         iter_id = fb.record_iteration(
             mode='claude',
             trainer=report.get('trainer', 'unknown'),
@@ -260,6 +336,35 @@ def main():
             lessons=report.get('lessons'),
         )
 
+        # Designate the next experimental case for train mode to sweep within.
+        # Falls back to inferring from report['trainer'] + defaults when the
+        # report doesn't include an explicit active_case block.
+        try:
+            new_case = active_case.from_report(report, claude_iter_id=iter_id)
+            if new_case is not None:
+                ac_path = active_case.write(new_case)
+                print(f'active_case → {new_case.get("trainer")} '
+                      f'(written to {ac_path})')
+            else:
+                print('active_case: skipped (report had no trainer field)')
+        except Exception as e:
+            # Never let a bad active_case write tank the iteration record.
+            print(f'active_case write failed: {e!r}', file=sys.stderr)
+
+        # Auto-commit source changes so prior trainers stay in git history
+        # — future iterations can recover any class via `git log` / `git show`
+        # even if a later run rewrites trainers.py.
+        commit_sha = None
+        try:
+            commit_sha = commit_iteration(
+                iter_id=iter_id,
+                trainer_name=report.get('trainer', 'unknown'),
+                gate_passed=bool(gate_result.get('gate_passed')),
+                hypothesis=report.get('hypothesis'),
+            )
+        except Exception as e:
+            print(f'auto-commit failed: {e!r}', file=sys.stderr)
+
         # Optional: log a data request if Claude submitted one
         dr = report.get('data_request') or ''
         if dr.strip():
@@ -273,8 +378,9 @@ def main():
                or report.get('avg_annualized_return') or 0)
         wr = (gate_result.get('avg_win_rate')
                or report.get('avg_win_rate') or 0)
+        sha_line = f'\ngit: {commit_sha}' if commit_sha else ''
         telegram(
-            f'{flag} *Claude iter #{iter_id}* `{report.get("trainer", "?")}`\n'
+            f'{flag} *Claude iter #{iter_id}* `{report.get("trainer", "?")}`{sha_line}\n'
             f'{report.get("hypothesis", "")[:200]}\n'
             f'wp={wp}/{wt}  ann={ann:+.1%}  wr={wr:.1%}  '
             f'({elapsed}s)\n'

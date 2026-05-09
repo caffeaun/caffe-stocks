@@ -3,6 +3,12 @@
 
 Cron-triggered monthly (1st of month, 00:01 ICT). Can also be run by hand
 or via Telegram (`t panel refresh`).
+
+Eligibility (per docs/ml-loop.md §promotion):
+  - gate_passed = 1
+  - finished_at within --days window
+Then dedupe by (trainer, hyperparams), keep top 3 by ann_return DESC, dd ASC.
+If no iteration is eligible, the panel is cleared and a Telegram alert fires.
 """
 import argparse
 import os
@@ -13,6 +19,60 @@ BASE = Path(os.path.expanduser('~/projects/caffe-stocks'))
 sys.path.insert(0, str(BASE))
 
 from scripts import feedback as fb
+
+
+def is_eligible(row: dict) -> bool:
+    return bool(row.get('gate_passed'))
+
+
+def select_panel(rows: list[dict], k: int = 3) -> list[dict]:
+    """Apply panel eligibility + dedupe-by-(trainer, hyperparams). Input is
+    expected pre-sorted (top_n_recent already orders by ann_return desc, dd asc)."""
+    seen = set()
+    out = []
+    for r in rows:
+        if not is_eligible(r):
+            continue
+        sig = (r['trainer'], r['hyperparams'])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(r)
+        if len(out) == k:
+            break
+    return out
+
+
+def telegram(text: str) -> None:
+    """Best-effort Telegram alert (same conf lookup as claude_mode.py)."""
+    conf_paths = [
+        BASE.parent / 'ops' / 'telegram' / 'telegram.conf',
+        Path.home() / 'kanoonth' / 'scripts' / 'telegram.conf',
+    ]
+    bot_token = chat_id = None
+    for p in conf_paths:
+        if p.exists():
+            with open(p) as f:
+                for line in f:
+                    if line.strip().startswith('TELEGRAM_BOT_TOKEN='):
+                        bot_token = line.split('=', 1)[1].strip().strip('"\'')
+                    elif line.strip().startswith('TELEGRAM_CHAT_ID='):
+                        chat_id = line.split('=', 1)[1].strip().strip('"\'')
+            break
+    if not (bot_token and chat_id):
+        return
+    try:
+        import urllib.request, urllib.parse
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id,
+            'text': text[:4000],
+            'disable_web_page_preview': 'true',
+        }).encode()
+        urllib.request.urlopen(
+            f'https://api.telegram.org/bot{bot_token}/sendMessage',
+            data=data, timeout=10)
+    except Exception as e:
+        print(f'Telegram alert failed: {e}', file=sys.stderr)
 
 
 def show_panel(panel):
@@ -33,7 +93,7 @@ def show_panel(panel):
 
 
 def show_top_recent(days=30, n=10):
-    rows = fb.top_n_recent(n=n, days=days, only_passed=False)
+    rows = fb.top_n_recent(n=n, days=days)
     if not rows:
         print(f'No iterations in last {days} days.')
         return
@@ -66,10 +126,19 @@ def main():
     print('=== Refreshing paper-trade panel ===')
     show_top_recent(days=args.days)
 
-    new_panel = fb.refresh_promotion_panel(days=args.days)
-    if not new_panel:
-        print(f'\nNo eligible iterations in last {args.days} days — panel cleared.')
+    candidates = fb.top_n_recent(n=50, days=args.days)
+    selected = select_panel(candidates, k=3)
+
+    if not selected:
+        # Panel left empty rather than promoting losers.
+        fb.set_panel([])
+        msg = (f'No gate-passing iterations in last {args.days} days — panel cleared. '
+               f'Loop needs a passing iteration before paper-trade panel can repopulate.')
+        print(f'\n{msg}')
+        telegram(f'⚠️ Paper-trade panel cleared: {msg}')
         return
+
+    new_panel = fb.set_panel([it['id'] for it in selected])
 
     print('\n=== New panel ===')
     show_panel(new_panel)

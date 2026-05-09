@@ -18,7 +18,7 @@ from textwrap import indent
 BASE = Path(os.path.expanduser('~/projects/caffe-stocks'))
 sys.path.insert(0, str(BASE))
 
-from scripts import feedback as fb
+from scripts import active_case, feedback as fb
 
 
 # ----- excerpt helpers --------------------------------------------------- #
@@ -119,10 +119,12 @@ Your job is to make ONE structural change to the pipeline based on the feedback 
 GOAL: 50% gross annual return on a 10k THB base, repeatable, withdrawing the gain to SCB at year-end.
 - Stop -3%, target +15%, trailing trigger +7% / floor 50%, max-hold 10 days
 - Friction model in models/labels.py (COMMISSION_PCT)
-- Universe: any THB-denominated SET instrument (SET / mai / ETFs / DRs / REITs)
+- Universe: any THB-denominated SET / mai / TDEX (ThaiDEX ETF) instrument tradable via BLS
 - Walk-forward gate: 7 calendar splits in scripts/return_gate.py
-- Gate criteria per window: ann_return >= 50%, max_dd <= 25%, n_trades >= 5, wr >= 30%
-- Pass overall: >= 80% of windows must meet criteria
+- v1 per-window pass: max_dd <= 20%, n_trades >= 20, wr >= 40% (no per-window ann floor)
+- v1 model-level pass (becomes a candidate): ALL 7 windows pass per-window AND avg
+  annualized_return strictly beats the best prior candidate (or > 0 if none yet).
+  No regime-exempt — 100% pass required, every regime works or you're not a candidate.
 
 ==================================================================
 3. PIPELINE STATE
@@ -130,6 +132,13 @@ GOAL: 50% gross annual return on a 10k THB base, repeatable, withdrawing the gai
 Trainers currently registered (models/trainers.py): {trainers}
 Curated features ({n_features} total): {features_preview}
 Latest feedback DB stats: {db_stats}
+Active experimental case (models/active_case.json): {active_case_summary}
+
+Every prior claude iteration is committed to git. If a trainer / feature / label / sequence-loader change you read about in §4 RECENT ITERATIONS is not visible in the current source, it was overwritten by a later iteration — recover it via:
+  - `git log --oneline -- models/trainers.py` (find the commit that added it)
+  - `git show <sha>:models/trainers.py` (read the prior version)
+  - `git show <sha> -- models/search_spaces.py` (matching HP space)
+Do NOT submit a "decompile the .pyc" data request — git history is the canonical source.
 
 ==================================================================
 4. RECENT ITERATIONS ({n_recent} latest, newest first)
@@ -171,7 +180,30 @@ You may use WebSearch / WebFetch to research recent ML techniques (post-2024 pap
 If the gate fails by a wide margin (avg_ann < -30%), CONSIDER reverting via `git checkout HEAD -- <files>`. If your change is structural and you expect it needs HP tuning, you can leave it — train mode will tune the HPs over the next hours.
 
 ==================================================================
-8. OUTPUT FORMAT — your final message MUST end with this JSON block
+8. ACTIVE CASE — designate which trainer family train mode should sweep next
+==================================================================
+The cron-driven train mode (every hour at :30) sweeps HPs WITHIN ONE trainer
+family. Which family is "active" is decided by you, in this iteration's
+report, via the ``active_case`` block. Train mode reads
+``models/active_case.json`` at startup; whatever you designate here is what
+gets HP-swept until the next claude run reassigns it.
+
+Two valid choices each iteration:
+
+- **Keep the same case** — copy the prior active_case forward (deepens the
+  sweep on the same family). Pick this when train mode hasn't yet exhausted
+  the current family's HP space.
+- **Pivot to a new case** — designate a different trainer (e.g. one you just
+  added in this run, or a previously-registered one you now want to sweep).
+
+The block must specify ``trainer`` (a key from the registry above),
+``feature_set``, a ``dataset`` config, and a one-line ``rationale``. Defaults
+are fine for ``feature_set`` (``"default"``) and ``dataset``
+(``{{"seq_len": 20, "lookahead": 10, "label": "v1"}}``) unless you changed
+them this iteration.
+
+==================================================================
+9. OUTPUT FORMAT — your final message MUST end with this JSON block
 ==================================================================
 ```json
 {{
@@ -193,22 +225,33 @@ If the gate fails by a wide margin (avg_ann < -30%), CONSIDER reverting via `git
     "total_trades": 38,
     "results": [<full per-window list from return_gate output>]
   }},
+  "active_case": {{
+    "trainer": "<registry key for train mode to sweep next>",
+    "feature_set": "default",
+    "dataset": {{"seq_len": 20, "lookahead": 10, "label": "v1"}},
+    "rationale": "<one line — why this is the strongest base for HP sweep right now>"
+  }},
   "lessons": "<1-2 sentences — what worked, what didn't, what to try next>",
   "data_request": "<empty string, or a free-form request to be sent to the operator>",
   "git_action": "kept" | "reverted"
 }}
 ```
 
-Be precise. The JSON is parsed by claude_mode.py and written to the SQLite feedback DB. Bad JSON = lost iteration.
+Be precise. The JSON is parsed by claude_mode.py and written to the SQLite
+feedback DB. ``active_case`` is also written verbatim to
+``models/active_case.json`` and gates train mode until you next override it.
+Bad JSON = lost iteration.
 
 ==================================================================
-9. NON-NEGOTIABLES
+10. NON-NEGOTIABLES
 ==================================================================
 - Do NOT change ~/projects/caffe-stocks/docs/ml-training.md or docs/ml-loop.md (the constitution).
 - Do NOT touch ~/projects/caffe-stocks/data/ (production runtime state).
 - Do NOT delete iteration_windows or iterations rows from the DB.
 - Do NOT install new Python packages without first checking if a comparable one exists.
 - Do NOT skip the JSON output block.
+- Do NOT skip the active_case block — train mode depends on it. If you have
+  no opinion, copy the prior active_case forward unchanged.
 
 Proceed.
 """
@@ -235,6 +278,18 @@ def build_prompt() -> str:
     requests = _open_data_requests()
     requests_block = '\n'.join(f'- {r}' for r in requests) if requests else '(none)'
 
+    case = active_case.read()
+    if case:
+        active_case_summary = (
+            f"trainer={case.get('trainer')!r} "
+            f"feature_set={case.get('feature_set')!r} "
+            f"dataset={case.get('dataset')!r} "
+            f"claude_iter_id={case.get('claude_iter_id')!r} "
+            f"rationale={(case.get('rationale') or '')[:120]!r}"
+        )
+    else:
+        active_case_summary = '(none — first run, or file missing)'
+
     return PROMPT_TEMPLATE.format(
         mission=indent(mission, '  '),
         trainers=trainers,
@@ -244,6 +299,7 @@ def build_prompt() -> str:
         n_recent=len(iters),
         recent_iterations=recent_block,
         open_requests=requests_block,
+        active_case_summary=active_case_summary,
     )
 
 

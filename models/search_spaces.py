@@ -268,11 +268,14 @@ SEARCH_SPACES: dict[str, dict] = {
     #     bagged_xgb_regressor (which is in [0,3]) because predict_proba is
     #     bounded [0,1] here, so the std term is also smaller in absolute
     #     scale — λ=1.5 already pushes mean−std into clipped territory.
-    #   bootstrap_frac ∈ [0.7, 1.0] — fraction of train rows sampled per
-    #     bag (with replacement, dates propagated). 0.7 = aggressive
-    #     decorrelation but smaller train-per-bag (worse early-stopping
-    #     signal); 1.0 = classic bootstrap (~63% unique rows per bag, full
-    #     sample size).
+    #   bootstrap_frac ∈ [0.7, 1.0] — fraction of unique trading **dates**
+    #     sampled per bag (with replacement; all rows of each sampled date
+    #     are included, preserving date-group ranker integrity). 0.7 =
+    #     aggressive regime decorrelation; 1.0 = classic bootstrap on
+    #     dates (~63% unique dates per bag at full sample size). Date-level
+    #     bootstrap is what drives the cross-bag std into a meaningful
+    #     consensus signal — row-level bootstrap shatters the within-date
+    #     pairwise structure the ranker depends on.
     'bagged_ev_gated_ranker': {
         'max_depth':          [3, 4, 6, 8],
         'learning_rate':      (0.01, 0.10),

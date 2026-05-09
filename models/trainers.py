@@ -2159,16 +2159,28 @@ class EVGatedRankerTrainer(XGBoostRankerTrainer):
 # count comfortably exceeds MIN_TRADES_PER_WINDOW=20 with K=2 slot cap).
 #
 # Implementation:
-#   - Wrap N copies of EVGatedRankerTrainer with row-bootstrap + seed diversity.
-#   - Each bag fits independently on its bootstrap sample; predict_proba returns
-#     the composite ranker_prob × ev_gate score in [0,1] per bag.
+#   - Wrap N copies of EVGatedRankerTrainer with date-block bootstrap + seed
+#     diversity. Each bag fits independently on its bootstrap sample;
+#     predict_proba returns the composite ranker_prob × ev_gate score in [0,1]
+#     per bag.
 #   - Aggregate: mean - conf_lambda * std, clipped to [0,1]. conf_lambda=0
 #     reduces to plain bagging (variance reduction); conf_lambda~0.5-1.0 adds
 #     consensus filtering — predictions where bags disagree get pulled below
 #     the threshold sweep, abstaining from low-confidence regimes.
-#   - Bootstrap is on raw rows (with replacement). Dates are propagated through
-#     the bootstrap so each bag's internal date-grouping in EVGatedRankerTrainer
-#     still works on its bootstrapped subset.
+#   - Bootstrap unit is the **trading date**, not the row. We sample
+#     ceil(bootstrap_frac × n_unique_dates) dates with replacement and pull
+#     every row belonging to each sampled date into the bag's training set.
+#     This (a) preserves date-group integrity so EVGatedRankerTrainer's
+#     pairwise rank:ndcg still operates on intact within-date pairs (row
+#     bootstrap shatters groups — a 0.85-row sample drops ~15% of every
+#     date's pairs uniformly, deflating gradient signal without giving the
+#     bags genuinely different views), (b) gives each bag a regime-distinct
+#     view (bag A might over-sample 2024-Q1, bag B over-samples 2025-Q3), so
+#     the cross-bag std (the consensus signal driving conf_lambda) actually
+#     measures regime-disagreement instead of within-date sub-sampling
+#     noise. Historical evidence: iter #286 used date-block bootstrap and
+#     cleared 5/7 windows at 46.1% WR; the row-bootstrap reconstruction
+#     (#411-#422) plateaus at 1/7 windows / 25-30% WR.
 #
 # Wall-time: 5 bags × 2 sub-models × 7 windows ≈ 70 XGBoost fits at ~3-4s each
 # ≈ 4-5 min — well inside the 30 min iter budget.
@@ -2232,16 +2244,30 @@ class BaggedEVGatedRankerTrainer(BaseTrainer):
         pnl_tr_arr = np.asarray(pnl_train, dtype=np.float32)
         dates_tr_arr = np.asarray(dates_train)
 
-        n_train = len(X_tr_arr)
-        n_sample = max(int(round(p['bootstrap_frac'] * n_train)), 200)
         rs_root = np.random.RandomState(p['random_state'])
+
+        # Date-block bootstrap setup. Pre-compute the rows belonging to each
+        # unique date once so per-bag sampling is O(n_dates_sample) instead of
+        # O(n_train) per bag.
+        unique_dates = np.unique(dates_tr_arr)
+        rows_per_date = {d: np.flatnonzero(dates_tr_arr == d)
+                         for d in unique_dates}
+        n_dates_sample = max(int(round(p['bootstrap_frac'] * len(unique_dates))), 5)
 
         self.bags = []
         best_iters = []
         for k in range(p['n_bags']):
             sample_seed = int(rs_root.randint(0, 2**31 - 1))
-            sub_idx = np.random.RandomState(sample_seed).choice(
-                n_train, size=n_sample, replace=True)
+            date_choice = np.random.RandomState(sample_seed).choice(
+                len(unique_dates), size=n_dates_sample, replace=True)
+            sampled_dates = unique_dates[date_choice]
+            # Concatenate all rows from sampled dates. Duplicate dates appear
+            # multiple times in the bag (multinomial bootstrap weighting);
+            # the inner trainer sorts by date before computing rank groups,
+            # so duplicate-date rows merge into a single larger group with
+            # M× the within-date pairs — equivalent to upweighting that date
+            # in the ranker's pairwise loss.
+            sub_idx = np.concatenate([rows_per_date[d] for d in sampled_dates])
             X_sub = X_tr_arr[sub_idx]
             y_sub = y_tr_arr[sub_idx]
             pnl_sub = pnl_tr_arr[sub_idx]

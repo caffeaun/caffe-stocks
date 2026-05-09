@@ -217,7 +217,12 @@ This produces ~16 OOS windows over 4 years — enough for stable gate evaluation
 
 ## 9. Acceptance gate (`return_gate.py`)
 
-A model **passes** the gate if, over the walk-forward windows:
+> **Note**: the prior version of this section (and the `return_gate.py` constants
+> shipped with it) was legacy from before this whitepaper was written. The v1
+> criteria below are the authoritative gate.
+
+A model becomes a **candidate** for the paper-trading panel only if, across all
+7 walk-forward windows in `SPLIT_DEFS`:
 
 ```
 For each window:
@@ -228,16 +233,35 @@ For each window:
     - Apply per-symbol friction (commission + VAT + slippage)
 
   Window passes if:
-    - Annualized return ≥ 50%
-    - Max drawdown ≤ 25%
-    - ≥ 5 trades in window
-    - Per-quarter return positive in ≥ 3 of 4 sub-quarters
-    - Per-trade WR ≥ 30%
+    - Max drawdown ≤ 20%
+    - ≥ 20 trades in window
+    - Per-trade WR ≥ 40%
+    (No per-window annualized return floor — moved to model level.)
 
-Model passes if ≥ 80% of windows pass (e.g., 13 of 16 OOS windows).
+Model passes (becomes a candidate) if:
+  - ALL 7 windows pass the per-window criteria above (100% — no regime exempt), AND
+  - avg annualized return across the 7 windows > best prior candidate's avg
+    annualized return (or > 0 for the first candidate, when no prior exists).
 ```
 
-The 80%-of-windows threshold is intentional — it rewards consistency across regimes, not one big win that masks losing periods.
+**Why 100% pass.** A candidate is going to paper-trade real signal; if it loses
+in any regime in the walk-forward, it's not a candidate. We'd rather sit empty
+than promote a model that fails in 1 of 7 regimes — that single regime will
+re-appear, and the model will lose money on it.
+
+**Why a relative bar on avg ann return.** The absolute 50% per-window floor in
+the legacy version made every model fail by an amount that wasn't informative.
+A relative bar that ratchets with each new candidate keeps the gate pulling
+forward without inventing an arbitrary number.
+
+**Per-window thresholds — rationale.**
+- `wr ≥ 40%`: with avg_win ~5% and avg_loss ~3.5%, breakeven WR ≈ 41%. 40%
+  filters statistical noise without being aspirational.
+- `max_dd ≤ 20%`: tightened from legacy 25% so a candidate can't survive on a
+  good-on-average pattern that includes one regime-deep drawdown.
+- `n_trades ≥ 20`: roughly 1 trade every 6 trading days in a 4-month window;
+  high enough that WR and DD are statistically meaningful, low enough that
+  trade-frequency optimization is tractable.
 
 ## 10. Friction model
 

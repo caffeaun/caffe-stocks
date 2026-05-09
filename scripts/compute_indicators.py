@@ -42,8 +42,15 @@ def main():
 
     # Process each symbol separately and collect results
     all_parts = []
+    skipped_short = []
     for symbol in stock_symbols:
         symbol_df = df[df['symbol'] == symbol].copy().sort_values('timestamp')
+        # Skip thin-history symbols — pandas_ta degrades to weird DataFrame
+        # returns when input is shorter than the indicator window. 30 rows
+        # comfortably covers RSI(14), MACD(12,26,9), BB(20), ATR(14).
+        if len(symbol_df) < 30:
+            skipped_short.append((symbol, len(symbol_df)))
+            continue
 
         # Compute indicators using pandas_ta
         symbol_df['rsi'] = symbol_df.ta.rsi(length=14)
@@ -212,6 +219,11 @@ def main():
             print(f"Merged historical trading features: {has_hist} rows")
     except Exception:
         pass  # table may not exist yet
+
+    if skipped_short:
+        print(f"Skipped {len(skipped_short)} symbols with <30 rows: "
+              f"{', '.join(f'{s}({n})' for s, n in skipped_short[:10])}"
+              f"{' ...' if len(skipped_short) > 10 else ''}")
 
     # Write to candles table
     df_clean = df_clean.drop_duplicates(subset=['symbol', 'date'], keep='last')
