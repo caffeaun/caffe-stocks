@@ -194,10 +194,17 @@ def simulate_window(scores, dates, symbols, pnl, hold_days, threshold,
     max_dd = float(dd.max()) if len(dd) > 0 else 0.0
     final_equity = float(equity[-1])
 
-    # Annualize: compute test-window length in days, scale return
-    first_date = trades[0]['date']
-    last_date = trades[-1]['date']
-    span_days = max(1, _date_diff(first_date, last_date) + int(trades[-1]['hold_days']))
+    # Annualize over the FULL test-window length, not the trader-active span.
+    # Pre-fix: span = first_trade..last_trade + hold; ranker trainers that
+    # cluster trades early in the window produced tiny spans (~10 days),
+    # blowing up the (365/span) exponent and yielding 10^9 % annualized.
+    # Now: span = min(dates)..max(dates) of the test window, so the same
+    # equity gain on a 4-month window produces a sane annualized rate.
+    # numpy 2.x can't np.min/max string dtype, so use Python builtin min/max.
+    date_strs = [str(d)[:10] for d in dates]
+    window_start = min(date_strs)
+    window_end = max(date_strs)
+    span_days = max(1, _date_diff(window_start, window_end) + 1)
     annualized = (final_equity ** (365.0 / span_days)) - 1.0
 
     wins = pnls > 0

@@ -39,6 +39,9 @@ PANEL_DIR = BASE / 'models' / 'panel'
 MIN_ATR_PCT = 0.03
 MIN_VOL_RATIO = 2.0
 RSI_MIN, RSI_MAX = 30, 65
+# BLS tick is ฿0.01 — that's 1% of a ฿1 stock and 5% of a ฿0.20 stock.
+# Sub-฿1 names suffer tick-noise the strategy can't profitably absorb.
+MIN_CLOSE = 1.0
 
 
 def _system_active() -> bool:
@@ -192,6 +195,7 @@ def _apply_rule_screen(symbols_today: np.ndarray, latest_date: str) -> set[str]:
     df = df[df['symbol'].isin(symbols_today)]
     df = df.dropna(subset=['atr', 'close', 'volume_ratio', 'rsi'])
     df = df[
+        (df['close'] >= MIN_CLOSE) &
         ((df['atr'] / df['close']) > MIN_ATR_PCT) &
         (df['volume_ratio'] > MIN_VOL_RATIO) &
         (df['rsi'].between(RSI_MIN, RSI_MAX))
