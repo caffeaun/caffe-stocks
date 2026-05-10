@@ -5187,6 +5187,114 @@ class XGBoostMetaLabelingTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# MC-Dropout Feature Mask Classifier — predict-time uncertainty via random
+# feature masking. Inherits strict-win training (y = pnl > 0); overrides
+# predict_proba to run K stochastic passes, masking drop_rate fraction of
+# features per row to NaN (XGB's native missing → default-direction routing
+# at each split). Final score = mean(p_k) − conf_lambda · std(p_k), so rows
+# whose prediction depends on a single fragile feature get penalised, and
+# only predictions stable under input perturbation pass the gate threshold.
+#
+# Motivation: the xgb_meta_label sweep (#619-#632) keeps producing high-WR
+# threshold bands JUST below the n>=20 cliff (e.g. #624 W6: 17 trades / 70.6%
+# WR / +22.4% ann — would pass at n>=20; #631 W4: 19 trades / 42.1% WR — same
+# story). This is the signature of confident-but-narrow predictions: the
+# model bets hard on a small cluster of (stock, day) rows whose score depends
+# on a specific feature value being intact. When the regime shifts (W4 2024-Q4,
+# W5 2025-Q1), the same feature drifts and the cluster's WR collapses.
+#
+# Feature-dropout uncertainty is structurally orthogonal to every existing
+# trainer family in the registry: bagging averages across MODELS, mixup
+# perturbs TRAINING rows, DRO reweights TRAINING quarters, adv-val reweights
+# train ROWS by test-similarity. None perturb the predict-time INPUT. The
+# Gal & Ghahramani (2016) MC-dropout intuition — that dropout at inference
+# yields a Bayesian uncertainty estimate — transfers to trees via XGB's
+# native NaN routing: each masked feature is replaced by the default-direction
+# vote, and the spread across K masks measures how much the prediction
+# depends on the SPECIFIC unmasked feature combination.
+#
+# Concretely: a (stock, day) row predicted +0.70 across all 15 masks (std=0.02)
+# is robust → score ≈ 0.70 − 0.5·0.02 = 0.69. A row predicted +0.70 in 8
+# passes and +0.40 in 7 passes (std=0.15) is fragile → score ≈ 0.70 − 0.5·0.15
+# = 0.625, demoted below the n=20-yielding threshold.
+class XGBoostMCDropoutClassifierTrainer(XGBoostStrictWinClassifierTrainer):
+    name = 'xgb_mcdropout_classifier'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 magnitude_scale: float = 15.0,
+                 base_weight: float = 0.6,
+                 pos_class_weight: float = 3.0,
+                 early_stopping_rounds: int = 30,
+                 drop_rate: float = 0.20,
+                 n_dropout_passes: int = 15,
+                 conf_lambda: float = 0.5,
+                 random_state: int = 42):
+        super().__init__(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            magnitude_scale=magnitude_scale,
+            base_weight=base_weight,
+            pos_class_weight=pos_class_weight,
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self._params['drop_rate'] = float(drop_rate)
+        self._params['n_dropout_passes'] = int(n_dropout_passes)
+        self._params['conf_lambda'] = float(conf_lambda)
+        self._last_mean_uncertainty = None  # diagnostic, set in predict_proba
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        p = self._params
+        X_arr = np.asarray(X, dtype=np.float64)
+        n_rows, n_feat = X_arr.shape
+        K = max(1, int(p['n_dropout_passes']))
+        drop_rate = max(0.0, min(0.95, float(p['drop_rate'])))
+        n_drop = int(round(drop_rate * n_feat))
+
+        if K == 1 or n_drop == 0:
+            # Degenerate config — fall back to plain XGB predict
+            return self.clf.predict_proba(X_arr)[:, 1]
+
+        rng = np.random.default_rng(int(p['random_state']))
+        probs = np.empty((K, n_rows), dtype=np.float64)
+        row_idx_template = np.repeat(np.arange(n_rows), n_drop)
+
+        for k in range(K):
+            X_masked = X_arr.copy()
+            # argpartition on random scores → indices of n_drop smallest per row
+            scores = rng.random((n_rows, n_feat))
+            drop_cols = np.argpartition(scores, n_drop - 1, axis=1)[:, :n_drop]
+            X_masked[row_idx_template, drop_cols.reshape(-1)] = np.nan
+            probs[k] = self.clf.predict_proba(X_masked)[:, 1]
+
+        mean_p = probs.mean(axis=0)
+        std_p = probs.std(axis=0)
+        self._last_mean_uncertainty = float(std_p.mean())
+        score = mean_p - float(p['conf_lambda']) * std_p
+        # Clip into [0, 1] so threshold semantics in return_gate.py
+        # (SCORE_THRESHOLDS) stay valid even when conf_lambda is aggressive.
+        return np.clip(score, 0.0, 1.0)
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -5215,6 +5323,7 @@ TRAINERS = {
     'xgb_topk_classifier': XGBoostTopKClassifierTrainer,
     'xgb_adv_val': XGBoostAdversarialValidationTrainer,
     'xgb_meta_label': XGBoostMetaLabelingTrainer,
+    'xgb_mcdropout_classifier': XGBoostMCDropoutClassifierTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

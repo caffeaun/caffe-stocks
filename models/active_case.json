@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_meta_label",
+  "trainer": "xgb_mcdropout_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "xgb_adv_val sweep #610-617 has plateaued at 5/7 (#610 best). xgb_meta_label is structurally novel (first hierarchical-classifier trainer where stage-1 score is an INPUT FEATURE to stage 2) and shows the right kind of WR uplift at default HP \u2014 W1 thr=0.40 hit WR=58% n=19 ann=+15%, W6 thr=0 hit WR=47% dd=2.3%. Both miss the n>=20 cliff by 1-3 trades. Sweep target: lower stage1/stage2 learning_rate \u00d7 more n_estimators \u00d7 wider stage1_train_frac to spread the score distribution and pull these high-WR threshold bands above n=20.",
-  "claude_iter_id": 618,
-  "designated_at": "2026-05-11T00:12:49"
+  "rationale": "Pivot from xgb_meta_label (14 sweep iters #619-#632 plateaued: best 5/7 #631 +18.6%, mean wp ~3.4, no monotone improvement) to the new MC-dropout trainer. Default conf_lambda=0.5 / drop_rate=0.20 was too aggressive \u2014 score compression dropped 5/7 windows to thr=0 fallback \u2014 but the mechanism IS proven: W2 (thr=0.6, n=24, WR=41.7%) and W3 (thr=0.5, n=24, WR=45.8%) cleanly cleared the gate with selective behavior. Train-mode sweep should explore lower conf_lambda (0.0\u20130.3) \u00d7 lower drop_rate (0.05\u20130.15) to lift mean predictions above the 0.30 floor while keeping enough std-spread to gate fragile rows \u2014 the goal HP combo should produce thr\u22650.3 selections in W4/W5/W6/W7.",
+  "claude_iter_id": 633,
+  "designated_at": "2026-05-11T03:12:07"
 }

@@ -635,6 +635,39 @@ SEARCH_SPACES: dict[str, dict] = {
         'stage2_reg_lambda':        (0.5, 2.0),
         'stage1_train_frac':        (0.40, 0.70),
     },
+    # MC-Dropout feature-mask classifier (xgb_mcdropout_classifier) — XGB tree
+    # HP space mirrors xgb_strict_win (the parent class providing the y=pnl>0
+    # alignment and per-row magnitude weighting). Three dropout-specific knobs:
+    #   drop_rate ∈ [0.05, 0.40] — fraction of features NaN-masked per row per
+    #     pass. Low end (0.05–0.10) yields conservative uncertainty estimates
+    #     (most predictions look stable); high end (0.30–0.40) aggressively
+    #     stress-tests feature dependence and may collapse mean toward 0.5
+    #     for rows whose signal comes from any few-feature subset.
+    #   n_dropout_passes ∈ {8, 12, 16, 24} — number of MC samples. 8 is the
+    #     SE/std floor where std estimate becomes reliable (CI for std with
+    #     n=8 is wide but useful for ranking); 24 is the compute ceiling
+    #     (~1.5s per window × 7 windows ≈ 11s extra at predict, negligible).
+    #   conf_lambda ∈ [0.0, 2.0] — std-penalty strength. 0 = plain MC mean
+    #     (averages out predict noise but keeps fragile-feature predictions);
+    #     0.5 = canonical Bayesian-style downweighting; 1.5+ = heavy penalty,
+    #     only the most stable rows clear high thresholds.
+    'xgb_mcdropout_classifier': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.01, 0.10),
+        'n_estimators':       [200, 400, 800],
+        'min_child_weight':   [1, 5, 10, 20],
+        'gamma':              (0.0, 0.3),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (0.5, 2.0),
+        'magnitude_scale':    (5.0, 30.0),
+        'base_weight':        (0.3, 1.0),
+        'pos_class_weight':   (1.5, 5.0),
+        'drop_rate':          (0.05, 0.40),
+        'n_dropout_passes':   [8, 12, 16, 24],
+        'conf_lambda':        (0.0, 2.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
