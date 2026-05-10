@@ -4531,6 +4531,297 @@ class XGBoostTopKClassifierTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Adversarial-validation reweighting — feature-distribution-aware shift fix.
+#
+# Every prior loss-engineering trainer (focal, JTT, group_balanced_focal,
+# quarterly_dro, mixup, topk_classifier, strict_win, magnitude) saturates at
+# 3-4/7 windows across iters #430-#586. They differ in HOW they reweight rows
+# (per-row mistakes, per-quarter losses, per-quarter counts, per-row magnitude,
+# synthetic interpolation), but they all share a structural blind spot: NONE
+# of them know which TRAIN rows resemble the upcoming TEST distribution. They
+# only know about the labels and losses on the train side. recency_huber (#207,
+# 1/7) tried to fix this with a raw exponential decay over date position — too
+# crude, since 2024-Q1 features may look like 2023-Q1 features regardless of
+# the calendar.
+#
+# Adversarial validation (Kaggle-canonical for time-series competitions) fits
+# this exact gap. A small inner classifier C predicts P(row is from the LATE
+# fraction of train | features), giving every train row a continuous
+# "test-likeness" score derived from its FEATURES, not its date. Re-train the
+# main classifier on (pnl > 0) with sample_weight = C(x)^adv_alpha so the
+# gradient concentrates on rows whose feature distribution most resembles
+# the upcoming test window — the exact axis recency-decay couldn't reach.
+#
+# Distinct from every existing trainer:
+#   - quarterly_dro: per-quarter LOSSES (label-conditioned). AVR: per-row
+#     feature-distribution similarity to test (label-agnostic upstream).
+#   - JTT: per-row pass-1 errors. AVR: per-row pass-1 distribution similarity.
+#   - temporal_mixup: synthesizes new rows linearly between regimes. AVR:
+#     reweights real rows by feature-space similarity.
+#   - recency_huber: raw exp(decay * t) over date position only. AVR: features
+#     drive the weight, so a 2023-Q4-dated row whose features happen to match
+#     the upcoming Q1-shifted distribution gets a HIGH weight, which raw
+#     date-decay can't express.
+#   - focal_loss / strict_win / topk_classifier: change the LABEL or the LOSS
+#     SHAPE on a fixed train pool. AVR: changes which TRAIN ROWS the gradient
+#     attends to, with the same binary (pnl > 0) target.
+#
+# Defaults chosen to be conservative:
+#   - adv_test_frac=0.25: last 25% of train rows by date are pseudo-test for
+#     the inner classifier. Roughly matches the inner-train/val split that
+#     evaluate_window already uses (0.80 cutoff = 20% val) — so the AVR
+#     classifier learns "what does the val distribution look like" which is
+#     the closest proxy to the actual test distribution available at fit time.
+#   - adv_alpha=1.0: P(test-like) raised to power 1 (no sharpening or softening).
+#     alpha=0 reduces to ERM; alpha>1 sharpens toward most-test-like rows;
+#     alpha<1 softens. Sweep range covers all three regimes.
+#   - weight_clip=10.0: caps any single row's weight at 10× the mean to prevent
+#     a handful of extreme test-like rows from dominating gradient (a known
+#     failure mode of importance-weighting under sparse domain overlap).
+#   - adv_n_estimators=100, adv_max_depth=4: small inner classifier — must NOT
+#     overfit pseudo-labels (else weights collapse to {0, 1} and AVR degenerates
+#     into hard truncation of train data).
+class XGBoostAdversarialValidationTrainer(BaseTrainer):
+    """Two-stage XGBoost: (1) inner classifier predicts test-likeness from
+    features; (2) main binary classifier on (pnl > 0) with sample_weight
+    derived from inner classifier's per-row probabilities.
+    """
+    name = 'xgb_adv_val'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 adv_alpha: float = 1.0,
+                 adv_test_frac: float = 0.25,
+                 adv_n_estimators: int = 100,
+                 adv_max_depth: int = 4,
+                 weight_clip: float = 10.0,
+                 weight_floor: float = 0.05,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            adv_alpha=float(adv_alpha),
+            adv_test_frac=float(adv_test_frac),
+            adv_n_estimators=int(adv_n_estimators),
+            adv_max_depth=int(adv_max_depth),
+            weight_clip=float(weight_clip),
+            weight_floor=float(weight_floor),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.booster = None
+        self._best_iteration = None
+        self._n_features = None
+        self._adv_auc = None         # diagnostic: how separable late vs early
+        self._weight_stats = None    # diagnostic
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val to derive the '
+                'strict-win label.')
+        if dates_train is None:
+            raise ValueError(
+                f'{self.name} requires dates_train to define the pseudo-test '
+                'fraction for adversarial validation.')
+
+        # Strict-win label (matches xgb_jtt / xgb_quarterly_dro / xgb_focal_loss)
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+
+        # ---- STAGE 1: adversarial classifier ---------------------------------
+        # Pseudo-test = last `adv_test_frac` fraction of UNIQUE train dates.
+        # Per-row label = 1 iff row's date is in the late tail. This gives the
+        # inner classifier a date-derived but feature-driven decision boundary.
+        dates_arr = np.asarray(dates_train)
+        unique_dates = np.sort(np.unique(dates_arr))
+        cutoff_idx = int((1.0 - float(p['adv_test_frac'])) * len(unique_dates))
+        cutoff_idx = max(1, min(cutoff_idx, len(unique_dates) - 1))
+        late_cutoff = unique_dates[cutoff_idx]
+        adv_y = (dates_arr >= late_cutoff).astype(np.float32)
+
+        # Guard: if the cutoff produces a single class, fall back to uniform
+        # weights (degenerate window — too few unique dates for AVR to bite).
+        if len(set(adv_y.tolist())) < 2:
+            weights = np.ones(len(Xt), dtype=np.float64)
+            self._adv_auc = None
+        else:
+            adv_dtrain = xgb.DMatrix(Xt, label=adv_y)
+            adv_params = {
+                'tree_method': 'hist',
+                'objective': 'binary:logistic',
+                'max_depth': int(p['adv_max_depth']),
+                'learning_rate': 0.05,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'verbosity': 0,
+                'eval_metric': 'auc',
+                'seed': int(p['random_state']) + 7,
+            }
+            adv_booster = xgb.train(
+                params=adv_params,
+                dtrain=adv_dtrain,
+                num_boost_round=int(p['adv_n_estimators']),
+                verbose_eval=verbose,
+            )
+            p_test_like = adv_booster.predict(adv_dtrain)
+            p_test_like = np.clip(p_test_like, 1e-6, 1.0 - 1e-6)
+
+            # Adversarial AUC for diagnostics: > 0.7 = clear distribution shift,
+            # ~ 0.5 = no shift detected (AVR collapses to ERM-ish weights).
+            try:
+                from sklearn.metrics import roc_auc_score
+                self._adv_auc = float(roc_auc_score(adv_y, p_test_like))
+            except Exception:
+                self._adv_auc = None
+
+            # Per-row weight = (P(test-like))^alpha, with floor and clip.
+            alpha = float(p['adv_alpha'])
+            w = np.power(p_test_like, alpha)
+            w = np.maximum(w, float(p['weight_floor']))
+            # Renormalize to mean=1 BEFORE clip so the clip threshold is
+            # interpretable in mean-multiples.
+            w = w * (len(w) / w.sum())
+            w = np.minimum(w, float(p['weight_clip']))
+            # Renormalize again post-clip.
+            if w.sum() > 0:
+                weights = w * (len(w) / w.sum())
+            else:
+                weights = np.ones(len(Xt), dtype=np.float64)
+
+        self._weight_stats = {
+            'min': float(weights.min()),
+            'max': float(weights.max()),
+            'mean': float(weights.mean()),
+            'std': float(weights.std()),
+            'frac_above_1.0': float((weights > 1.0).mean()),
+            'late_frac': float(adv_y.mean()),
+        }
+
+        # ---- STAGE 2: main classifier with AVR weights -----------------------
+        common = {
+            'tree_method': 'hist',
+            'objective': 'binary:logistic',
+            'max_depth': int(p['max_depth']),
+            'learning_rate': float(p['learning_rate']),
+            'subsample': float(p['subsample']),
+            'colsample_bytree': float(p['colsample_bytree']),
+            'reg_alpha': float(p['reg_alpha']),
+            'reg_lambda': float(p['reg_lambda']),
+            'min_child_weight': float(p['min_child_weight']),
+            'gamma': float(p['gamma']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+            'seed': int(p['random_state']),
+        }
+        dtrain = xgb.DMatrix(
+            Xt,
+            label=y_tr.astype(np.float32),
+            weight=weights.astype(np.float32),
+        )
+        dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+        self.booster = xgb.train(
+            params=common,
+            dtrain=dtrain,
+            num_boost_round=int(p['n_estimators']),
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.booster, 'best_iteration', 0))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.booster is None:
+            raise RuntimeError('Model not fit')
+        dmat = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        return self.booster.predict(dmat)
+
+    def feature_importance(self):
+        if self.booster is None or self._n_features is None:
+            return None
+        score = self.booster.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                out[int(k[1:])] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.booster.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+            'adv_auc': self._adv_auc,
+            'weight_stats': self._weight_stats,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.booster = xgb.Booster()
+        inst.booster.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        inst._adv_auc = meta.get('adv_auc')
+        inst._weight_stats = meta.get('weight_stats')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -4557,6 +4848,7 @@ TRAINERS = {
     'xgb_jtt': XGBoostJTTTrainer,
     'xgb_quarterly_dro': XGBoostQuarterlyDROTrainer,
     'xgb_topk_classifier': XGBoostTopKClassifierTrainer,
+    'xgb_adv_val': XGBoostAdversarialValidationTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

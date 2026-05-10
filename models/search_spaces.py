@@ -565,6 +565,42 @@ SEARCH_SPACES: dict[str, dict] = {
         'top_k':                  [1, 2, 3],
         'pos_class_weight':       (10.0, 50.0),
     },
+    # Adversarial-Validation-Reweighted XGBoost. Same XGB tree-family HP space
+    # as xgb_quarterly_dro / xgb_focal_loss (HP intuitions carry over) plus
+    # four AVR-specific knobs:
+    #   adv_alpha ∈ [0.0, 3.0] — exponent applied to P(test-like)^alpha. 0=ERM
+    #     (no AVR), 1=raw probability, >1=sharpen toward most-test-like rows,
+    #     <1=soften. Sweep covers all three regimes; recency_huber's failure
+    #     at decay=1.5 (#207) suggests the sweet spot is likely in [0.5, 1.5].
+    #   adv_test_frac ∈ [0.15, 0.4] — fraction of train (by unique date) used
+    #     as the pseudo-test for the inner AVR classifier. The gate's inner
+    #     val cutoff is 0.20, so the natural anchor is ~0.25; smaller values
+    #     give a sharper but noisier "future-like" signal, larger values
+    #     dilute it.
+    #   adv_n_estimators ∈ {50, 100, 200} — capacity of the inner classifier.
+    #     Too high → overfits pseudo-labels and weights collapse to {0, 1}.
+    #     Too low → can't separate distributions and AVR adds nothing.
+    #   weight_clip ∈ [3.0, 20.0] — caps any single row's weight at K× the
+    #     mean. Looser clips let extreme test-like rows dominate (gradient
+    #     concentration); tighter clips spread the gradient. Importance-
+    #     weighting under sparse domain overlap historically benefits from
+    #     moderate clips (~5-10).
+    'xgb_adv_val': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'adv_alpha':              (0.0, 3.0),
+        'adv_test_frac':          (0.15, 0.40),
+        'adv_n_estimators':       [50, 100, 200],
+        'adv_max_depth':          [3, 4, 6],
+        'weight_clip':            (3.0, 20.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
