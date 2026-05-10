@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_group_balanced_focal",
+  "trainer": "xgb_temporal_mixup",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Fresh HP space with one extra structural dim (group_balance_strength) attacking regime-shift; xgb_focal_loss saturated over 8 train iters #485-#492 at best 4/7 \u2014 switch the sweep to a family with unsampled territory.",
-  "claude_iter_id": 493,
-  "designated_at": "2026-05-10T00:05:25"
+  "rationale": "Fresh structural lever (synthetic-row temporal Mixup augmentation) hit 3/7 at default HPs and notably passed W2 2024-Q1 chop (WR 47.6%, ann +36.4%) which has been the historical break-point across xgb_focal_loss/strict_win/group_balanced_focal sweeps; HP space includes 3 trainer-specific knobs (mixup_alpha/ratio/min_quarters) that train mode hasn't explored yet.",
+  "claude_iter_id": 539,
+  "designated_at": "2026-05-10T09:12:49"
 }
