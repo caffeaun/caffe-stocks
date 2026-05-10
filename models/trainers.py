@@ -3805,6 +3805,250 @@ class XGBoostTemporalMixupTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Just-Train-Twice XGBoost classifier (Liu et al. 2021)
+# --------------------------------------------------------------------- #
+# Motivation: every prior loss-shape / sample-weighting trainer (focal,
+# strict-win, magnitude, group-balanced-focal, temporal-mixup) saturates at
+# 4/7 windows. The chronic failure cluster is W3 (2024-05..2024-08) and W6
+# (2025-05..2025-08) — Thai-summer regimes where WR collapses to 30-37%.
+# Static reweighting schemes (per-row by |pnl|, per-quarter by inverse-
+# frequency, per-row by current model confidence) all reweight the SAME
+# distribution the ERM model already sees: they don't change which subset
+# of the input space is "hard" — only how loudly the existing hard set
+# screams.
+#
+# Hypothesis: the truly hard subset is empirically defined — the rows an
+# ERM-trained XGBoost model gets WRONG. JTT (Liu et al. 2021, ICML, "Just
+# Train Twice: Improving Group Robustness without Training Group
+# Information") implements implicit Group DRO without requiring group
+# labels:
+#   Pass 1 (identifier): train a deliberately-weak ERM model
+#   Pass 2 (final):      retrain a fresh model with samples misclassified
+#                        by the identifier upweighted by `lambda_up`
+# Without group labels, the misclassified-by-pass-1 set is the empirical
+# worst-case subgroup. Liu et al. show this matches or beats Group DRO
+# (which requires explicit group labels) on Waterbirds / CelebA / CivilComments.
+#
+# Structurally distinct from existing trainers:
+#   - focal_loss:    per-row weighting by CURRENT prediction confidence
+#                    (single-pass, weights computed inside loss closure)
+#   - group_balanced: per-quarter weighting by FREQUENCY (single-pass,
+#                    weights computed before any training)
+#   - magnitude:     per-row weighting by |pnl| (single-pass, static)
+#   - temporal_mixup: synthetic samples (data augmentation, single-pass)
+#   - bagged_*:      bootstrap diversity, but bags are still ERM
+#   - JTT:           per-row weighting by FIRST-PASS MISTAKES (two-pass,
+#                    weights derived from a separately-trained model)
+# The "weights from a learned model" mechanism is genuinely orthogonal —
+# it's the only one that lets the identifier discover hard subsets the
+# loss / labels themselves couldn't reveal.
+#
+# Why this should help W3/W6 specifically: the dominant 2024-H2 / 2025-H2
+# bull-quarter rows in training are easy for the identifier; the chop /
+# regime-shift rows are hard. Upweighting the latter forces the pass-2
+# model to fit decision boundaries that survive in summer regimes — even
+# when those rows aren't from the test windows themselves, they're closer
+# in feature distribution than the bull-quarter rows are.
+#
+# Implementation: pure-strict-win label (matches focal_loss / group_balanced /
+# temporal_mixup), binary:logistic objective (no custom obj — JTT works
+# equally well with built-in CE since the DRO comes from the weights, not
+# the loss shape). Pass 1 deliberately weakened by training only
+# `pass1_estimators_frac` of n_estimators (per JTT paper §3 — early-stopped
+# identifier, not over-trained one, otherwise mistakes ≈ 0 and DRO degrades
+# to ERM). Pass 1 and pass 2 use distinct seeds so pass-2 isn't a strict
+# refinement of pass-1's tree structure.
+class XGBoostJTTTrainer(BaseTrainer):
+    """Just Train Twice (Liu et al. 2021): two-pass training with implicit
+    Group DRO via mistake-set upweighting. No group labels required.
+    """
+    name = 'xgb_jtt'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 lambda_up: float = 50.0,
+                 pass1_estimators_frac: float = 0.5,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            lambda_up=float(lambda_up),
+            pass1_estimators_frac=float(pass1_estimators_frac),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.booster = None
+        self._best_iteration = None
+        self._n_features = None
+        self._mistake_rate = None  # diagnostic: fraction of train rows the identifier got wrong
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade '
+                'realized P&L) to derive the strict-win label.')
+
+        # Strict-win label aligns target with the gate's WR metric (matches
+        # xgb_focal_loss / xgb_strict_win / xgb_temporal_mixup).
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+
+        n_total = int(p['n_estimators'])
+        n_pass1 = max(50, int(n_total * float(p['pass1_estimators_frac'])))
+
+        common = {
+            'tree_method': 'hist',
+            'objective': 'binary:logistic',
+            'max_depth': int(p['max_depth']),
+            'learning_rate': float(p['learning_rate']),
+            'subsample': float(p['subsample']),
+            'colsample_bytree': float(p['colsample_bytree']),
+            'reg_alpha': float(p['reg_alpha']),
+            'reg_lambda': float(p['reg_lambda']),
+            'min_child_weight': float(p['min_child_weight']),
+            'gamma': float(p['gamma']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+        }
+
+        # PASS 1 — ERM identifier (weakened capacity via fewer rounds)
+        dtrain_uniform = xgb.DMatrix(Xt, label=y_tr.astype(np.float32))
+        dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+        params_p1 = {**common, 'seed': int(p['random_state'])}
+        identifier = xgb.train(
+            params=params_p1,
+            dtrain=dtrain_uniform,
+            num_boost_round=n_pass1,
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+
+        # Identify mistakes on the training set (hard 0.5 threshold — the
+        # canonical JTT criterion; using the actual model decisions, not
+        # margin slack).
+        pass1_proba = identifier.predict(dtrain_uniform)
+        pass1_class = (pass1_proba >= 0.5).astype(np.int32)
+        mistakes = (pass1_class != y_tr)
+        mistake_rate = float(mistakes.mean())
+        self._mistake_rate = mistake_rate
+
+        # Build pass-2 weights: misclassified rows × lambda_up, correct rows × 1.
+        # Renormalize to mean = 1 so XGBoost's effective learning rate matches
+        # the un-weighted pass (gradient magnitudes preserved in expectation).
+        weights = np.where(mistakes, float(p['lambda_up']), 1.0).astype(np.float64)
+        weights = weights * (len(weights) / weights.sum())
+
+        # PASS 2 — final model with mistake-upweighted DMatrix. Distinct seed
+        # so pass 2 isn't a deterministic refinement of pass 1's tree structure
+        # (would defeat the DRO mechanism by recovering pass 1's mistakes).
+        dtrain_w = xgb.DMatrix(
+            Xt,
+            label=y_tr.astype(np.float32),
+            weight=weights.astype(np.float32),
+        )
+        params_p2 = {**common, 'seed': int(p['random_state']) + 1}
+        self.booster = xgb.train(
+            params=params_p2,
+            dtrain=dtrain_w,
+            num_boost_round=n_total,
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.booster, 'best_iteration', 0))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.booster is None:
+            raise RuntimeError('Model not fit')
+        dmat = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        # binary:logistic returns probabilities directly.
+        return self.booster.predict(dmat)
+
+    def feature_importance(self):
+        if self.booster is None or self._n_features is None:
+            return None
+        score = self.booster.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                out[int(k[1:])] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.booster.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+            'mistake_rate': self._mistake_rate,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.booster = xgb.Booster()
+        inst.booster.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        inst._mistake_rate = meta.get('mistake_rate')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -3828,6 +4072,7 @@ TRAINERS = {
     'xgb_focal_loss': XGBoostFocalLossClassifierTrainer,
     'xgb_group_balanced_focal': XGBoostGroupBalancedFocalLossTrainer,
     'xgb_temporal_mixup': XGBoostTemporalMixupTrainer,
+    'xgb_jtt': XGBoostJTTTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

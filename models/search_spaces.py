@@ -468,6 +468,43 @@ SEARCH_SPACES: dict[str, dict] = {
         'mixup_ratio':            (0.5, 2.0),
         'mixup_min_quarters':     [0, 1, 2, 3],
     },
+    # Just-Train-Twice (JTT, Liu et al. 2021) XGB classifier: pass 1 ERM
+    # identifier finds samples that ERM gets wrong, pass 2 retrains with those
+    # samples upweighted. Implicit Group DRO without group labels — addresses
+    # the W3/W6 summer-regime WR collapse that none of focal / group_balanced /
+    # magnitude / temporal_mixup can reach (those reweight by static signals;
+    # JTT reweights by model-discovered hard subset). Same XGB tree-family HP
+    # space as xgb_focal_loss / xgb_temporal_mixup (HP intuitions carry over)
+    # plus two JTT-specific knobs:
+    #   lambda_up ∈ [10, 200] — upweight multiplier on misclassified pass-1
+    #     rows. Liu et al. (2021) Table 1 reports best λ_up ∈ {20, 50, 100}
+    #     across vision/NLI tasks; tabular literature (Idrissi et al. 2022)
+    #     suggests slightly lower (~20-50) on smaller datasets. Range [10, 200]
+    #     covers both — λ=10 is mild reweighting (ERM ≈ 80% of gradient still),
+    #     λ=200 is aggressive (mistake gradient dominates 4-5×). The sweep
+    #     should locate the slope where mistake-set fitting stops trading off
+    #     against majority-set fit.
+    #   pass1_estimators_frac ∈ [0.3, 0.7] — fraction of n_estimators used to
+    #     train the identifier. <0.3 risks an under-trained identifier whose
+    #     "mistakes" are noise rather than the hard subset; >0.7 risks an
+    #     over-trained identifier with mistake_rate ≈ 0 (memorizes training
+    #     set, JTT degrades to ERM). 0.5 is the JTT-paper default (early-stop
+    #     halfway). The sweep should find the slope where mistake_rate lands
+    #     in the 15-35% band that the paper validates as "informative hard
+    #     subset, not pure noise".
+    'xgb_jtt': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'lambda_up':              (10.0, 200.0),
+        'pass1_estimators_frac':  (0.3, 0.7),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
