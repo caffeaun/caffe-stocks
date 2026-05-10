@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_quarterly_dro",
+  "trainer": "xgb_adv_val",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "xgb_topk_classifier failed catastrophically at default HPs (0/7, avg_ann -27.5%) \u2014 the per-date top-K-by-pnl label selects for VARIANCE not SELECTIVITY (avg_win +8-13% but WR 14-33%, DD often >20%). xgb_quarterly_dro remains the strongest baseline (3/7 default, +3.5% avg_ann); train mode should keep deepening its HP sweep on dro_strength \u00d7 pass1_estimators_frac \u00d7 weight_smoothing \u2014 three knobs barely explored beyond defaults.",
-  "claude_iter_id": 586,
-  "designated_at": "2026-05-10T18:17:19"
+  "rationale": "xgb_adv_val structurally novel (first feature-distribution-aware reweighting trainer) and default-HP avg_ann +24.4% materially beats every prior 3/7 baseline (#570 quarterly_dro +3.5%, #539 mixup +3.3%); W2 hit unprecedented +162.6% ann. Failure modes are HP-tunable (W1 n=17 at thr=0.55 close to passing, W4 n=15 at thr=0.50 with WR=40%) \u2014 score distribution too peaky at default. Sweep should explore adv_alpha (never sampled, range [0,3]) \u00d7 adv_test_frac \u00d7 lower learning_rate to spread the score distribution into the threshold-sweep band.",
+  "claude_iter_id": 602,
+  "designated_at": "2026-05-10T21:13:54"
 }
