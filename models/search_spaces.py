@@ -668,6 +668,34 @@ SEARCH_SPACES: dict[str, dict] = {
         'n_dropout_passes':   [8, 12, 16, 24],
         'conf_lambda':        (0.0, 2.0),
     },
+    # Diverse-objective rank-fusion ensemble (xgb_rank_fusion). Three internally
+    # fit XGBoost bases (strict-win BCE, huber pnl regressor, quarterly DRO),
+    # combined via within-batch quantile-rank geometric mean — no learned
+    # weights. The fusion is fixed; only the SHARED base HPs are swept, plus
+    # loss-specific knobs for each base. Keeping a SHARED tree-shape HP profile
+    # across bases means train mode doesn't blow up into a 30-dimensional
+    # search; the bases get their diversity from objective and per-base seed
+    # offsets, not from divergent depth/lr settings. n_estimators capped at 500
+    # because three boosters run sequentially per window — at 800 the gate
+    # could breach the 30 min wall on dense splits.
+    'xgb_rank_fusion': {
+        'max_depth':              [3, 4, 6],
+        'learning_rate':          (0.02, 0.08),
+        'n_estimators':           [200, 300, 500],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.3),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'pos_class_weight':       (1.5, 5.0),
+        'magnitude_scale':        (5.0, 25.0),
+        'base_weight':            (0.3, 1.0),
+        'huber_slope':            (0.02, 0.10),
+        'dro_strength':           (0.5, 2.0),
+        'pass1_estimators_frac':  (0.3, 0.7),
+        'weight_smoothing':       (0.05, 0.30),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

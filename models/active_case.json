@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_mcdropout_classifier",
+  "trainer": "xgb_rank_fusion",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from xgb_meta_label (14 sweep iters #619-#632 plateaued: best 5/7 #631 +18.6%, mean wp ~3.4, no monotone improvement) to the new MC-dropout trainer. Default conf_lambda=0.5 / drop_rate=0.20 was too aggressive \u2014 score compression dropped 5/7 windows to thr=0 fallback \u2014 but the mechanism IS proven: W2 (thr=0.6, n=24, WR=41.7%) and W3 (thr=0.5, n=24, WR=45.8%) cleanly cleared the gate with selective behavior. Train-mode sweep should explore lower conf_lambda (0.0\u20130.3) \u00d7 lower drop_rate (0.05\u20130.15) to lift mean predictions above the 0.30 floor while keeping enough std-spread to gate fragile rows \u2014 the goal HP combo should produce thr\u22650.3 selections in W4/W5/W6/W7.",
-  "claude_iter_id": 633,
-  "designated_at": "2026-05-11T03:12:07"
+  "rationale": "Pivot from xgb_mcdropout_classifier (8-iter train sweep #641-#648 plateaued at 0-3/7 with avg_ann -5% to -39%, no monotone improvement) to new xgb_rank_fusion. Default 3/7 (W3/W4/W6 pass cleanly with WR 41-55% and ann +15-36%) on first try with a novel diverse-objective + rank-quantile-geometric-mean fusion mechanism; W7 narrowly misses (WR 38.6%, 1.4pp short). The 16-dim HP space spans both shared tree-shape and per-base loss-specific knobs (pos_class_weight, magnitude_scale, huber_slope, dro_strength), so train mode has wide search surface to find a combo that lifts the WR floor in W1/W2/W5 (where the geometric mean is currently too aggressive \u2014 quarterly_dro alone would have passed these windows). Lowering pos_class_weight (less aggressive strict-win base) and raising weight_smoothing (gentler DRO reweighting) are the leading hypotheses for the sweep.",
+  "claude_iter_id": 649,
+  "designated_at": "2026-05-11T06:17:38"
 }

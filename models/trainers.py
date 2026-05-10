@@ -5295,6 +5295,235 @@ class XGBoostMCDropoutClassifierTrainer(XGBoostStrictWinClassifierTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Diverse-Objective Rank-Fusion Ensemble (xgb_rank_fusion)
+# --------------------------------------------------------------------- #
+# Motivation: post-gate-fix history (#200+) shows distinct trainers fail in
+# distinct walk-forward windows:
+#   - iter #589 xgb_quarterly_dro: 6/7 (avg_ann 26.2%) — fails only W7
+#     (2025-09..2026-02, regime shift).
+#   - iter #631 xgb_meta_label:    5/7 (avg_ann 18.6%) — fails W2/W4, passes W7.
+#   - iter #565 xgb_temporal_mixup:5/7 (avg_ann 17.7%) — fails different windows.
+# No single trainer has ever passed 7/7. The failure modes are window-specific
+# and trainer-specific — uncorrelated noise across objectives. That is the
+# textbook signature of an ensembling opportunity: if base failures are not
+# perfectly correlated, a consensus filter has a strictly lower joint-failure
+# probability than any individual base.
+#
+# Prior ensemble attempts and why this is different:
+#   - StackedRanker (16 iters, 0 pass): learns simplex weights on val via grid
+#     search → weights overfit the train-period regime; out-of-sample weights
+#     wrong. We avoid LEARNED weights entirely.
+#   - BaggedEVGatedRanker / BaggedXGBRegressor (10+45 iters, 0 pass): bagging
+#     with same base trainer + seed shuffle → low diversity, all bags share
+#     the same loss family's regime-edge blind spots.
+#
+# Design: three structurally-distinct XGBoost bases (different objectives,
+# different loss landscapes), each fit independently, predictions fused via
+# WITHIN-TEST-SET QUANTILE-RANK GEOMETRIC MEAN (no learned weights).
+#
+#   Base 1: Strict-win BCE classifier   — direct P(pnl>0)
+#   Base 2: Huber regressor on pnl       — continuous EV, different gradient
+#   Base 3: Quarterly DRO classifier     — per-quarter loss-reweighted (regime)
+#
+# Fusion: for each base i, convert raw score p_i to within-batch quantile rank
+# q_i ∈ (0, 1]. Combined score = (q1 * q2 * q3) ** (1/3). Geometric mean is
+# harsh on disagreement — if any one base ranks a row low, the combined rank
+# drops sharply. Equivalent in log-space to mean(log q_i), so any single
+# very-bad base ≈ kills the consensus. This implements an implicit "all-must-
+# agree" filter without any tunable mixing coefficients.
+#
+# Why geometric-mean of rank quantiles (not weighted avg of raw scores):
+#   1. Rank quantile is regime-invariant by construction — bounded [0, 1]
+#      with a uniform marginal, regardless of how the base model's raw score
+#      drifts across regimes. The StackedRanker over-fit failure came from
+#      weighting raw scores whose scales drift; quantile rank removes drift.
+#   2. Geometric mean encodes consensus harshly — arithmetic average lets a
+#      single confident base outvote two uncertain ones; geometric mean
+#      requires all bases to agree (any q→0 kills the product).
+#   3. No tunable mixing parameters → nothing to overfit on val. The bases
+#      themselves are tuned (HPs) but the FUSION is a fixed function.
+#
+# Expected behavior: combined score has the same per-day rank order as a
+# soft AND of the three bases' rankings → top-K-per-day picks are stocks
+# that ALL three bases independently rank highly. Should reduce false-positive
+# regime-edge picks (where one base over-calls but the others abstain) at
+# minor cost to true-positive rate (some W2/W3 wins where only quarterly_dro
+# called correctly won't survive the consensus). Net effect: trading TRADE-
+# COUNT-AT-WR-FLOOR for HIGHER WR — the exact tradeoff failing windows need.
+class XGBoostRankFusionTrainer(BaseTrainer):
+    name = 'xgb_rank_fusion'
+
+    def __init__(self,
+                 # Shared XGBoost knobs (applied to all three bases)
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 300,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 # Strict-win classifier-only knobs
+                 pos_class_weight: float = 3.0,
+                 magnitude_scale: float = 15.0,
+                 base_weight: float = 0.6,
+                 # Huber regressor-only knobs
+                 huber_slope: float = 0.05,
+                 # Quarterly DRO-only knobs
+                 dro_strength: float = 1.0,
+                 pass1_estimators_frac: float = 0.5,
+                 weight_smoothing: float = 0.1,
+                 # Common
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=int(max_depth),
+            learning_rate=float(learning_rate),
+            n_estimators=int(n_estimators),
+            subsample=float(subsample),
+            colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha),
+            reg_lambda=float(reg_lambda),
+            min_child_weight=float(min_child_weight),
+            gamma=float(gamma),
+            pos_class_weight=float(pos_class_weight),
+            magnitude_scale=float(magnitude_scale),
+            base_weight=float(base_weight),
+            huber_slope=float(huber_slope),
+            dro_strength=float(dro_strength),
+            pass1_estimators_frac=float(pass1_estimators_frac),
+            weight_smoothing=float(weight_smoothing),
+            early_stopping_rounds=int(early_stopping_rounds),
+            random_state=int(random_state),
+        )
+        self.classifier = None  # XGBoostStrictWinClassifierTrainer
+        self.regressor = None   # XGBoostHuberRegressorTrainer
+        self.dro = None         # XGBoostQuarterlyDROTrainer
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train/pnl_val for its three '
+                'sub-trainers (strict-win label, huber pnl target, DRO).')
+        if dates_train is None:
+            raise ValueError(
+                f'{self.name} requires dates_train for the DRO sub-trainer.')
+
+        p = self._params
+        self._n_features = int(np.asarray(X_train).shape[1])
+
+        # Distinct sub-seeds prevent the three bases from deterministically
+        # collapsing onto identical tree structures — adds genuine sample
+        # diversity on top of objective diversity.
+        rs = int(p['random_state'])
+
+        self.classifier = XGBoostStrictWinClassifierTrainer(
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            n_estimators=p['n_estimators'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            magnitude_scale=p['magnitude_scale'],
+            base_weight=p['base_weight'],
+            pos_class_weight=p['pos_class_weight'],
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=rs,
+        )
+        self.classifier.fit(
+            X_train, y_train, X_val, y_val, verbose=False,
+            pnl_train=pnl_train, pnl_val=pnl_val,
+            dates_train=dates_train, dates_val=dates_val,
+        )
+
+        self.regressor = XGBoostHuberRegressorTrainer(
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            n_estimators=p['n_estimators'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            huber_slope=p['huber_slope'],
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=rs + 7,
+        )
+        self.regressor.fit(
+            X_train, y_train, X_val, y_val, verbose=False,
+            pnl_train=pnl_train, pnl_val=pnl_val,
+            dates_train=dates_train, dates_val=dates_val,
+        )
+
+        self.dro = XGBoostQuarterlyDROTrainer(
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            n_estimators=p['n_estimators'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            dro_strength=p['dro_strength'],
+            pass1_estimators_frac=p['pass1_estimators_frac'],
+            weight_smoothing=p['weight_smoothing'],
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=rs + 13,
+        )
+        self.dro.fit(
+            X_train, y_train, X_val, y_val, verbose=False,
+            pnl_train=pnl_train, pnl_val=pnl_val,
+            dates_train=dates_train, dates_val=dates_val,
+        )
+        return self
+
+    @staticmethod
+    def _quantile_rank(x: np.ndarray) -> np.ndarray:
+        """Within-batch quantile rank ∈ (0, 1]. Average-rank for ties."""
+        x = np.asarray(x, dtype=np.float64)
+        n = len(x)
+        if n == 0:
+            return x
+        # argsort-of-argsort gives 0-indexed ranks (ties broken by order, but
+        # consistent across runs). Add 1 so output ∈ [1/n, 1] — strictly > 0
+        # so the geometric mean's log is finite.
+        ranks = np.argsort(np.argsort(x, kind='stable'), kind='stable')
+        return (ranks + 1).astype(np.float64) / n
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.classifier is None or self.regressor is None or self.dro is None:
+            raise RuntimeError('Model not fit')
+        p1 = self.classifier.predict_proba(X)
+        p2 = self.regressor.predict_proba(X)
+        p3 = self.dro.predict_proba(X)
+        q1 = self._quantile_rank(p1)
+        q2 = self._quantile_rank(p2)
+        q3 = self._quantile_rank(p3)
+        # Geometric mean in log-space (numerically stable for n large).
+        log_geo = (np.log(q1) + np.log(q2) + np.log(q3)) / 3.0
+        return np.exp(log_geo)
+
+    @property
+    def best_iteration(self):
+        if self.classifier is None:
+            return None
+        return self.classifier.best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -5324,6 +5553,7 @@ TRAINERS = {
     'xgb_adv_val': XGBoostAdversarialValidationTrainer,
     'xgb_meta_label': XGBoostMetaLabelingTrainer,
     'xgb_mcdropout_classifier': XGBoostMCDropoutClassifierTrainer,
+    'xgb_rank_fusion': XGBoostRankFusionTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 
