@@ -601,6 +601,40 @@ SEARCH_SPACES: dict[str, dict] = {
         'adv_max_depth':          [3, 4, 6],
         'weight_clip':            (3.0, 20.0),
     },
+    # Meta-labeling (López de Prado, AFML Ch.3). Two-stage XGBoost: stage 1
+    # predicts P(pnl > 0); stage 2 predicts P(pnl > 0 | features, stage1_pred)
+    # using stage-1's OOF prediction as an additional input feature.
+    # HP space follows the prior xgb_adv_val structure (XGB-tree family) but
+    # with a SEPARATE space for stage 1 vs stage 2:
+    #   - stage 2 typically wants tighter regularization (smaller depth, higher
+    #     min_child_weight) — it's filtering on a smaller, late-half train pool
+    #     and is more vulnerable to overfit. Defaults reflect this.
+    #   - stage1_train_frac ∈ [0.4, 0.7] — fraction of unique train dates given
+    #     to stage 1's first pass. <0.4 starves stage 1 of signal; >0.7 starves
+    #     stage 2 of training data. Sweep covers the natural range around 0.5.
+    #   - learning rates and depths drawn independently per stage so the sweep
+    #     can find e.g. (deep stage 1 + shallow stage 2) or vice versa.
+    'xgb_meta_label': {
+        'stage1_max_depth':         [3, 4, 6, 8],
+        'stage1_learning_rate':     (0.01, 0.10),
+        'stage1_n_estimators':      [200, 400, 800],
+        'stage1_min_child_weight':  [1, 5, 10, 20],
+        'stage1_gamma':             (0.0, 0.5),
+        'stage1_subsample':         (0.6, 1.0),
+        'stage1_colsample_bytree':  (0.5, 0.9),
+        'stage1_reg_alpha':         (0.0, 0.5),
+        'stage1_reg_lambda':        (0.5, 2.0),
+        'stage2_max_depth':         [2, 3, 4, 6],
+        'stage2_learning_rate':     (0.01, 0.10),
+        'stage2_n_estimators':      [200, 400, 800],
+        'stage2_min_child_weight':  [5, 10, 20, 40],
+        'stage2_gamma':             (0.0, 0.5),
+        'stage2_subsample':         (0.6, 1.0),
+        'stage2_colsample_bytree':  (0.5, 0.9),
+        'stage2_reg_alpha':         (0.0, 0.5),
+        'stage2_reg_lambda':        (0.5, 2.0),
+        'stage1_train_frac':        (0.40, 0.70),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

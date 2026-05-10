@@ -4822,6 +4822,371 @@ class XGBoostAdversarialValidationTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Meta-labeling — López de Prado, Advances in Financial ML, Ch. 3.
+#
+# Every prior loss-engineering / reweighting trainer (#430-#617) is a SINGLE-
+# stage classifier predicting P(pnl > 0). HP sweeps of xgb_adv_val (#610-617)
+# top out at 5/7 windows, avg ann +5%, with WR stuck at 36-42%. Threshold-sweep
+# diagnostics show the model has reasonable RANK ordering (high thresholds
+# produce small, high-WR baskets) but POOR PRECISION at the n_trades >= 20
+# operating point — exactly the failure pattern meta-labeling is designed for.
+#
+# Meta-labeling separates SIDE from SIZE:
+#   - Stage 1 (side):  P(pnl > 0 | features)        — same target as today
+#   - Stage 2 (size):  P(pnl > 0 | features, stage1_pred)  — confidence filter
+# Stage 2 takes stage 1's output as an input feature and re-learns "given the
+# side model says positive, is it actually a winner?" This concentrates trades
+# on the high-confidence subset and lifts WR at the cost of trade count — the
+# exact direction we need (W4-W7 cluster at 36-39% WR, just below the 40%
+# gate, and even default thresholds yield 24-35 trades on those windows).
+#
+# Distinct from every existing trainer:
+#   - xgb_adv_val: inner classifier predicts P(test-like), outputs WEIGHTS for
+#     stage 2. Meta-labeling: inner classifier predicts P(pnl>0), outputs a
+#     FEATURE for stage 2. Different epistemic axis (distribution vs confidence).
+#   - xgb_jtt: stage 2 reweights pass-1 errors but predicts the same label
+#     with the same input features. Meta-labeling: stage 2 has stage 1's
+#     prediction as a NEW input feature, enabling it to learn calibration.
+#   - ev_gated_ranker: regressor → ranker pipeline; both predict the same
+#     pnl-related quantity. Meta-labeling: stage 2 explicitly targets
+#     "filter the side model" not "rank within side-model picks".
+#   - stacked_ranker: averages predictions across base learners. Meta-labeling
+#     is hierarchical (one model's output feeds the next), not parallel.
+#
+# Implementation:
+#   1. Time-split train into early/late halves by unique date.
+#   2. Train stage_1_first on EARLY half; predict on LATE half + X_val to get
+#      OOF stage-1 scores (no leakage — late-half rows never touched stage 1).
+#   3. Train stage_2 on LATE half with [X | stage1_oof_pred] as input,
+#      label = (pnl > 0). Early-stop on X_val with stage1's OOF preds on X_val.
+#   4. Refit stage_1_final on ALL of train (uses full data for inference).
+#   5. predict_proba(X_test): stage_1_final.predict(X_test) → stack with X_test
+#      → stage_2.predict — final score is stage 2's probability.
+#
+# Defaults chosen conservatively:
+#   - stage1_train_frac=0.5: half-and-half. Smaller fractions give stage 1 less
+#     to learn from; larger fractions starve stage 2's training set.
+#   - stage 2 deeper trees and lower min_child_weight than typical for stage 1
+#     would cause overfit on the smaller late-half train pool. Defaults keep
+#     stage 2 SHALLOWER (max_depth 3 vs 4) and HIGHER min_child_weight (10 vs 5).
+#   - Strict-win label (pnl > 0), matching xgb_strict_win / xgb_jtt /
+#     xgb_quarterly_dro / xgb_focal_loss / xgb_adv_val.
+class XGBoostMetaLabelingTrainer(BaseTrainer):
+    """Two-stage XGBoost meta-labeling: side (stage 1) + size (stage 2)."""
+    name = 'xgb_meta_label'
+
+    def __init__(self,
+                 # Stage 1 (side classifier) hyperparameters
+                 stage1_max_depth: int = 4,
+                 stage1_learning_rate: float = 0.05,
+                 stage1_n_estimators: int = 400,
+                 stage1_min_child_weight: float = 5.0,
+                 stage1_subsample: float = 0.8,
+                 stage1_colsample_bytree: float = 0.7,
+                 stage1_reg_alpha: float = 0.1,
+                 stage1_reg_lambda: float = 1.0,
+                 stage1_gamma: float = 0.1,
+                 # Stage 2 (size / meta classifier) hyperparameters — by
+                 # default tighter regularization than stage 1.
+                 stage2_max_depth: int = 3,
+                 stage2_learning_rate: float = 0.05,
+                 stage2_n_estimators: int = 400,
+                 stage2_min_child_weight: float = 10.0,
+                 stage2_subsample: float = 0.8,
+                 stage2_colsample_bytree: float = 0.7,
+                 stage2_reg_alpha: float = 0.1,
+                 stage2_reg_lambda: float = 1.0,
+                 stage2_gamma: float = 0.1,
+                 # Time-based train split for stage-1 OOF.
+                 stage1_train_frac: float = 0.5,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            stage1_max_depth=int(stage1_max_depth),
+            stage1_learning_rate=float(stage1_learning_rate),
+            stage1_n_estimators=int(stage1_n_estimators),
+            stage1_min_child_weight=float(stage1_min_child_weight),
+            stage1_subsample=float(stage1_subsample),
+            stage1_colsample_bytree=float(stage1_colsample_bytree),
+            stage1_reg_alpha=float(stage1_reg_alpha),
+            stage1_reg_lambda=float(stage1_reg_lambda),
+            stage1_gamma=float(stage1_gamma),
+            stage2_max_depth=int(stage2_max_depth),
+            stage2_learning_rate=float(stage2_learning_rate),
+            stage2_n_estimators=int(stage2_n_estimators),
+            stage2_min_child_weight=float(stage2_min_child_weight),
+            stage2_subsample=float(stage2_subsample),
+            stage2_colsample_bytree=float(stage2_colsample_bytree),
+            stage2_reg_alpha=float(stage2_reg_alpha),
+            stage2_reg_lambda=float(stage2_reg_lambda),
+            stage2_gamma=float(stage2_gamma),
+            stage1_train_frac=float(stage1_train_frac),
+            early_stopping_rounds=int(early_stopping_rounds),
+            random_state=int(random_state),
+        )
+        self.stage1_final = None
+        self.stage2 = None
+        self._best_iteration = None
+        self._n_features = None
+        self._stage1_oof_auc = None
+        self._stage2_val_auc = None
+        self._stage1_first_iter = None
+
+    def _xgb_params(self, prefix: str) -> dict:
+        p = self._params
+        return {
+            'tree_method': 'hist',
+            'objective': 'binary:logistic',
+            'max_depth': int(p[f'{prefix}_max_depth']),
+            'learning_rate': float(p[f'{prefix}_learning_rate']),
+            'subsample': float(p[f'{prefix}_subsample']),
+            'colsample_bytree': float(p[f'{prefix}_colsample_bytree']),
+            'min_child_weight': float(p[f'{prefix}_min_child_weight']),
+            'gamma': float(p[f'{prefix}_gamma']),
+            'reg_alpha': float(p[f'{prefix}_reg_alpha']),
+            'reg_lambda': float(p[f'{prefix}_reg_lambda']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+            'seed': int(p['random_state']) + (0 if prefix == 'stage1' else 11),
+        }
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val to derive the '
+                'strict-win label.')
+        if dates_train is None:
+            raise ValueError(
+                f'{self.name} requires dates_train for the time-based '
+                'OOF split.')
+
+        # Strict-win label (matches xgb_jtt / xgb_quarterly_dro / xgb_adv_val)
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+        p = self._params
+
+        # ---- Time split of train into early / late halves --------------------
+        dates_arr = np.asarray(dates_train)
+        unique_dates = np.sort(np.unique(dates_arr))
+        cutoff_idx = int(float(p['stage1_train_frac']) * len(unique_dates))
+        cutoff_idx = max(1, min(cutoff_idx, len(unique_dates) - 1))
+        late_cutoff = unique_dates[cutoff_idx]
+        early_mask = dates_arr < late_cutoff
+        late_mask = ~early_mask
+
+        # Guard: degenerate split (rare, e.g. < 4 unique dates). Fall back to
+        # random 50/50 to keep the trainer evaluable rather than aborting.
+        if early_mask.sum() < 50 or late_mask.sum() < 50:
+            rng = np.random.RandomState(int(p['random_state']))
+            shuffle = rng.permutation(len(Xt))
+            half = len(Xt) // 2
+            early_idx = shuffle[:half]
+            late_idx = shuffle[half:]
+            early_mask = np.zeros(len(Xt), dtype=bool)
+            late_mask = np.zeros(len(Xt), dtype=bool)
+            early_mask[early_idx] = True
+            late_mask[late_idx] = True
+
+        # Need both classes present in the early half for stage 1 to fit
+        if len(set(y_tr[early_mask].tolist())) < 2 or \
+           len(set(y_tr[late_mask].tolist())) < 2:
+            raise ValueError(
+                f'{self.name}: degenerate class distribution after time-split — '
+                'early or late half is single-class.')
+
+        # ---- STAGE 1 (first pass): train on early half -----------------------
+        stage1_first_dtrain = xgb.DMatrix(
+            Xt[early_mask],
+            label=y_tr[early_mask].astype(np.float32),
+        )
+        # Use the late half as stage-1's val set for early stopping. This keeps
+        # stage-1's OOF predictions on the late half generated by a model
+        # tuned to that distribution boundary (best-iteration on the boundary
+        # we'll predict on next).
+        stage1_first_dval = xgb.DMatrix(
+            Xt[late_mask],
+            label=y_tr[late_mask].astype(np.float32),
+        )
+        stage1_first_booster = xgb.train(
+            params=self._xgb_params('stage1'),
+            dtrain=stage1_first_dtrain,
+            num_boost_round=int(p['stage1_n_estimators']),
+            evals=[(stage1_first_dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._stage1_first_iter = int(
+            getattr(stage1_first_booster, 'best_iteration', 0))
+
+        # OOF stage-1 predictions on the late half (these rows were never seen
+        # during stage 1 first-pass training).
+        stage1_oof_late = stage1_first_booster.predict(stage1_first_dval)
+        # Stage-1 prediction on val (also OOF — val rows aren't in the early
+        # half by construction; train_mask precedes val_mask in the gate).
+        stage1_pred_val = stage1_first_booster.predict(
+            xgb.DMatrix(Xv))
+
+        try:
+            from sklearn.metrics import roc_auc_score
+            self._stage1_oof_auc = float(
+                roc_auc_score(y_tr[late_mask], stage1_oof_late))
+        except Exception:
+            self._stage1_oof_auc = None
+
+        # ---- STAGE 2: meta-classifier over [features | stage1_oof_pred] ------
+        Xt_late = Xt[late_mask]
+        # Stack stage-1 prediction as an additional column.
+        X_stage2_tr = np.column_stack([
+            Xt_late,
+            stage1_oof_late.astype(np.float32),
+        ]).astype(np.float32)
+        X_stage2_val = np.column_stack([
+            Xv,
+            stage1_pred_val.astype(np.float32),
+        ]).astype(np.float32)
+
+        stage2_dtrain = xgb.DMatrix(
+            X_stage2_tr,
+            label=y_tr[late_mask].astype(np.float32),
+        )
+        stage2_dval = xgb.DMatrix(
+            X_stage2_val,
+            label=y_va.astype(np.float32),
+        )
+        self.stage2 = xgb.train(
+            params=self._xgb_params('stage2'),
+            dtrain=stage2_dtrain,
+            num_boost_round=int(p['stage2_n_estimators']),
+            evals=[(stage2_dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.stage2, 'best_iteration', 0))
+        try:
+            from sklearn.metrics import roc_auc_score
+            stage2_val_pred = self.stage2.predict(stage2_dval)
+            self._stage2_val_auc = float(roc_auc_score(y_va, stage2_val_pred))
+        except Exception:
+            self._stage2_val_auc = None
+
+        # ---- STAGE 1 (final): refit on full train ----------------------------
+        # At inference, the stage-1 input to stage 2 should come from a model
+        # trained on as much data as possible. The early-half model was used
+        # only to manufacture OOF predictions during training. There is a
+        # mild distribution shift between (early-only-trained) stage-1 preds
+        # used at stage-2 train time and (full-train) stage-1 preds at
+        # inference — empirically this is small relative to the gain from
+        # using all of train at inference, and matches the canonical LdP
+        # implementation.
+        stage1_final_dtrain = xgb.DMatrix(
+            Xt,
+            label=y_tr.astype(np.float32),
+        )
+        stage1_final_dval = xgb.DMatrix(
+            Xv,
+            label=y_va.astype(np.float32),
+        )
+        self.stage1_final = xgb.train(
+            params=self._xgb_params('stage1'),
+            dtrain=stage1_final_dtrain,
+            num_boost_round=int(p['stage1_n_estimators']),
+            evals=[(stage1_final_dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.stage1_final is None or self.stage2 is None:
+            raise RuntimeError('Model not fit')
+        X_arr = np.asarray(X, dtype=np.float32)
+        stage1_pred = self.stage1_final.predict(xgb.DMatrix(X_arr))
+        X_meta = np.column_stack([
+            X_arr,
+            stage1_pred.astype(np.float32),
+        ]).astype(np.float32)
+        return self.stage2.predict(xgb.DMatrix(X_meta))
+
+    def feature_importance(self):
+        # Return importance over the ORIGINAL feature set (drop the stage-1
+        # meta column, which is at index n_features in stage 2's input).
+        if self.stage2 is None or self._n_features is None:
+            return None
+        score = self.stage2.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                idx = int(k[1:])
+                if idx < self._n_features:
+                    out[idx] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        stage1_path = os.path.join(output_dir, 'stage1.json')
+        stage2_path = os.path.join(output_dir, 'stage2.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.stage1_final.save_model(stage1_path)
+        self.stage2.save_model(stage2_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+            'stage1_oof_auc': self._stage1_oof_auc,
+            'stage2_val_auc': self._stage2_val_auc,
+            'stage1_first_iter': self._stage1_first_iter,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'stage1': stage1_path, 'stage2': stage2_path,
+                'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        stage1_path = os.path.join(output_dir, 'stage1.json')
+        stage2_path = os.path.join(output_dir, 'stage2.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.stage1_final = xgb.Booster()
+        inst.stage1_final.load_model(stage1_path)
+        inst.stage2 = xgb.Booster()
+        inst.stage2.load_model(stage2_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        inst._stage1_oof_auc = meta.get('stage1_oof_auc')
+        inst._stage2_val_auc = meta.get('stage2_val_auc')
+        inst._stage1_first_iter = meta.get('stage1_first_iter')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -4849,6 +5214,7 @@ TRAINERS = {
     'xgb_quarterly_dro': XGBoostQuarterlyDROTrainer,
     'xgb_topk_classifier': XGBoostTopKClassifierTrainer,
     'xgb_adv_val': XGBoostAdversarialValidationTrainer,
+    'xgb_meta_label': XGBoostMetaLabelingTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

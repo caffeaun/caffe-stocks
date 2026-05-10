@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_adv_val",
+  "trainer": "xgb_meta_label",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "xgb_adv_val structurally novel (first feature-distribution-aware reweighting trainer) and default-HP avg_ann +24.4% materially beats every prior 3/7 baseline (#570 quarterly_dro +3.5%, #539 mixup +3.3%); W2 hit unprecedented +162.6% ann. Failure modes are HP-tunable (W1 n=17 at thr=0.55 close to passing, W4 n=15 at thr=0.50 with WR=40%) \u2014 score distribution too peaky at default. Sweep should explore adv_alpha (never sampled, range [0,3]) \u00d7 adv_test_frac \u00d7 lower learning_rate to spread the score distribution into the threshold-sweep band.",
-  "claude_iter_id": 602,
-  "designated_at": "2026-05-10T21:13:54"
+  "rationale": "xgb_adv_val sweep #610-617 has plateaued at 5/7 (#610 best). xgb_meta_label is structurally novel (first hierarchical-classifier trainer where stage-1 score is an INPUT FEATURE to stage 2) and shows the right kind of WR uplift at default HP \u2014 W1 thr=0.40 hit WR=58% n=19 ann=+15%, W6 thr=0 hit WR=47% dd=2.3%. Both miss the n>=20 cliff by 1-3 trades. Sweep target: lower stage1/stage2 learning_rate \u00d7 more n_estimators \u00d7 wider stage1_train_frac to spread the score distribution and pull these high-WR threshold bands above n=20.",
+  "claude_iter_id": 618,
+  "designated_at": "2026-05-11T00:12:49"
 }
