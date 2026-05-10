@@ -4049,6 +4049,263 @@ class XGBoostJTTTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Quarterly Group DRO XGBoost Classifier
+# --------------------------------------------------------------------- #
+# Motivation: across the last ~150 iterations every loss-side knob
+# (focal_loss, group_balanced_focal, magnitude, strict_win, temporal_mixup,
+# JTT) saturates at 3-5/7 windows. Per-window pass-rates over the last 50
+# xgb_temporal_mixup train-mode iters: W1 23%, W3 40%, W4 30%, W6 10%.
+# W1/W3/W4 fail with WR ~33% (low-quality picks despite enough trades);
+# W6 fails on n_trades=13<20 with WR=60% (rotation-limited high-conviction
+# regime). Existing reweighting axes:
+#   - focal: per-row CONFIDENCE (down-weights easy)
+#   - group_balanced_focal: per-quarter ROW-COUNT (inverse-frequency)
+#   - magnitude: per-row |PNL| (up-weights tail trades)
+#   - JTT: per-row MISTAKES from an ERM identifier (implicit groups)
+# What's missing: per-quarter LOSS-based reweighting. JTT looks at row-level
+# mistakes; group_balanced_focal weights by group SIZE. Quarterly-DRO weights
+# rows by their group's RISK (logloss after a pass-1 identifier), so a
+# quarter where many rows are individually "correct" but the model's
+# probability calibration is poor still gets upweighted. This is the natural
+# group-level analogue of JTT.
+#
+# Algorithm:
+#   1. Pass 1: train ERM XGBoost on uniform-weight strict-win labels.
+#   2. Compute per-quarter mean BCE loss on the training set using pass-1
+#      probabilities (clipped to (eps, 1-eps) to avoid log(0)).
+#   3. Reweight: w_q = ((R_q + smoothing*R_mean) / (R_mean + smoothing*R_mean))
+#                       ^ dro_strength
+#      Smoothing prevents one outlier-low-loss quarter from collapsing weights.
+#      dro_strength controls aggressiveness: 0 = uniform (ERM), 1 = linear in
+#      relative loss, 2+ = quadratic (worst quarter dominates).
+#   4. Renormalize per-row weights to mean=1 (preserves XGBoost effective
+#      learning-rate scale).
+#   5. Pass 2: train final XGBoost with these per-row weights.
+#
+# Distinct from JTT: JTT identifies hard ROWS; this trainer identifies hard
+# GROUPS. If a quarter's logloss is high uniformly across its rows (regime
+# the model fits poorly overall), JTT would only upweight individual
+# misclassified rows in that quarter; quarterly-DRO upweights ALL rows of
+# that quarter, including the ones the identifier got right. The latter
+# is appropriate when the failure mode is regime-level (the model's whole
+# decision boundary is wrong for that quarter), not row-level (a few hard
+# samples).
+class XGBoostQuarterlyDROTrainer(BaseTrainer):
+    """Group DRO with explicit calendar-quarter groups, weighted by per-quarter
+    pass-1 logloss. Two-pass: ERM identifier → quarter-loss reweighted retrain.
+    """
+    name = 'xgb_quarterly_dro'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 dro_strength: float = 1.0,
+                 pass1_estimators_frac: float = 0.5,
+                 weight_smoothing: float = 0.1,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            dro_strength=float(dro_strength),
+            pass1_estimators_frac=float(pass1_estimators_frac),
+            weight_smoothing=float(weight_smoothing),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.booster = None
+        self._best_iteration = None
+        self._n_features = None
+        self._quarter_logloss = None  # diagnostic
+        self._quarter_weights = None  # diagnostic
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade '
+                'realized P&L) to derive the strict-win label.')
+        if dates_train is None:
+            raise ValueError(
+                f'{self.name} requires dates_train for per-quarter group DRO.')
+
+        # Strict-win label — same alignment with the gate's WR metric as
+        # xgb_focal_loss / xgb_jtt / xgb_temporal_mixup.
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+
+        n_total = int(p['n_estimators'])
+        n_pass1 = max(50, int(n_total * float(p['pass1_estimators_frac'])))
+
+        common = {
+            'tree_method': 'hist',
+            'objective': 'binary:logistic',
+            'max_depth': int(p['max_depth']),
+            'learning_rate': float(p['learning_rate']),
+            'subsample': float(p['subsample']),
+            'colsample_bytree': float(p['colsample_bytree']),
+            'reg_alpha': float(p['reg_alpha']),
+            'reg_lambda': float(p['reg_lambda']),
+            'min_child_weight': float(p['min_child_weight']),
+            'gamma': float(p['gamma']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+        }
+
+        # PASS 1 — ERM identifier
+        dtrain_uniform = xgb.DMatrix(Xt, label=y_tr.astype(np.float32))
+        dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+        params_p1 = {**common, 'seed': int(p['random_state'])}
+        identifier = xgb.train(
+            params=params_p1,
+            dtrain=dtrain_uniform,
+            num_boost_round=n_pass1,
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+
+        # Per-row BCE loss using pass-1 probabilities
+        proba_p1 = identifier.predict(dtrain_uniform)
+        proba_p1 = np.clip(proba_p1, 1e-7, 1.0 - 1e-7)
+        bce_per_row = -(y_tr * np.log(proba_p1)
+                        + (1 - y_tr) * np.log(1.0 - proba_p1))
+
+        # Per-quarter mean logloss
+        quarters = np.array([_quarter_group(d) for d in dates_train])
+        uniq_q = np.unique(quarters)
+        q_logloss: dict[str, float] = {}
+        for q in uniq_q:
+            mask = (quarters == q)
+            q_logloss[q] = float(bce_per_row[mask].mean())
+        self._quarter_logloss = q_logloss
+
+        # Smoothed relative-loss weights, then raised to dro_strength
+        loss_vals = np.array(list(q_logloss.values()), dtype=np.float64)
+        mean_R = float(loss_vals.mean()) if len(loss_vals) else 1.0
+        smoothing = float(p['weight_smoothing']) * mean_R
+        eta = float(p['dro_strength'])
+        q_weights: dict[str, float] = {}
+        for q, R in q_logloss.items():
+            q_weights[q] = float(
+                ((R + smoothing) / (mean_R + smoothing)) ** eta
+            )
+        self._quarter_weights = q_weights
+
+        weights = np.array([q_weights[q] for q in quarters], dtype=np.float64)
+        # Renormalize to mean=1 so XGBoost's effective learning rate matches
+        # the un-weighted pass (gradient magnitudes preserved in expectation).
+        if weights.sum() > 0:
+            weights = weights * (len(weights) / weights.sum())
+
+        # PASS 2 — final model with quarter-loss-upweighted DMatrix.
+        # Distinct seed prevents pass 2 from deterministically recovering
+        # pass 1's tree structure and undoing the DRO mechanism.
+        dtrain_w = xgb.DMatrix(
+            Xt,
+            label=y_tr.astype(np.float32),
+            weight=weights.astype(np.float32),
+        )
+        params_p2 = {**common, 'seed': int(p['random_state']) + 1}
+        self.booster = xgb.train(
+            params=params_p2,
+            dtrain=dtrain_w,
+            num_boost_round=n_total,
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.booster, 'best_iteration', 0))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.booster is None:
+            raise RuntimeError('Model not fit')
+        dmat = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        return self.booster.predict(dmat)
+
+    def feature_importance(self):
+        if self.booster is None or self._n_features is None:
+            return None
+        score = self.booster.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                out[int(k[1:])] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.booster.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+            'quarter_logloss': self._quarter_logloss,
+            'quarter_weights': self._quarter_weights,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.booster = xgb.Booster()
+        inst.booster.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        inst._quarter_logloss = meta.get('quarter_logloss')
+        inst._quarter_weights = meta.get('quarter_weights')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -4073,6 +4330,7 @@ TRAINERS = {
     'xgb_group_balanced_focal': XGBoostGroupBalancedFocalLossTrainer,
     'xgb_temporal_mixup': XGBoostTemporalMixupTrainer,
     'xgb_jtt': XGBoostJTTTrainer,
+    'xgb_quarterly_dro': XGBoostQuarterlyDROTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 

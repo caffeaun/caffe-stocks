@@ -505,6 +505,40 @@ SEARCH_SPACES: dict[str, dict] = {
         'lambda_up':              (10.0, 200.0),
         'pass1_estimators_frac':  (0.3, 0.7),
     },
+    # Quarterly Group DRO: per-calendar-quarter logloss-based reweighting after
+    # a pass-1 ERM identifier. The natural group-level analogue of JTT (which
+    # weights ROWS by mistakes); the loss-driven analogue of group_balanced_focal
+    # (which weights GROUPS by inverse-frequency). Same XGB tree-family HP space
+    # as xgb_jtt / xgb_focal_loss (HP intuitions carry over) plus three knobs:
+    #   dro_strength ∈ [0.0, 3.0] — exponent on relative quarter loss. 0 = ERM
+    #     (uniform weights, falls back to plain XGBoost classifier); 1 = linear
+    #     (worst-loss quarter ~2x weight if its loss is 2x mean); 2 = quadratic
+    #     (worst quarter dominates); 3 = aggressive (mostly fits the lossy
+    #     quarter). The sweep should find where regime-rebalance gain peaks
+    #     before the lossy quarter starves the rest.
+    #   pass1_estimators_frac ∈ [0.3, 0.7] — fraction of n_estimators used to
+    #     train the identifier. Same rationale as xgb_jtt: <0.3 risks an
+    #     under-trained identifier whose per-quarter logloss is noise; >0.7
+    #     risks an over-trained identifier with logloss → 0 uniformly across
+    #     quarters (DRO degrades to ERM).
+    #   weight_smoothing ∈ [0.0, 0.5] — additive smoothing on the loss ratio,
+    #     fraction of mean_R. 0 = no smoothing (pure relative-loss weighting,
+    #     can collapse to zero on outlier-low-loss quarters); 0.5 = strong
+    #     smoothing (dampens DRO toward uniform).
+    'xgb_quarterly_dro': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'dro_strength':           (0.0, 3.0),
+        'pass1_estimators_frac':  (0.3, 0.7),
+        'weight_smoothing':       (0.0, 0.5),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
