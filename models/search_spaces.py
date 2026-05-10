@@ -432,6 +432,42 @@ SEARCH_SPACES: dict[str, dict] = {
         'focal_gamma':            (0.5, 4.0),
         'group_balance_strength': (0.4, 1.0),
     },
+    # Temporal-Mixup XGB classifier: synthetic train rows linearly interpolate
+    # features+labels between two real samples drawn from temporally-distant
+    # quarters. Trained with reg:logistic on real ∪ synthetic. Same XGB
+    # tree-family HP space as xgb_focal_loss / xgb_group_balanced_focal (HP
+    # intuitions carry over) plus three Mixup-specific knobs:
+    #   mixup_alpha ∈ [0.1, 1.0] — Beta(α,α) shape parameter for the lambda
+    #     mix coefficient. α<0.5 → U-shaped lambda (most synth rows are 90/10
+    #     mixes, gentle augmentation); α=1.0 → uniform lambda (heavier
+    #     blending). After the asymmetric max(λ, 1−λ) projection we apply,
+    #     effective λ ∈ [0.5, 1.0]. The sweep should find where the
+    #     regularisation gain peaks before label noise dominates.
+    #   mixup_ratio ∈ [0.5, 2.0] — number of synthetic rows per real row.
+    #     0.5 = mild augmentation (1.5× train data); 2.0 = aggressive
+    #     (3× train data, ~10s extra fit time per window — well inside
+    #     30 min budget). Above 2.0 the synthetic rows start dominating
+    #     gradient and the model fits the interpolation manifold instead
+    #     of the real distribution.
+    #   mixup_min_quarters ∈ {0, 1, 2, 3} — minimum quarter-distance for the
+    #     partner. 0 = vanilla Mixup (random partner anywhere); 1 = different
+    #     quarter (the temporal-bridging hypothesis); 2-3 = more aggressive
+    #     regime spanning, but on 6-month train windows often falls back to
+    #     "any other quarter" because the constraint cannot be satisfied.
+    'xgb_temporal_mixup': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'mixup_alpha':            (0.1, 1.0),
+        'mixup_ratio':            (0.5, 2.0),
+        'mixup_min_quarters':     [0, 1, 2, 3],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

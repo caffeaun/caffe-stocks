@@ -3541,6 +3541,270 @@ class XGBoostGroupBalancedFocalLossTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Temporal Mixup XGBoost Classifier
+# --------------------------------------------------------------------- #
+# Motivation: 5 distinct trainer families saturate at 4/7 windows across the
+# last ~150 iterations (xgb_focal_loss #470-#489 best 4/7; xgb_strict_win
+# #446-#461 best 4/7; xgb_magnitude_classifier #430-#445 best 3/7 ann=+95%;
+# xgb_group_balanced_focal #495-#538 best 4/7; bagged_ev_gated_ranker best
+# 5/7 only on the pre-fix annualization bug). The failing windows cluster on
+# regime-shift periods (W2 2024-Q1 chop, W5 2025-Q1 selloff, W7 2025Q4-2026Q1)
+# with WR<40%. Each tried loss-function tweak (focal, group balance, magnitude
+# weighting, class weighting) reweights *existing* training samples but never
+# expands the model's implicit knowledge beyond the empirical distribution.
+#
+# Hypothesis: regime-specific overfitting is the structural ceiling. The
+# learned discriminant memorises bull-quarter-specific patterns and projects
+# poorly onto chop-quarter test data. Mixup augmentation (Zhang et al. 2018,
+# C-Mixup 2022, and recent 2024 tabular extensions) generates synthetic
+# training samples that linearly interpolate features+labels between two real
+# samples, explicitly creating training points OUTSIDE the empirical
+# distribution. When the partner is drawn from a temporally-distant quarter,
+# the synthetic samples bridge regime boundaries — forcing the model to learn
+# decision boundaries that are smooth across regimes rather than memorising
+# the dominant-quarter pattern.
+#
+# This is structurally distinct from every prior knob:
+#   - focal / strict-win / magnitude: per-row weighting on real samples only
+#   - group_balanced_focal: per-quarter weighting on real samples only
+#   - bagged_*: bootstrap diversity, but bags still draw from real samples
+#   - SMOTE-like minority oversampling: random partners, no regime bridging
+# Mixup is the only mechanism that creates training points outside the
+# empirical distribution — which is what regime-shift generalisation
+# fundamentally requires. Soft labels (in [0,1]) require reg:logistic
+# objective rather than focal loss; this is the trade-off — focal loss
+# operates on hard targets only, so the two innovations are not stackable
+# in the same trainer without rederiving the focal gradient.
+def _temporal_mixup_partners(base_idx: np.ndarray, dates_arr: np.ndarray,
+                              min_quarters_apart: int,
+                              rng: 'np.random.Generator') -> np.ndarray:
+    """For each entry in base_idx, return a partner index drawn from a sample
+    in a quarter at least ``min_quarters_apart`` away. Falls back to any-other
+    when no distant quarter exists in the training data.
+    """
+    quarters = np.array([_quarter_group(d) for d in dates_arr])
+
+    def _q_to_int(q: str) -> int:
+        yr, qq = q.split('Q')
+        return int(yr) * 4 + int(qq)
+
+    q_int = np.array([_q_to_int(q) for q in quarters])
+    n = len(dates_arr)
+
+    # Per-quarter "far pool" cache so we don't recompute the mask per row.
+    far_pool: dict[int, np.ndarray] = {}
+    for q in np.unique(q_int):
+        far_idx = np.where(np.abs(q_int - q) >= max(0, min_quarters_apart))[0]
+        if len(far_idx) == 0:
+            # Fallback 1: any sample from a different quarter.
+            far_idx = np.where(q_int != q)[0]
+        if len(far_idx) == 0:
+            # Fallback 2: any sample (all in same quarter — degenerate).
+            far_idx = np.arange(n)
+        far_pool[int(q)] = far_idx
+
+    partners = np.empty(len(base_idx), dtype=np.int64)
+    for k, i in enumerate(base_idx):
+        pool = far_pool[int(q_int[i])]
+        partners[k] = pool[rng.integers(0, len(pool))]
+    return partners
+
+
+class XGBoostTemporalMixupTrainer(BaseTrainer):
+    """XGBoost binary classifier trained on real ∪ temporally-mixed samples.
+
+    For each real training row, generates a synthetic partner row by linearly
+    combining its features and (strict-win) label with a sample drawn from a
+    quarter at least ``mixup_min_quarters`` away. Trains with reg:logistic
+    objective (which accepts soft labels in [0,1]) on the augmented set.
+    Validation set is left untouched — early stopping evaluates on real
+    held-out data only.
+    """
+    name = 'xgb_temporal_mixup'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 mixup_alpha: float = 0.4,
+                 mixup_ratio: float = 1.0,
+                 mixup_min_quarters: int = 1,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            mixup_alpha=float(mixup_alpha),
+            mixup_ratio=float(mixup_ratio),
+            mixup_min_quarters=int(mixup_min_quarters),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.booster = None
+        self._best_iteration = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val (per-trade '
+                'realized P&L) to derive the strict-win label.')
+        if dates_train is None:
+            raise ValueError(
+                f'{self.name} requires dates_train for temporal partner selection.')
+
+        # Strict-win label aligns training target with the gate's WR metric,
+        # matching xgb_focal_loss / xgb_group_balanced_focal.
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.float64)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.float64)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        Xt = np.asarray(X_train, dtype=np.float64)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+
+        rng = np.random.default_rng(int(p['random_state']))
+        n = len(Xt)
+        n_aug = int(n * float(p['mixup_ratio']))
+
+        if n_aug > 0:
+            base_idx = rng.integers(0, n, size=n_aug)
+            partner_idx = _temporal_mixup_partners(
+                base_idx, np.asarray(dates_train),
+                min_quarters_apart=int(p['mixup_min_quarters']),
+                rng=rng,
+            )
+            alpha = float(p['mixup_alpha'])
+            lam_raw = rng.beta(alpha, alpha, size=n_aug)
+            # Asymmetric mixup: ensure lam ≥ 0.5 so the synthetic sample stays
+            # closer to its base parent than to the temporal partner. Empirically
+            # this stabilises soft-label training; symmetric (lam ~ 0.5) labels
+            # collapse the gradient signal on rows where parents disagree.
+            lam = np.maximum(lam_raw, 1.0 - lam_raw)
+            lam_col = lam[:, None]
+
+            X_mix = lam_col * Xt[base_idx] + (1.0 - lam_col) * Xt[partner_idx]
+            y_mix = lam * y_tr[base_idx] + (1.0 - lam) * y_tr[partner_idx]
+
+            X_combined = np.vstack([Xt, X_mix]).astype(np.float32)
+            y_combined = np.concatenate([y_tr, y_mix]).astype(np.float32)
+        else:
+            X_combined = Xt.astype(np.float32)
+            y_combined = y_tr.astype(np.float32)
+
+        dtrain = xgb.DMatrix(X_combined, label=y_combined)
+        dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+
+        params = {
+            'tree_method': 'hist',
+            # reg:logistic supports continuous labels in [0,1] — required for
+            # soft mixup labels. Standard binary:logistic with hard labels would
+            # round-trip through round() and lose the mixup signal.
+            'objective': 'reg:logistic',
+            'max_depth': int(p['max_depth']),
+            'learning_rate': float(p['learning_rate']),
+            'subsample': float(p['subsample']),
+            'colsample_bytree': float(p['colsample_bytree']),
+            'reg_alpha': float(p['reg_alpha']),
+            'reg_lambda': float(p['reg_lambda']),
+            'min_child_weight': float(p['min_child_weight']),
+            'gamma': float(p['gamma']),
+            'seed': int(p['random_state']),
+            'verbosity': 0,
+            'eval_metric': 'logloss',
+        }
+
+        self.booster = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=int(p['n_estimators']),
+            evals=[(dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.booster, 'best_iteration', 0))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.booster is None:
+            raise RuntimeError('Model not fit')
+        dmat = xgb.DMatrix(np.asarray(X, dtype=np.float32))
+        # reg:logistic returns probabilities in [0,1] directly.
+        return self.booster.predict(dmat)
+
+    def feature_importance(self):
+        if self.booster is None or self._n_features is None:
+            return None
+        score = self.booster.get_score(importance_type='gain')
+        out = np.zeros(self._n_features, dtype=np.float64)
+        for k, v in score.items():
+            if k.startswith('f'):
+                out[int(k[1:])] = v
+        return out
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.booster.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.booster = xgb.Booster()
+        inst.booster.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -3563,6 +3827,7 @@ TRAINERS = {
     'xgb_strict_win': XGBoostStrictWinClassifierTrainer,
     'xgb_focal_loss': XGBoostFocalLossClassifierTrainer,
     'xgb_group_balanced_focal': XGBoostGroupBalancedFocalLossTrainer,
+    'xgb_temporal_mixup': XGBoostTemporalMixupTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 
