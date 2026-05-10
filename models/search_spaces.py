@@ -539,6 +539,32 @@ SEARCH_SPACES: dict[str, dict] = {
         'pass1_estimators_frac':  (0.3, 0.7),
         'weight_smoothing':       (0.0, 0.5),
     },
+    # Top-K Classifier: y = (trade is in top-K of its date by pnl AND pnl > 0).
+    # Direct alignment with the gate's top-K-per-date selection rule. ~2-3% pos
+    # rate on K=2 → high pos_class_weight needed. Same XGB tree-family HP space
+    # as xgb_focal_loss / xgb_strict_win (HP intuitions carry over) plus two
+    # trainer-specific knobs:
+    #   top_k ∈ {1, 2, 3} — K=2 matches MAX_OPEN_POSITIONS in the gate. K=1
+    #     is more selective (the day's single best); K=3 admits a third pick
+    #     per date which the gate then filters down. Sweep should find where
+    #     the train-time relabelling matches the gate's actual selection.
+    #   pos_class_weight ∈ [10, 50] — wider range than xgboost's [1.0, 8.0]
+    #     because the K=2 positive rate is ~2-3% (vs 22% for strict-win, 12%
+    #     for clean-win). At K=2 the analytic balanced weight is ~30-50; the
+    #     sweep covers both moderate (10-15) and aggressive (40-50) regimes.
+    'xgb_topk_classifier': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'top_k':                  [1, 2, 3],
+        'pos_class_weight':       (10.0, 50.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

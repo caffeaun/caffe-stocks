@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Fresh structural lever (per-quarter loss-driven Group DRO) hit 3/7 at default HPs with W6 (chronic rotation-limited) and W2 (chronic Q1 chop) BOTH passing \u2014 first trainer to clear both simultaneously. W1 fails by 5pp WR despite ann +25.3% (HP-tunable). Three trainer-specific knobs (dro_strength, pass1_estimators_frac, weight_smoothing) unexplored; mixup HP space exhausted at 5/7 ceiling after 30+ train-mode iters.",
-  "claude_iter_id": 570,
-  "designated_at": "2026-05-10T15:15:29"
+  "rationale": "xgb_topk_classifier failed catastrophically at default HPs (0/7, avg_ann -27.5%) \u2014 the per-date top-K-by-pnl label selects for VARIANCE not SELECTIVITY (avg_win +8-13% but WR 14-33%, DD often >20%). xgb_quarterly_dro remains the strongest baseline (3/7 default, +3.5% avg_ann); train mode should keep deepening its HP sweep on dro_strength \u00d7 pass1_estimators_frac \u00d7 weight_smoothing \u2014 three knobs barely explored beyond defaults.",
+  "claude_iter_id": 586,
+  "designated_at": "2026-05-10T18:17:19"
 }

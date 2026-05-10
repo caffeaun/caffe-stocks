@@ -4306,6 +4306,231 @@ class XGBoostQuarterlyDROTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Top-K Classifier — y = (trade was top-K of its date by pnl AND pnl > 0)
+# --------------------------------------------------------------------- #
+# Motivation: the loss-engineering family (focal, group_focal, JTT, DRO,
+# magnitude, strict_win, temporal_mixup) all saturate at 3-4/7 windows. They
+# REWEIGHT example losses but keep a STATIC binary target — "was this trade
+# profitable?". The gate, however, doesn't ask that: it asks "is this trade in
+# the top-K-per-date by score, with score above threshold?" — a per-day
+# competitive selection rule. The model is being optimized for a global
+# criterion (any win) and selected by a relative criterion (best-of-day),
+# producing high-WR-at-high-threshold but flat-WR-at-low-threshold (the
+# gate's MIN_TRADES=20 floor forces the latter, which is where W3-W5 fail).
+#
+# Per-day TopK label: y=1 iff the trade is in the top-K (default K=2) of its
+# entry date by realized pnl AND pnl > 0. K=2 mirrors MAX_OPEN_POSITIONS in
+# return_gate.simulate_window — the gate physically takes top-2 per date.
+# Positives become ~2-3% of train rows (vs 22% for strict-win), but the model
+# now sees the EXACT discrimination rule the gate scores: "what makes a stock
+# the best of the day?". On bear days where no candidate has pnl > 0, no
+# positives are emitted — the model implicitly learns to abstain when even
+# the day's best is a loser, reducing the W3-W5 false-positive band where
+# 0.4-0.5-scored trades currently destroy WR.
+#
+# Distinct from xgb_win_ranker (NDCG@2): the ranker fits a pairwise/listwise
+# loss whose gradient depends on within-date pred ordering — it can rank
+# trades correctly even if all candidates are losers. This trainer's BCE
+# gradient depends only on the binary positive/negative split — it can
+# converge on "no positives today" patterns where the ranker still emits
+# ordered scores. Distinct from xgb_strict_win: that trains on (pnl > 0)
+# globally; ~22% pos_rate, no per-date relativization. The ranker and the
+# strict-win classifier collectively over-call the regime-edge windows;
+# this trainer's tighter label is hypothesised to under-call and abstain.
+class XGBoostTopKClassifierTrainer(BaseTrainer):
+    """Per-date relative top-K classifier with pos_weighted XGBoost CE.
+
+    The training label is reconstructed inside fit() from pnl_train + dates_train:
+    rows in the top-K of their entry date by pnl (with pnl > 0) get y=1, else 0.
+    """
+    name = 'xgb_topk_classifier'
+
+    def __init__(self,
+                 max_depth: int = 6,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 top_k: int = 2,
+                 pos_class_weight: float = 20.0,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            n_estimators=n_estimators,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            top_k=int(top_k),
+            pos_class_weight=float(pos_class_weight),
+            early_stopping_rounds=early_stopping_rounds,
+            random_state=random_state,
+        )
+        self.clf = None
+        self._best_iteration = None
+        self._n_features = None
+        self._train_pos_rate = None  # diagnostic
+
+    @staticmethod
+    def _topk_labels(pnl, dates, k: int) -> np.ndarray:
+        """Per-date top-K positive label: y=1 iff row is in top-K by pnl AND pnl > 0.
+
+        Vectorised path: rank within each date by pnl (descending). Rows whose
+        rank <= k AND pnl > 0 are positive. Argsort-based per-date rank avoids
+        a Python-level groupby loop.
+        """
+        pnl = np.asarray(pnl, dtype=np.float64)
+        dates = np.asarray(dates)
+        n = len(pnl)
+        if n == 0:
+            return np.zeros(0, dtype=np.int32)
+        # Sort by (date asc, pnl desc) so consecutive equal-date rows are
+        # ranked highest-pnl-first. Then rank-within-date is just a counter
+        # that resets on date change.
+        order = np.lexsort((-pnl, dates))
+        sorted_dates = dates[order]
+        # Rank within date: position since last date change.
+        # New-date marker: 1 at index 0 and where date != prev date.
+        new_date = np.empty(n, dtype=bool)
+        new_date[0] = True
+        new_date[1:] = sorted_dates[1:] != sorted_dates[:-1]
+        # group_id increments by 1 at every new_date; group_start[i] = index
+        # of the first row of group_id[i].
+        group_id = np.cumsum(new_date) - 1
+        group_start = np.zeros(group_id[-1] + 1, dtype=np.int64)
+        group_start[group_id[new_date]] = np.where(new_date)[0]
+        rank_in_date = np.arange(n) - group_start[group_id]
+        # Apply mask: rank < k AND pnl > 0
+        sorted_pnl = pnl[order]
+        is_topk = (rank_in_date < k) & (sorted_pnl > 0.0)
+        # Map back to original row order.
+        y_sorted = is_topk.astype(np.int32)
+        y = np.empty(n, dtype=np.int32)
+        y[order] = y_sorted
+        return y
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val to derive the '
+                'top-K-per-date label.')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for per-date '
+                'top-K label construction.')
+
+        p = self._params
+        k = int(p['top_k'])
+        y_tr = self._topk_labels(pnl_train, dates_train, k)
+        y_va = self._topk_labels(pnl_val, dates_val, k)
+
+        # Defensive: degenerate splits where every date has no positive can
+        # still happen on weird windows. Fall back to strict-win if so.
+        if y_tr.sum() < 5 or y_va.sum() < 2:
+            y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+            y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        self._train_pos_rate = float(y_tr.mean())
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+
+        self.clf = xgb.XGBClassifier(
+            n_estimators=int(p['n_estimators']),
+            max_depth=int(p['max_depth']),
+            learning_rate=float(p['learning_rate']),
+            subsample=float(p['subsample']),
+            colsample_bytree=float(p['colsample_bytree']),
+            scale_pos_weight=float(p['pos_class_weight']),
+            reg_alpha=float(p['reg_alpha']),
+            reg_lambda=float(p['reg_lambda']),
+            min_child_weight=float(p['min_child_weight']),
+            gamma=float(p['gamma']),
+            objective='binary:logistic',
+            eval_metric='logloss',
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            random_state=int(p['random_state']),
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf.fit(
+            Xt, y_tr,
+            eval_set=[(Xv, y_va)],
+            verbose=verbose,
+        )
+        self._best_iteration = getattr(self.clf, 'best_iteration', None) or int(p['n_estimators'])
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict_proba(np.asarray(X))[:, 1]
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        booster_path = os.path.join(output_dir, 'booster.json')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        self.clf.save_model(booster_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_iteration': self._best_iteration,
+            'n_features': self._n_features,
+            'train_pos_rate': self._train_pos_rate,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': booster_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import xgboost as xgb
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        booster_path = os.path.join(output_dir, 'booster.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.clf = xgb.XGBClassifier()
+        inst.clf.load_model(booster_path)
+        inst._best_iteration = meta.get('best_iteration')
+        inst._n_features = meta.get('n_features')
+        inst._train_pos_rate = meta.get('train_pos_rate')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -4331,6 +4556,7 @@ TRAINERS = {
     'xgb_temporal_mixup': XGBoostTemporalMixupTrainer,
     'xgb_jtt': XGBoostJTTTrainer,
     'xgb_quarterly_dro': XGBoostQuarterlyDROTrainer,
+    'xgb_topk_classifier': XGBoostTopKClassifierTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 
