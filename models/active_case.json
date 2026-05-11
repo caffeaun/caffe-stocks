@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_rank_fusion",
+  "trainer": "xgb_recency_consensus",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from xgb_mcdropout_classifier (8-iter train sweep #641-#648 plateaued at 0-3/7 with avg_ann -5% to -39%, no monotone improvement) to new xgb_rank_fusion. Default 3/7 (W3/W4/W6 pass cleanly with WR 41-55% and ann +15-36%) on first try with a novel diverse-objective + rank-quantile-geometric-mean fusion mechanism; W7 narrowly misses (WR 38.6%, 1.4pp short). The 16-dim HP space spans both shared tree-shape and per-base loss-specific knobs (pos_class_weight, magnitude_scale, huber_slope, dro_strength), so train mode has wide search surface to find a combo that lifts the WR floor in W1/W2/W5 (where the geometric mean is currently too aggressive \u2014 quarterly_dro alone would have passed these windows). Lowering pos_class_weight (less aggressive strict-win base) and raising weight_smoothing (gentler DRO reweighting) are the leading hypotheses for the sweep.",
-  "claude_iter_id": 649,
-  "designated_at": "2026-05-11T06:17:38"
+  "rationale": "Pivot from xgb_rank_fusion (8-iter train sweep #667-#674 plateaued at 1-4/7 with avg_ann -3% to +25%, no monotone improvement past iter #669) to new xgb_recency_consensus. Default 1/7 (only W2 +29.5%) is below rank_fusion's default 3/7, BUT default 60d half-life is on the aggressive end of the [20, 150] HP range \u2014 W6 collapsed from rank_fusion's +29% to -65% specifically because the recent head over-weights the late-2024/early-2025 train rows whose signal inverts in W6 test. The 14-dim HP space includes two structurally novel knobs (recency_halflife_days, min_recent_weight) plus the existing strict_win/magnitude axes, giving train mode wide latitude to find a half-life that filters bear-regime overconfidence in W1/W4/W5/W7 without killing W6. Push half-life up (120-150d) and min_recent_weight up (0.3-0.4) to soften the recent head toward the full head; if no HP combo beats rank_fusion's best 3/7 after 8-10 sweep iters, next claude iter should pivot.",
+  "claude_iter_id": 675,
+  "designated_at": "2026-05-11T12:14:07"
 }

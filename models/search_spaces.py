@@ -696,6 +696,77 @@ SEARCH_SPACES: dict[str, dict] = {
         'pass1_estimators_frac':  (0.3, 0.7),
         'weight_smoothing':       (0.05, 0.30),
     },
+    # Regime-blend classifier (xgb_regime_blend). Two parallel strict-win
+    # XGB heads — generalist on FULL train + bear-specialist on the lower-
+    # quantile-by-market_breadth_adv subset — softly blended at predict by
+    # per-row regime feature. Single tree-family HP set (both heads share),
+    # plus three blend-mechanic knobs:
+    #   bear_quantile ∈ [0.25, 0.55] — fraction of training rows labelled
+    #     "bear" for the specialist head. 0.25 = tight (specialist sees the
+    #     deepest bear rows only, but starves on small windows); 0.55 = loose
+    #     (specialist sees ~half of train, blurs the bear/bull discrimination
+    #     but keeps sample size up). The sweep should find where bear-only
+    #     learning beats noise.
+    #   temperature ∈ [0.05, 0.50] — softness of the predict-time blend.
+    #     Small temp = nearly hard routing (bear rows → 100% specialist,
+    #     bull rows → 100% generalist); large temp = mostly 50/50 averaging,
+    #     specialist contribution barely felt. 0.15 (default) gives a ~70/30
+    #     blend at 1 IQR away from the threshold.
+    #   regime_feature_idx ∈ {15, 16, 19, 12} — which feature column drives
+    #     the blend. 15 = last__market_breadth_adv (default), 16 =
+    #     last__market_breadth_above_sma20, 19 = last__market_new_highs,
+    #     12 = last__sector_breadth. All four are bounded [0,1] regime
+    #     features from feature_eng.py; the sweep should find which signal
+    #     cleanest separates bear/bull when applied as the blend gate.
+    'xgb_regime_blend': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'magnitude_scale':        (5.0, 25.0),
+        'base_weight':            (0.3, 1.0),
+        'pos_class_weight':       (1.5, 4.0),
+        'bear_quantile':          (0.25, 0.55),
+        'temperature':            (0.05, 0.50),
+        'regime_feature_idx':     [15, 16, 19, 12],
+    },
+    # Recency-consensus classifier (xgb_recency_consensus). Two strict-win
+    # XGB heads — one trained with uniform sample weights (full-history view),
+    # one with exp-decay recency weighting (recent-history view) — geo-mean
+    # fused at predict. Single shared XGB tree-shape HP set + magnitude
+    # weighting (same as strict_win), plus the two recency-specific knobs:
+    #   recency_halflife_days ∈ [20, 150] — half-life in calendar days for
+    #     the exp decay on the recent head's sample weights. 20d gives a
+    #     SHARP recent focus (last ~1 mo of a 6-mo train dominates); 150d
+    #     gives a SOFT recent focus (gentle tilt toward the second half of
+    #     train). Default 60d. The sweep should find the half-life that
+    #     best previews each test window's regime — too short and the
+    #     recent head has high variance from small ESS; too long and the
+    #     two heads collapse to the same model (consensus disappears).
+    #   min_recent_weight ∈ [0.05, 0.40] — floor on the recency weight for
+    #     the OLDEST train rows. 0.05 nearly drops them (high recent bias);
+    #     0.40 keeps them as a strong regularizer. Default 0.20.
+    'xgb_recency_consensus': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'magnitude_scale':        (5.0, 25.0),
+        'base_weight':            (0.3, 1.0),
+        'pos_class_weight':       (1.5, 4.0),
+        'recency_halflife_days':  (20.0, 150.0),
+        'min_recent_weight':      (0.05, 0.40),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

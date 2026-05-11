@@ -5524,6 +5524,472 @@ class XGBoostRankFusionTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Regime-Blend Classifier — two strict-win XGB heads (one trained on FULL
+# data, one trained on BEAR-regime-only subset), softly blended at predict
+# time by per-row market_breadth_adv. Bear-regime test rows pull the
+# bear-specialist head; bull-regime test rows pull the generalist head.
+#
+# Motivation: the rank_fusion / mcdropout / meta_label / adv_val / quarterly_dro
+# sweep (#618-#661, 130+ iters) plateaus at 3-6/7 windows. The failing
+# windows (W1 Nov2023-Feb2024 with WR=17.6%, W2 Jan-Apr2024 WR=30.8%, W5
+# Jan-Apr2025 WR=31.8%) ALL correspond to bear-regime test periods, while
+# the passing windows (W3 May-Aug2024 WR=55%, W4 Sep-Dec2024 WR=41%, W6
+# May-Aug2025 WR=46%) are recovery / bullish periods. In W1 the model picks
+# losers WORSE THAN RANDOM (17.6% vs 50% random baseline) — this is signal
+# INVERSION, where features that predict winners in the training (bullish)
+# period predict losers in the test (bearish) period.
+#
+# Every prior structural change reweights TRAINING rows (focal, group-DRO,
+# adversarial val, JTT, magnitude weighting) — they all train ONE model on
+# the SAME set, hoping the loss-shape forces regime invariance. None hit
+# 100% because a single XGB tree split that's predictive in bull regime
+# IS NOT predictive in bear, no matter how the train rows are weighted.
+#
+# Regime blend is structurally different: it trains TWO classifiers in
+# parallel, and ROUTES at predict time. Model A is the generalist (trained
+# on all rows). Model B is the bear specialist (trained only on rows where
+# the market regime feature is in the lower quantile of training). At test
+# time, a row's market_breadth_adv value determines a soft blend weight:
+# bear-like rows (low breadth) draw more from B, bull-like rows (high
+# breadth) draw more from A. The blend is smooth (sigmoid-based) so there
+# is no hard expert routing — bull rows still see B's signal at low weight,
+# and the (limited) bear training data is amplified only where it matters.
+#
+# Why soft blend not hard routing: hard routing fails when the bear-regime
+# test data outsizes the bear-regime train data (exactly the W1/W2/W5
+# pattern — test is mostly bear, train is mostly bull, so the bear expert
+# has few training rows). The soft blend ensures we always have generalist
+# A as a fallback when B is undertrained, AND the blend weight is bounded
+# in [0, 1] regardless of expert size mismatch.
+# --------------------------------------------------------------------- #
+class XGBoostRegimeBlendTrainer(BaseTrainer):
+    """Regime-conditioned 2-model blend (generalist + bear-specialist).
+
+    fit() trains:
+      - model_A: XGB strict-win classifier on FULL training data
+      - model_B: XGB strict-win classifier on the bear-quantile subset
+        of training rows (rows where the regime feature is below
+        ``bear_quantile`` percentile of the training distribution).
+
+    predict_proba(X) returns a per-row blend:
+      bear_w = sigmoid((threshold - X[:, regime_feature_idx]) / temperature)
+      score  = (1 - bear_w) * model_A.predict(X) + bear_w * model_B.predict(X)
+
+    The regime feature defaults to column 15 of the aggregated tabular X,
+    which is ``last__market_breadth_adv`` under the curated feature set
+    (see models/feature_eng.py CURATED_FEATURES). If ``model_B``'s training
+    subset is smaller than ``min_specialist_samples``, ``model_B`` is skipped
+    and the trainer degenerates to ``model_A`` alone — preserving graceful
+    fallback when a window's training data has too few bear samples.
+    """
+    name = 'xgb_regime_blend'
+
+    def __init__(self,
+                 # Shared XGB tree-family knobs (both heads use these)
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 # Strict-win classifier weighting knobs (both heads)
+                 magnitude_scale: float = 15.0,
+                 base_weight: float = 0.6,
+                 pos_class_weight: float = 2.5,
+                 # Regime-blend mechanics. Defaults err on the side of
+                 # NEAR-HARD routing (temperature=0.05) so the bull-regime
+                 # rows get pure model_A and bear rows get pure model_B —
+                 # soft blending in the transition zone produced noisy
+                 # ranking contamination at default HPs.
+                 regime_feature_idx: int = 15,
+                 bear_quantile: float = 0.30,
+                 temperature: float = 0.05,
+                 min_specialist_samples: int = 500,
+                 # Common
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        self._params = dict(
+            max_depth=int(max_depth),
+            learning_rate=float(learning_rate),
+            n_estimators=int(n_estimators),
+            subsample=float(subsample),
+            colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha),
+            reg_lambda=float(reg_lambda),
+            min_child_weight=float(min_child_weight),
+            gamma=float(gamma),
+            magnitude_scale=float(magnitude_scale),
+            base_weight=float(base_weight),
+            pos_class_weight=float(pos_class_weight),
+            regime_feature_idx=int(regime_feature_idx),
+            bear_quantile=float(bear_quantile),
+            temperature=float(temperature),
+            min_specialist_samples=int(min_specialist_samples),
+            early_stopping_rounds=int(early_stopping_rounds),
+            random_state=int(random_state),
+        )
+        self.model_a = None
+        self.model_b = None
+        self._regime_threshold = None
+        self._specialist_fit = False
+        self._n_features = None
+
+    def _build_strict_win(self, seed_offset: int = 0):
+        p = self._params
+        return XGBoostStrictWinClassifierTrainer(
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            n_estimators=p['n_estimators'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            magnitude_scale=p['magnitude_scale'],
+            base_weight=p['base_weight'],
+            pos_class_weight=p['pos_class_weight'],
+            early_stopping_rounds=p['early_stopping_rounds'],
+            random_state=int(p['random_state']) + int(seed_offset),
+        )
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train/pnl_val (strict-win label).')
+        X_tr = np.asarray(X_train, dtype=np.float32)
+        X_va = np.asarray(X_val, dtype=np.float32)
+        self._n_features = X_tr.shape[1]
+        p = self._params
+
+        idx = int(p['regime_feature_idx'])
+        if idx < 0 or idx >= self._n_features:
+            raise ValueError(
+                f'{self.name}: regime_feature_idx={idx} out of bounds for '
+                f'X with {self._n_features} columns.')
+
+        # Quantile boundary on the SCALED training feature.
+        # X has already been RobustScaler-transformed by the gate, so the
+        # quantile here is on the scaled-units space — and the same scaling
+        # is applied at predict, so it's consistent.
+        regime_train = X_tr[:, idx]
+        self._regime_threshold = float(
+            np.quantile(regime_train, p['bear_quantile']))
+
+        # --- Head A: generalist on FULL train --------------------------------
+        self.model_a = self._build_strict_win(seed_offset=0)
+        self.model_a.fit(
+            X_tr, np.asarray(y_train), X_va, np.asarray(y_val),
+            verbose=False,
+            pnl_train=pnl_train, pnl_val=pnl_val,
+            dates_train=dates_train, dates_val=dates_val,
+        )
+
+        # --- Head B: bear-regime specialist on subset ------------------------
+        bear_mask = regime_train <= self._regime_threshold
+        n_bear = int(bear_mask.sum())
+        # Require both bear samples AND class diversity in the subset.
+        if n_bear >= int(p['min_specialist_samples']):
+            pnl_bear = np.asarray(pnl_train)[bear_mask]
+            y_bear_strict = (pnl_bear > 0.0).astype(np.int32)
+            if len(set(y_bear_strict.tolist())) >= 2:
+                # Bear-subset val: use rows from X_val whose regime feature is
+                # also bear-side, so early stopping picks a model_B iteration
+                # tuned to bear-distribution loss, not full-val (bull-leaning)
+                # loss. Falls back to full val if bear-subset val is too thin
+                # (< 30 rows or single-class).
+                val_regime = X_va[:, idx]
+                val_bear_mask = val_regime <= self._regime_threshold
+                y_val_strict = (np.asarray(pnl_val) > 0.0).astype(np.int32)
+                if (val_bear_mask.sum() >= 30
+                        and len(set(y_val_strict[val_bear_mask].tolist())) >= 2):
+                    Xv_for_b = X_va[val_bear_mask]
+                    yv_for_b = np.asarray(y_val)[val_bear_mask]
+                    pnlv_for_b = np.asarray(pnl_val)[val_bear_mask]
+                    datesv_for_b = (np.asarray(dates_val)[val_bear_mask]
+                                    if dates_val is not None else None)
+                else:
+                    Xv_for_b = X_va
+                    yv_for_b = np.asarray(y_val)
+                    pnlv_for_b = np.asarray(pnl_val)
+                    datesv_for_b = dates_val
+                self.model_b = self._build_strict_win(seed_offset=11)
+                self.model_b.fit(
+                    X_tr[bear_mask], np.asarray(y_train)[bear_mask],
+                    Xv_for_b, yv_for_b,
+                    verbose=False,
+                    pnl_train=pnl_bear,
+                    pnl_val=pnlv_for_b,
+                    dates_train=(np.asarray(dates_train)[bear_mask]
+                                 if dates_train is not None else None),
+                    dates_val=datesv_for_b,
+                )
+                self._specialist_fit = True
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.model_a is None:
+            raise RuntimeError(f'{self.name}: not fit')
+        X_arr = np.asarray(X, dtype=np.float32)
+        p_a = self.model_a.predict_proba(X_arr)
+        if not self._specialist_fit or self.model_b is None:
+            return p_a
+
+        p = self._params
+        idx = int(p['regime_feature_idx'])
+        thr = float(self._regime_threshold)
+        T = max(1e-6, float(p['temperature']))
+        # bear_w high when regime feature < threshold; smooth via sigmoid.
+        # Clip the logit to avoid overflow on extreme outliers (RobustScaler
+        # uses IQR, so 1.5-sigma outliers can be in [-3, 3]; bigger blowups
+        # are rare but possible on tail rows). The clip keeps exp() finite.
+        logit = (thr - X_arr[:, idx]) / T
+        logit = np.clip(logit, -30.0, 30.0)
+        bear_w = 1.0 / (1.0 + np.exp(-logit))
+        p_b = self.model_b.predict_proba(X_arr)
+        return (1.0 - bear_w) * p_a + bear_w * p_b
+
+    @property
+    def best_iteration(self):
+        if self.model_a is None:
+            return None
+        return self.model_a.best_iteration
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+
+# --------------------------------------------------------------------- #
+# Recency-Consensus Classifier — two strict-win XGB heads (full-history
+# view + exponential-decay recent-history view), geometric-mean fused at
+# predict time. Picks must score high in BOTH temporal lenses to clear
+# the consensus filter.
+#
+# Motivation: the failing windows (W1 Nov2023-Feb2024 WR=17.6%, W4
+# Sep-Dec2024 WR=20.8%, W5 Jan-Apr2025 WR=31.8%, W7 Sep2025-Feb2026
+# WR=21.3% — all on rank_fusion default) follow a pattern: test period
+# is a bear/transition immediately AFTER a bull-dominated train. Every
+# prior trainer (focal, DRO, JTT, adv_val, meta_label, rank_fusion,
+# regime_blend, mcdropout) treats train rows with uniform TEMPORAL
+# weight — only their PER-ROW row weighting (magnitude, focal, DRO
+# group, adversarial-importance) differs. This means an outdated bullish
+# regime signal from the early-train months dominates the gradient
+# equally with the late-train signal that should better preview test.
+#
+# Recency consensus is a structurally distinct knob: it weights train
+# rows by their AGE (exp decay from train_end). The "recent" head sees
+# late-train rows at full weight and old-train rows at min_recent_weight,
+# capturing the regime signal closest to test. The "full" head sees all
+# rows uniformly (the existing strict_win behavior). Geometric-mean
+# fusion at predict keeps only stocks where BOTH lenses agree — a stock
+# only flagged by the full-history head (likely an outdated bullish
+# pattern) gets suppressed by the recent head; a stock only flagged by
+# the recent head (likely a one-off late-train fluke) gets suppressed
+# by the full head. The intersection-style consensus is structurally
+# different from rank_fusion's geo-mean-of-different-objectives (which
+# uses the SAME train data for all three bases) — here the two heads
+# disagree EXACTLY when train-time regime is non-stationary, which is
+# the failure mode we need to filter out.
+# --------------------------------------------------------------------- #
+class XGBoostRecencyConsensusTrainer(BaseTrainer):
+    """Recency-consensus strict-win classifier (full + recent heads, geo mean)."""
+    name = 'xgb_recency_consensus'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 magnitude_scale: float = 15.0,
+                 base_weight: float = 0.6,
+                 pos_class_weight: float = 3.0,
+                 recency_halflife_days: float = 60.0,
+                 min_recent_weight: float = 0.20,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        # recency_halflife_days: shorter half-life concentrates the recent
+        #   head onto the last weeks of train. 30d ≈ last quarter dominates;
+        #   180d ≈ roughly uniform across 6-mo train. Default 60d puts ~75%
+        #   of weight on the most-recent half of a 6-mo train window.
+        # min_recent_weight: floor for the oldest train rows in the recent
+        #   head, AFTER exp decay. 0.0 means oldest rows ignored (high
+        #   variance from small ESS); 1.0 means uniform (no recency
+        #   advantage). 0.20 keeps the old rows as a soft regularizer.
+        self._params = dict(
+            max_depth=int(max_depth),
+            learning_rate=float(learning_rate),
+            n_estimators=int(n_estimators),
+            subsample=float(subsample),
+            colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha),
+            reg_lambda=float(reg_lambda),
+            min_child_weight=float(min_child_weight),
+            gamma=float(gamma),
+            magnitude_scale=float(magnitude_scale),
+            base_weight=float(base_weight),
+            pos_class_weight=float(pos_class_weight),
+            recency_halflife_days=float(recency_halflife_days),
+            min_recent_weight=float(min_recent_weight),
+            early_stopping_rounds=int(early_stopping_rounds),
+            random_state=int(random_state),
+        )
+        self.clf_full = None
+        self.clf_recent = None
+        self._best_iteration_full = None
+        self._best_iteration_recent = None
+
+    def _build_magnitude_weights(self, pnl):
+        p = self._params
+        pnl_arr = np.asarray(pnl, dtype=np.float64)
+        raw = np.abs(pnl_arr) * p['magnitude_scale'] + p['base_weight']
+        m = raw.mean()
+        if m <= 0:
+            return np.ones_like(raw, dtype=np.float32)
+        return (raw / m).astype(np.float32)
+
+    @staticmethod
+    def _to_ordinal(dates) -> np.ndarray:
+        """Convert assorted date inputs to numeric days. Works for numpy
+        datetime64, pandas Timestamp, datetime.date/datetime, or ISO date
+        strings — falls back to row-index if all parsing fails."""
+        arr = np.asarray(dates)
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return arr.astype('datetime64[D]').astype(np.int64).astype(np.float64)
+        try:
+            import pandas as pd
+            ts = pd.to_datetime(arr)
+            return ts.values.astype('datetime64[D]').astype(np.int64).astype(np.float64)
+        except Exception:
+            return np.arange(len(arr), dtype=np.float64)
+
+    def _build_recency_weights(self, dates, ref_day: float) -> np.ndarray:
+        p = self._params
+        days = self._to_ordinal(dates)
+        age = np.maximum(0.0, ref_day - days)
+        halflife = max(1.0, p['recency_halflife_days'])
+        w = np.power(0.5, age / halflife)
+        w = np.maximum(w, p['min_recent_weight'])
+        return w.astype(np.float32)
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val for strict-win '
+                'labels and magnitude weighting.')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for '
+                'recency weighting.')
+
+        p = self._params
+
+        y_tr_strict = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va_strict = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr_strict)) < 2:
+            raise ValueError('Train set has only one class after strict-win — fit aborted')
+
+        mag_tr = self._build_magnitude_weights(pnl_train)
+        mag_va = self._build_magnitude_weights(pnl_val)
+
+        days_tr = self._to_ordinal(dates_train)
+        days_va = self._to_ordinal(dates_val)
+        ref_day = float(max(days_tr.max(), days_va.max()))
+        rec_tr = self._build_recency_weights(dates_train, ref_day)
+        rec_va = self._build_recency_weights(dates_val, ref_day)
+
+        comb_tr = mag_tr * rec_tr
+        m_tr = comb_tr.mean()
+        if m_tr > 0:
+            comb_tr = (comb_tr / m_tr).astype(np.float32)
+        comb_va = mag_va * rec_va
+        m_va = comb_va.mean()
+        if m_va > 0:
+            comb_va = (comb_va / m_va).astype(np.float32)
+
+        common_kw = dict(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            scale_pos_weight=p['pos_class_weight'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='binary:logistic',
+            eval_metric='logloss',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+
+        self.clf_full = xgb.XGBClassifier(
+            random_state=p['random_state'],
+            **common_kw,
+        )
+        self.clf_full.fit(
+            np.asarray(X_train), y_tr_strict,
+            sample_weight=mag_tr,
+            eval_set=[(np.asarray(X_val), y_va_strict)],
+            sample_weight_eval_set=[mag_va],
+            verbose=verbose,
+        )
+        self._best_iteration_full = getattr(self.clf_full, 'best_iteration', None) or p['n_estimators']
+
+        self.clf_recent = xgb.XGBClassifier(
+            random_state=p['random_state'] + 7,
+            **common_kw,
+        )
+        self.clf_recent.fit(
+            np.asarray(X_train), y_tr_strict,
+            sample_weight=comb_tr,
+            eval_set=[(np.asarray(X_val), y_va_strict)],
+            sample_weight_eval_set=[comb_va],
+            verbose=verbose,
+        )
+        self._best_iteration_recent = getattr(self.clf_recent, 'best_iteration', None) or p['n_estimators']
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf_full is None or self.clf_recent is None:
+            raise RuntimeError('Model not fit')
+        X_arr = np.asarray(X)
+        p_full = self.clf_full.predict_proba(X_arr)[:, 1]
+        p_recent = self.clf_recent.predict_proba(X_arr)[:, 1]
+        eps = 1e-7
+        log_geo = (np.log(np.clip(p_full, eps, 1.0))
+                   + np.log(np.clip(p_recent, eps, 1.0))) / 2.0
+        return np.exp(log_geo)
+
+    @property
+    def best_iteration(self):
+        if self._best_iteration_full is None:
+            return None
+        return max(self._best_iteration_full, self._best_iteration_recent or 0)
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -5554,6 +6020,8 @@ TRAINERS = {
     'xgb_meta_label': XGBoostMetaLabelingTrainer,
     'xgb_mcdropout_classifier': XGBoostMCDropoutClassifierTrainer,
     'xgb_rank_fusion': XGBoostRankFusionTrainer,
+    'xgb_regime_blend': XGBoostRegimeBlendTrainer,
+    'xgb_recency_consensus': XGBoostRecencyConsensusTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 
