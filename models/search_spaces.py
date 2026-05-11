@@ -767,6 +767,34 @@ SEARCH_SPACES: dict[str, dict] = {
         'recency_halflife_days':  (20.0, 150.0),
         'min_recent_weight':      (0.05, 0.40),
     },
+    # Day-quality consensus (xgb_day_quality_consensus). Inherits all the
+    # recency_consensus knobs and adds two head-C specific axes:
+    #   day_quality_floor ∈ [0.05, 0.60] — floor for head C's effective
+    #     output before the geo-mean. 0.05 = head C can suppress a score
+    #     to ~5% of its un-gated value on the worst days; 0.60 = at most
+    #     40% suppression. 0.30 default.
+    #   day_quality_weight ∈ [0.25, 2.5] — exponent on head C in the
+    #     weighted geo-mean (p_a * p_b * p_dq_eff^w)^(1/(2+w)). w=0.25
+    #     keeps head C as a gentle tiebreaker; w=2.5 makes head C
+    #     dominant (risk: regime miscalls dictate whole batch).
+    'xgb_day_quality_consensus': {
+        'max_depth':              [3, 4, 6, 8],
+        'learning_rate':          (0.01, 0.10),
+        'n_estimators':           [200, 400, 800],
+        'min_child_weight':       [1, 5, 10, 20],
+        'gamma':                  (0.0, 0.5),
+        'subsample':              (0.6, 1.0),
+        'colsample_bytree':       (0.5, 0.9),
+        'reg_alpha':              (0.0, 0.5),
+        'reg_lambda':             (0.5, 2.0),
+        'magnitude_scale':        (5.0, 25.0),
+        'base_weight':            (0.3, 1.0),
+        'pos_class_weight':       (1.5, 4.0),
+        'recency_halflife_days':  (20.0, 150.0),
+        'min_recent_weight':      (0.05, 0.40),
+        'day_quality_floor':      (0.05, 0.60),
+        'day_quality_weight':     (0.25, 2.5),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

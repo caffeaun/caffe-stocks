@@ -5990,6 +5990,305 @@ class XGBoostRecencyConsensusTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Day-Quality Consensus — three-head strict-win classifier. Heads A and B
+# match recency_consensus (uniform vs exp-decay temporal weighting). Head
+# C is the structural novelty: a per-day-quality regressor supervised by
+# the per-DATE mean strict-win rate (a quantity that is constant within a
+# date but varies across dates). Geometric-mean-of-three fusion at predict.
+#
+# Motivation: even the best xgb_recency_consensus run (iter #688 default,
+# 5/7 default, +27% avg_ann) still fails W5 (Jan-Apr2025 WR 34.4%) and
+# W7 (Sep2025-Feb2026 WR 21.2%) — both bear/transition windows where the
+# per-row classifier picks 30+ trades whose WR sits below the 40% floor.
+# All existing trainers (focal, DRO, JTT, adv_val, meta_label, mcdropout,
+# rank_fusion, regime_blend, recency_consensus) train heads on the SAME
+# row-level signal (strict-win or magnitude-weighted variants), so each
+# head, no matter the temporal weighting, optimizes for "which row is a
+# winner?" — never for "is the regime supportive of trading today?".
+#
+# Per-day mean strict-win rate is an inherently day-level signal: the per
+# row value is a CONSTANT for all rows sharing a date, so a regressor
+# trained on it cannot use intra-day cross-symbol signals (atr_pct,
+# volume_ratio, etc.) to discriminate — only features that ARE
+# day-level (market_breadth_*, set_above_sma20, up_days_5d,
+# sector_breadth, market_new_highs, sector_avg_*, etc.) carry the
+# gradient. This explicitly forces the third head to leverage the regime
+# features that are already in the feature set but dominated by per-row
+# features in heads A/B's gradient.
+#
+# At predict: head C output (in [0,1] via reg:logistic) is floored at
+# day_quality_floor so a clearly-bearish-day prediction can suppress but
+# not zero out, then folded into the geometric mean with adjustable
+# weight. Result: stocks only clear the gate when (a) the full-history
+# classifier likes them, AND (b) the recent-tilt classifier likes them,
+# AND (c) the regime regressor says it's a tradeable day.
+# --------------------------------------------------------------------- #
+class XGBoostDayQualityConsensusTrainer(BaseTrainer):
+    """Three-head consensus: full + recent strict-win + day-quality regressor."""
+    name = 'xgb_day_quality_consensus'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 400,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.7,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 1.0,
+                 min_child_weight: float = 5.0,
+                 gamma: float = 0.1,
+                 magnitude_scale: float = 15.0,
+                 base_weight: float = 0.6,
+                 pos_class_weight: float = 3.0,
+                 recency_halflife_days: float = 120.0,
+                 min_recent_weight: float = 0.30,
+                 day_quality_floor: float = 0.30,
+                 day_quality_weight: float = 1.0,
+                 early_stopping_rounds: int = 30,
+                 random_state: int = 42):
+        # day_quality_floor: floor for head C's effective output BEFORE the
+        #   geo-mean. 0.0 = head C can fully zero a score on bad days; 1.0 =
+        #   head C is bypassed entirely. 0.30 lets head C dampen by ~70% at
+        #   most, keeping the consensus from collapsing on borderline days.
+        # day_quality_weight: exponent applied to head C in the geo-mean.
+        #   The fused score = (p_a * p_b * p_dq_eff^w)^(1/(2+w)). w=0 is
+        #   plain two-head recency_consensus; w=1 weights C equally with A,B;
+        #   w=2 makes C dominant. Train mode should search [0.0, 2.5].
+        self._params = dict(
+            max_depth=int(max_depth),
+            learning_rate=float(learning_rate),
+            n_estimators=int(n_estimators),
+            subsample=float(subsample),
+            colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha),
+            reg_lambda=float(reg_lambda),
+            min_child_weight=float(min_child_weight),
+            gamma=float(gamma),
+            magnitude_scale=float(magnitude_scale),
+            base_weight=float(base_weight),
+            pos_class_weight=float(pos_class_weight),
+            recency_halflife_days=float(recency_halflife_days),
+            min_recent_weight=float(min_recent_weight),
+            day_quality_floor=float(day_quality_floor),
+            day_quality_weight=float(day_quality_weight),
+            early_stopping_rounds=int(early_stopping_rounds),
+            random_state=int(random_state),
+        )
+        self.clf_full = None
+        self.clf_recent = None
+        self.reg_dq = None
+        self._best_iteration_full = None
+        self._best_iteration_recent = None
+        self._best_iteration_dq = None
+
+    def _build_magnitude_weights(self, pnl):
+        p = self._params
+        pnl_arr = np.asarray(pnl, dtype=np.float64)
+        raw = np.abs(pnl_arr) * p['magnitude_scale'] + p['base_weight']
+        m = raw.mean()
+        if m <= 0:
+            return np.ones_like(raw, dtype=np.float32)
+        return (raw / m).astype(np.float32)
+
+    @staticmethod
+    def _to_ordinal(dates) -> np.ndarray:
+        arr = np.asarray(dates)
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return arr.astype('datetime64[D]').astype(np.int64).astype(np.float64)
+        try:
+            import pandas as pd
+            ts = pd.to_datetime(arr)
+            return ts.values.astype('datetime64[D]').astype(np.int64).astype(np.float64)
+        except Exception:
+            return np.arange(len(arr), dtype=np.float64)
+
+    def _build_recency_weights(self, dates, ref_day: float) -> np.ndarray:
+        p = self._params
+        days = self._to_ordinal(dates)
+        age = np.maximum(0.0, ref_day - days)
+        halflife = max(1.0, p['recency_halflife_days'])
+        w = np.power(0.5, age / halflife)
+        w = np.maximum(w, p['min_recent_weight'])
+        return w.astype(np.float32)
+
+    @staticmethod
+    def _per_date_mean(dates, values) -> np.ndarray:
+        """Broadcast per-date mean(values) back onto each row. Constant
+        within a date so regressors can only fit it via day-level features."""
+        dates_arr = np.asarray(dates)
+        v_arr = np.asarray(values, dtype=np.float64)
+        try:
+            import pandas as pd
+            s = pd.Series(v_arr).groupby(pd.Series(dates_arr)).transform('mean')
+            return s.values.astype(np.float32)
+        except Exception:
+            sums: dict = {}
+            counts: dict = {}
+            for d, v in zip(dates_arr, v_arr):
+                sums[d] = sums.get(d, 0.0) + float(v)
+                counts[d] = counts.get(d, 0) + 1
+            means = {d: sums[d] / counts[d] for d in sums}
+            return np.asarray([means[d] for d in dates_arr], dtype=np.float32)
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val for strict-win '
+                'labels and magnitude weighting.')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for '
+                'recency weighting and day-quality supervision.')
+
+        p = self._params
+
+        y_tr_strict = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va_strict = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr_strict)) < 2:
+            raise ValueError('Train set has only one class after strict-win — fit aborted')
+
+        mag_tr = self._build_magnitude_weights(pnl_train)
+        mag_va = self._build_magnitude_weights(pnl_val)
+
+        days_tr = self._to_ordinal(dates_train)
+        days_va = self._to_ordinal(dates_val)
+        ref_day = float(max(days_tr.max(), days_va.max()))
+        rec_tr = self._build_recency_weights(dates_train, ref_day)
+        rec_va = self._build_recency_weights(dates_val, ref_day)
+
+        comb_tr = mag_tr * rec_tr
+        m_tr = comb_tr.mean()
+        if m_tr > 0:
+            comb_tr = (comb_tr / m_tr).astype(np.float32)
+        comb_va = mag_va * rec_va
+        m_va = comb_va.mean()
+        if m_va > 0:
+            comb_va = (comb_va / m_va).astype(np.float32)
+
+        # Head-C target: per-DATE mean strict-win rate, broadcast to rows.
+        # Constant within a date → only day-level features can fit it.
+        dq_tr = self._per_date_mean(dates_train, y_tr_strict)
+        dq_va = self._per_date_mean(dates_val, y_va_strict)
+
+        cls_kw = dict(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            scale_pos_weight=p['pos_class_weight'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='binary:logistic',
+            eval_metric='logloss',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+
+        self.clf_full = xgb.XGBClassifier(
+            random_state=p['random_state'],
+            **cls_kw,
+        )
+        self.clf_full.fit(
+            np.asarray(X_train), y_tr_strict,
+            sample_weight=mag_tr,
+            eval_set=[(np.asarray(X_val), y_va_strict)],
+            sample_weight_eval_set=[mag_va],
+            verbose=verbose,
+        )
+        self._best_iteration_full = (getattr(self.clf_full, 'best_iteration', None)
+                                      or p['n_estimators'])
+
+        self.clf_recent = xgb.XGBClassifier(
+            random_state=p['random_state'] + 7,
+            **cls_kw,
+        )
+        self.clf_recent.fit(
+            np.asarray(X_train), y_tr_strict,
+            sample_weight=comb_tr,
+            eval_set=[(np.asarray(X_val), y_va_strict)],
+            sample_weight_eval_set=[comb_va],
+            verbose=verbose,
+        )
+        self._best_iteration_recent = (getattr(self.clf_recent, 'best_iteration', None)
+                                        or p['n_estimators'])
+
+        # Head C: regressor supervised by per-date mean WR. reg:logistic
+        # keeps output in (0,1), aligning naturally with the geo-mean fold.
+        reg_kw = dict(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='reg:logistic',
+            eval_metric='rmse',
+            early_stopping_rounds=p['early_stopping_rounds'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.reg_dq = xgb.XGBRegressor(
+            random_state=p['random_state'] + 13,
+            **reg_kw,
+        )
+        eps = 1e-3
+        dq_tr_clip = np.clip(dq_tr, eps, 1.0 - eps).astype(np.float32)
+        dq_va_clip = np.clip(dq_va, eps, 1.0 - eps).astype(np.float32)
+        self.reg_dq.fit(
+            np.asarray(X_train), dq_tr_clip,
+            eval_set=[(np.asarray(X_val), dq_va_clip)],
+            verbose=verbose,
+        )
+        self._best_iteration_dq = (getattr(self.reg_dq, 'best_iteration', None)
+                                    or p['n_estimators'])
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf_full is None or self.clf_recent is None or self.reg_dq is None:
+            raise RuntimeError('Model not fit')
+        X_arr = np.asarray(X)
+        p_full = self.clf_full.predict_proba(X_arr)[:, 1]
+        p_recent = self.clf_recent.predict_proba(X_arr)[:, 1]
+        p_dq = np.clip(self.reg_dq.predict(X_arr), 0.0, 1.0)
+        floor = self._params['day_quality_floor']
+        w = self._params['day_quality_weight']
+        p_dq_eff = floor + (1.0 - floor) * p_dq
+        eps = 1e-7
+        # Weighted geo-mean: (p_a * p_b * p_dq_eff^w)^(1/(2+w)).
+        log_score = (np.log(np.clip(p_full, eps, 1.0))
+                     + np.log(np.clip(p_recent, eps, 1.0))
+                     + w * np.log(np.clip(p_dq_eff, eps, 1.0)))
+        return np.exp(log_score / (2.0 + w))
+
+    @property
+    def best_iteration(self):
+        if self._best_iteration_full is None:
+            return None
+        return max(
+            self._best_iteration_full,
+            self._best_iteration_recent or 0,
+            self._best_iteration_dq or 0,
+        )
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -6022,6 +6321,7 @@ TRAINERS = {
     'xgb_rank_fusion': XGBoostRankFusionTrainer,
     'xgb_regime_blend': XGBoostRegimeBlendTrainer,
     'xgb_recency_consensus': XGBoostRecencyConsensusTrainer,
+    'xgb_day_quality_consensus': XGBoostDayQualityConsensusTrainer,
     # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
 }
 
