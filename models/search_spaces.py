@@ -825,6 +825,26 @@ SEARCH_SPACES: dict[str, dict] = {
         'patience':           [3, 4, 6],
         'pos_class_weight':   (1.0, 3.5),
     },
+    # Iter #712 — Transformer encoder over time + learnable [CLS] token.
+    # `d_model` choices are all divisible by every `nhead` choice (48 % 4,
+    # 64 % 4, 64 % 8, 96 % 4, 96 % 8, 128 % 4, 128 % 8 all clean) so the
+    # constructor's clamp never triggers under sampled configs. Higher
+    # dropout floor than GRU (0.20 vs 0.10) since attention has more
+    # capacity and iter #711's failure mode was over-aggressive predictions
+    # (WR 14-37%, never DD-bound) — the prior is "regularise harder".
+    'torch_seq_transformer': {
+        'd_model':            [48, 64, 96, 128],
+        'nhead':              [4, 8],
+        'num_layers':         [1, 2, 3],
+        'dim_feedforward':    [96, 128, 192, 256],
+        'dropout':            (0.20, 0.50),
+        'learning_rate':      (3e-4, 2e-3),
+        'weight_decay':       (1e-5, 1e-3),
+        'batch_size':         [256, 512, 1024],
+        'max_epochs':         [8, 12, 16],
+        'patience':           [3, 4, 6],
+        'pos_class_weight':   (1.0, 3.5),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

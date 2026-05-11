@@ -6742,6 +6742,260 @@ class TorchSeqGRUTrainer(BaseTrainer):
         return inst
 
 
+# Iter #712 — Transformer encoder over the time dimension, second
+# `consumes_sequences=True` trainer (after #711 torch_seq_gru).
+#
+# Diagnosis from last-20-iter cross-tab: W7 (test 2026-01..05) has 0/20
+# passes, avg_wr 30.9%, avg_ann -15%; W4/W5 chronic. Iter #711 torch_seq_gru
+# delivered massive ANN signal on W6 (+96%) / W7 (+75%) but ALL failures
+# were WR-bound (14-37%), never DD-bound. Regime stats show W7 is actually
+# a +15% bull market with 8% vol — failure cannot be blamed on a hostile
+# regime, so the GRU's last-hidden-state compression is dropping the
+# selectivity signal mid-sequence.
+#
+# Hypothesis: a Transformer encoder reads the full (B, T, F) sequence via
+# self-attention and pools through a learnable [CLS] token. Unlike the GRU
+# which sequentially compresses, attention can identify the single timestep
+# inside the 20-day window where a regime flip occurred (breadth drop,
+# foreign-flow inversion, vol acceleration). Different inductive bias from
+# everything in the registry: GBDT/XGB-loss variants (aggregated tabular),
+# torch_attentive_mlp (feature-gated MLP, no time axis), torch_seq_gru
+# (recurrent compression to last state).
+#
+# Architecture (small, CPU-friendly, ~3× GRU param count at same d_model):
+#   Linear(F → D) per timestep → x_proj  (B, T, D)
+#   prepend learnable [CLS] token       → (B, T+1, D)
+#   add learnable positional embedding  (1, T+1, D)
+#   N-layer nn.TransformerEncoder (H heads, GELU FFN, dropout)
+#   read [CLS] embedding                → (B, D)
+#   LayerNorm → Linear(D → D/2) → GELU → Dropout → Linear(D/2 → 1)
+# Loss: BCEWithLogitsLoss(pos_weight)
+# Optim: AdamW + CosineAnnealingLR; early-stop on val ROC-AUC, patience=4.
+class TorchSeqTransformerTrainer(BaseTrainer):
+    name = 'torch_seq_transformer'
+    consumes_sequences = True
+
+    def __init__(self,
+                 d_model: int = 48,
+                 nhead: int = 4,
+                 num_layers: int = 2,
+                 dim_feedforward: int = 128,
+                 dropout: float = 0.35,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 max_epochs: int = 12,
+                 patience: int = 4,
+                 pos_class_weight: float = 2.0,
+                 random_state: int = 42):
+        self._params = dict(
+            d_model=int(d_model),
+            nhead=int(nhead),
+            num_layers=int(num_layers),
+            dim_feedforward=int(dim_feedforward),
+            dropout=float(dropout),
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay),
+            batch_size=int(batch_size),
+            max_epochs=int(max_epochs),
+            patience=int(patience),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.net = None
+        self._best_epoch = None
+        self._n_features = None
+        self._seq_len = None
+
+    def _build_net(self, n_features, seq_len):
+        import torch
+        import torch.nn as nn
+        p = self._params
+        # d_model must be divisible by nhead; clamp if mis-sampled.
+        d = p['d_model']
+        h = p['nhead']
+        if d % h != 0:
+            d = (d // h) * h
+            if d <= 0:
+                d = h
+            p['d_model'] = d
+
+        class SeqTransformer(nn.Module):
+            def __init__(self, F, T, D, H, L, FF, dp):
+                super().__init__()
+                self.proj = nn.Linear(F, D)
+                self.cls = nn.Parameter(torch.zeros(1, 1, D))
+                nn.init.normal_(self.cls, std=0.02)
+                self.pos = nn.Parameter(torch.zeros(1, T + 1, D))
+                nn.init.normal_(self.pos, std=0.02)
+                enc_layer = nn.TransformerEncoderLayer(
+                    d_model=D, nhead=H, dim_feedforward=FF,
+                    dropout=dp, activation='gelu', batch_first=True,
+                    norm_first=True)
+                self.encoder = nn.TransformerEncoder(enc_layer, num_layers=L)
+                self.norm = nn.LayerNorm(D)
+                self.drop = nn.Dropout(dp)
+                self.head = nn.Sequential(
+                    nn.Linear(D, max(8, D // 2)), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(max(8, D // 2), 1),
+                )
+
+            def forward(self, x):
+                # x: (B, T, F)
+                B = x.size(0)
+                z = self.proj(x)                                # (B, T, D)
+                cls = self.cls.expand(B, -1, -1)                # (B, 1, D)
+                z = torch.cat([cls, z], dim=1)                  # (B, T+1, D)
+                z = z + self.pos                                # broadcast pos
+                z = self.encoder(z)                             # (B, T+1, D)
+                cls_out = self.norm(z[:, 0, :])                 # (B, D)
+                cls_out = self.drop(cls_out)
+                return self.head(cls_out).squeeze(-1)
+
+        return SeqTransformer(
+            n_features, seq_len, p['d_model'], p['nhead'],
+            p['num_layers'], p['dim_feedforward'], p['dropout'])
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'torch_seq_transformer expects 3D sequence input (N, T, F); '
+                f'got shape {X_train.shape}. The gate must thread X_seq.')
+        if len(set(y_train)) < 2 or len(set(y_val)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        torch.manual_seed(p['random_state'])
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        Xt = np.clip(Xt, -8.0, 8.0)
+        Xv = np.clip(Xv, -8.0, 8.0)
+        yt = np.asarray(y_train, dtype=np.float32)
+        yv = np.asarray(y_val, dtype=np.float32)
+        self._n_features = Xt.shape[-1]
+        self._seq_len = Xt.shape[1]
+        self.net = self._build_net(self._n_features, self._seq_len)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net.to(device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([p['pos_class_weight']], device=device))
+        opt = torch.optim.AdamW(self.net.parameters(),
+                                lr=p['learning_rate'],
+                                weight_decay=p['weight_decay'])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=p['max_epochs'])
+
+        ds = TensorDataset(torch.from_numpy(Xt), torch.from_numpy(yt))
+        dl = DataLoader(ds, batch_size=p['batch_size'], shuffle=True,
+                        drop_last=False)
+        Xv_t = torch.from_numpy(Xv).to(device)
+
+        best_auc = -1.0
+        best_state = None
+        bad = 0
+        for epoch in range(p['max_epochs']):
+            self.net.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = self.net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            sched.step()
+            self.net.eval()
+            with torch.no_grad():
+                vl = torch.sigmoid(self.net(Xv_t)).cpu().numpy()
+            auc = _auc_safe(yv, vl)
+            if verbose:
+                print(f'  ep{epoch:02d} val_auc={auc:.4f}')
+            if auc > best_auc + 1e-4:
+                best_auc = auc
+                best_state = {k: v.detach().clone() for k, v in
+                              self.net.state_dict().items()}
+                self._best_epoch = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['patience']:
+                    break
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if self.net is None:
+            raise RuntimeError('Model not fit')
+        if X.ndim != 3:
+            raise ValueError(
+                f'torch_seq_transformer.predict_proba expects 3D input '
+                f'(N, T, F); got shape {X.shape}.')
+        device = next(self.net.parameters()).device
+        X = np.asarray(X, dtype=np.float32)
+        X = np.clip(X, -8.0, 8.0)
+        self.net.eval()
+        with torch.no_grad():
+            logits = self.net(torch.from_numpy(X).to(device))
+            return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+
+    @property
+    def best_iteration(self):
+        return self._best_epoch
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pt')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        torch.save({'state_dict': self.net.state_dict(),
+                    'n_features': self._n_features,
+                    'seq_len': self._seq_len}, model_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_epoch': self._best_epoch,
+            'n_features': self._n_features,
+            'seq_len': self._seq_len,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pt')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst._seq_len = meta.get('seq_len')
+        inst.net = inst._build_net(inst._n_features, inst._seq_len)
+        state = torch.load(model_path, weights_only=True)
+        inst.net.load_state_dict(state['state_dict'])
+        inst._best_epoch = meta.get('best_epoch')
+        return inst
+
+
 # --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
@@ -6778,6 +7032,7 @@ TRAINERS = {
     'xgb_day_quality_consensus': XGBoostDayQualityConsensusTrainer,
     'torch_attentive_mlp': TorchAttentiveMLPTrainer,
     'torch_seq_gru': TorchSeqGRUTrainer,
+    'torch_seq_transformer': TorchSeqTransformerTrainer,
 }
 
 

@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from xgb_day_quality_consensus (20-iter sweep #691-710 saturated at avg_ann ~0%, only iter #688's xgb_recency_consensus hit 5/7 +27%). torch_seq_gru default produced 1/7 +22% \u2014 comparable on windows passed but +22pp in avg_ann, and crucially is the first non-tabular trainer (consumes_sequences=True). W3 +122% / W6 +96% / W7 +75% prove the temporal inductive bias finds signal the XGB-aggregate family cannot. Failures are all WR<40% (model is too aggressive) \u2014 train mode should sweep pos_class_weight \u2208 [1.0, 3.5] and dropout \u2208 [0.25, 0.45] to trade selectivity for win quality. Even modest WR lift on W3/W6/W7 (3.5pp each) would push 4/7 windows over the per-window gate.",
-  "claude_iter_id": 711,
-  "designated_at": "2026-05-11T21:08:23"
+  "rationale": "torch_seq_transformer at default HPs underperforms torch_seq_gru (0/7 vs 1/7, avg_ann -7.6% vs +0%, avg_wr 29% vs 33%) \u2014 more attention-capacity made selectivity WORSE, not better. The negative finding is that the WR bottleneck is general across sequence-model families, not GRU-specific. Keep the prior GRU sweep on pos_class_weight / dropout \u2014 those knobs directly target the diagnosed WR-bound failure mode and the GRU's smaller capacity is acting as helpful regularization.",
+  "claude_iter_id": 712,
+  "designated_at": "2026-05-12T00:20:47"
 }
