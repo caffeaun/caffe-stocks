@@ -6289,6 +6289,460 @@ class XGBoostDayQualityConsensusTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Torch Attentive MLP — first NN-family trainer post-pyc loss
+# --------------------------------------------------------------------- #
+# Diagnosis (claude iter following #700): across the last 20 iter the XGB
+# family plateaus on bear/choppy windows — W4 (avg ann -16.8%), W5
+# (-29.0%), W7 (-16.6%) — while W6 (bull, +85.1% avg ann) passes 13/20.
+# W5 corresponds to SET -9.7% Jan–Apr 2025 with breadth 0.32, the deepest
+# bear in the panel. With 30+ XGB-loss variants and several thousand HP
+# samples, the failure pattern is regime-shaped, not loss-shaped: piecewise
+# constant tree boundaries cluster around the same losing patterns when the
+# regime flips, and the registry has no NN inductive bias to compare
+# against (the torch_* trainers from earlier iterations were lost when
+# trainers.py was rebuilt and only the .pyc remained — see iter #696 data
+# request).
+#
+# Hypothesis: a small MLP with a *sample-level feature-attention gate*
+# (sigmoid mask over the 92 aggregated features, learned per row) lets the
+# network down-weight features that mislead in bear regimes (high
+# momentum / high volume look like wins in bull but get faded in bear)
+# while keeping useful ones (atr_pct, market_breadth_*). This is the
+# minimal "TabNet-style" gating that fits in a 30-min wall budget without
+# new package dependencies. Cross-feature smoothness (NN) plus per-sample
+# masking (gate) gives XGB-orthogonal coverage of the same input space.
+#
+# Architecture (parameters small to keep CPU training under ~30s/window):
+#   Linear(F → 128) + GELU + Dropout → context z
+#   Linear(z → F) → sigmoid → feature gate g (per-sample, per-feature)
+#   x' = x * g (Hadamard); Linear(F → 128) + GELU + Dropout
+#   Linear(128 → 64) + GELU + Dropout → Linear(64 → 1) → logit
+# Loss: BCEWithLogitsLoss(pos_weight=pos_class_weight)
+# Optim: AdamW, cosine schedule, early-stop on val ROC-AUC patience=5.
+class TorchAttentiveMLPTrainer(BaseTrainer):
+    name = 'torch_attentive_mlp'
+
+    def __init__(self,
+                 hidden_dim: int = 128,
+                 bottleneck_dim: int = 64,
+                 dropout: float = 0.3,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 max_epochs: int = 40,
+                 patience: int = 6,
+                 pos_class_weight: float = 2.0,
+                 random_state: int = 42):
+        self._params = dict(
+            hidden_dim=int(hidden_dim),
+            bottleneck_dim=int(bottleneck_dim),
+            dropout=float(dropout),
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay),
+            batch_size=int(batch_size),
+            max_epochs=int(max_epochs),
+            patience=int(patience),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.net = None
+        self._best_epoch = None
+        self._n_features = None
+
+    def _build_net(self, n_features):
+        import torch
+        import torch.nn as nn
+        p = self._params
+
+        class AttentiveMLP(nn.Module):
+            def __init__(self, F, H, B, dp):
+                super().__init__()
+                self.ctx = nn.Sequential(
+                    nn.Linear(F, H), nn.GELU(), nn.Dropout(dp),
+                )
+                self.gate = nn.Linear(H, F)
+                self.head = nn.Sequential(
+                    nn.Linear(F, H), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(H, B), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(B, 1),
+                )
+
+            def forward(self, x):
+                z = self.ctx(x)
+                g = torch.sigmoid(self.gate(z))
+                return self.head(x * g).squeeze(-1)
+
+        return AttentiveMLP(n_features, p['hidden_dim'],
+                            p['bottleneck_dim'], p['dropout'])
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        if len(set(y_train)) < 2 or len(set(y_val)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        # 92-dim input × small MLP — OMP overhead dominates on >4 threads.
+        # Pin to 4 to keep per-window wall-time predictable under the 30 min budget.
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        torch.manual_seed(p['random_state'])
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        # Clip very large standardized values to keep tanh/sigmoid gradients sane
+        Xt = np.clip(Xt, -8.0, 8.0)
+        Xv = np.clip(Xv, -8.0, 8.0)
+        yt = np.asarray(y_train, dtype=np.float32)
+        yv = np.asarray(y_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+        self.net = self._build_net(self._n_features)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net.to(device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([p['pos_class_weight']], device=device))
+        opt = torch.optim.AdamW(self.net.parameters(),
+                                lr=p['learning_rate'],
+                                weight_decay=p['weight_decay'])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=p['max_epochs'])
+
+        ds = TensorDataset(torch.from_numpy(Xt), torch.from_numpy(yt))
+        dl = DataLoader(ds, batch_size=p['batch_size'], shuffle=True,
+                        drop_last=False)
+        Xv_t = torch.from_numpy(Xv).to(device)
+        yv_t = torch.from_numpy(yv).to(device)
+
+        best_auc = -1.0
+        best_state = None
+        bad = 0
+        for epoch in range(p['max_epochs']):
+            self.net.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = self.net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            sched.step()
+            # Val AUC
+            self.net.eval()
+            with torch.no_grad():
+                vl = torch.sigmoid(self.net(Xv_t)).cpu().numpy()
+            auc = _auc_safe(yv, vl)
+            if verbose:
+                print(f'  ep{epoch:02d} val_auc={auc:.4f}')
+            if auc > best_auc + 1e-4:
+                best_auc = auc
+                best_state = {k: v.detach().clone() for k, v in
+                              self.net.state_dict().items()}
+                self._best_epoch = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['patience']:
+                    break
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if self.net is None:
+            raise RuntimeError('Model not fit')
+        device = next(self.net.parameters()).device
+        X = np.asarray(X, dtype=np.float32)
+        X = np.clip(X, -8.0, 8.0)
+        self.net.eval()
+        with torch.no_grad():
+            logits = self.net(torch.from_numpy(X).to(device))
+            return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+
+    @property
+    def best_iteration(self):
+        return self._best_epoch
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pt')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        torch.save({'state_dict': self.net.state_dict(),
+                    'n_features': self._n_features}, model_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_epoch': self._best_epoch,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pt')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst.net = inst._build_net(inst._n_features)
+        state = torch.load(model_path, weights_only=True)
+        inst.net.load_state_dict(state['state_dict'])
+        inst._best_epoch = meta.get('best_epoch')
+        return inst
+
+
+def _auc_safe(y_true, y_score):
+    """ROC-AUC that returns 0.5 on degenerate input instead of raising."""
+    from sklearn.metrics import roc_auc_score
+    try:
+        if len(set(np.asarray(y_true).astype(int).tolist())) < 2:
+            return 0.5
+        return float(roc_auc_score(y_true, y_score))
+    except Exception:
+        return 0.5
+
+
+# Iter #711 — first trainer with `consumes_sequences = True`. Every existing
+# trainer (XGB / LightGBM / torch_attentive_mlp) trains on the 92-dim
+# aggregated tabular vector `[last, mean, std, last-mean]` produced by
+# `aggregate_sequence`. That projection collapses the 20-step temporal
+# trajectory into 4 summary statistics per feature — sufficient when the
+# signal is stationary, lossy when the test window is a regime shift.
+#
+# Diagnosis (last 20 iters, all `xgb_day_quality_consensus`): W4 (test
+# 2024-09..12) avg_ann=-22% / pass=4/20 and W5 (test 2025-01..04)
+# avg_ann=-23% / pass=4/20 are chronic failures across every HP setting.
+# Both test slices follow bull-ish training periods and contain a clear
+# regime flip mid-window. The tabular aggregator throws away exactly the
+# temporal evolution signal a model would need to recognise that flip.
+#
+# Hypothesis: a small GRU that consumes the raw (N, 20, F) sequence can
+# read the temporal arc — accelerating volatility, breadth decay,
+# foreign-flow zscore trend — and produce regime-aware probabilities.
+# This is genuinely orthogonal inductive bias to the 30 GBDT / XGB-loss
+# variants already in the registry.
+#
+# Architecture (kept small for CPU + 30-min wall budget):
+#   GRU(F → H, 1 layer, batch_first) → take last hidden h_T
+#   LayerNorm(H) → Dropout → Linear(H → H//2) → GELU → Dropout
+#   Linear(H//2 → 1) → logit
+# Loss: BCEWithLogitsLoss(pos_weight=pos_class_weight)
+# Optim: AdamW + cosine, early-stop on val ROC-AUC, patience=4.
+class TorchSeqGRUTrainer(BaseTrainer):
+    name = 'torch_seq_gru'
+    consumes_sequences = True
+
+    def __init__(self,
+                 hidden_dim: int = 64,
+                 dropout: float = 0.30,
+                 learning_rate: float = 1.5e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 max_epochs: int = 12,
+                 patience: int = 4,
+                 pos_class_weight: float = 2.0,
+                 random_state: int = 42):
+        self._params = dict(
+            hidden_dim=int(hidden_dim),
+            dropout=float(dropout),
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay),
+            batch_size=int(batch_size),
+            max_epochs=int(max_epochs),
+            patience=int(patience),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.net = None
+        self._best_epoch = None
+        self._n_features = None
+        self._seq_len = None
+
+    def _build_net(self, n_features):
+        import torch
+        import torch.nn as nn
+        p = self._params
+
+        class SeqGRU(nn.Module):
+            def __init__(self, F, H, dp):
+                super().__init__()
+                self.gru = nn.GRU(input_size=F, hidden_size=H,
+                                  num_layers=1, batch_first=True)
+                self.norm = nn.LayerNorm(H)
+                self.drop = nn.Dropout(dp)
+                self.head = nn.Sequential(
+                    nn.Linear(H, max(8, H // 2)), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(max(8, H // 2), 1),
+                )
+
+            def forward(self, x):
+                # x: (B, T, F)
+                _, h_T = self.gru(x)            # h_T: (1, B, H)
+                z = self.norm(h_T.squeeze(0))   # (B, H)
+                z = self.drop(z)
+                return self.head(z).squeeze(-1)
+
+        return SeqGRU(n_features, p['hidden_dim'], p['dropout'])
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru expects 3D sequence input (N, T, F); got '
+                f'shape {X_train.shape}. The gate must thread X_seq, not '
+                f'aggregated X_tab.')
+        if len(set(y_train)) < 2 or len(set(y_val)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        torch.manual_seed(p['random_state'])
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        Xt = np.clip(Xt, -8.0, 8.0)
+        Xv = np.clip(Xv, -8.0, 8.0)
+        yt = np.asarray(y_train, dtype=np.float32)
+        yv = np.asarray(y_val, dtype=np.float32)
+        self._n_features = Xt.shape[-1]
+        self._seq_len = Xt.shape[1]
+        self.net = self._build_net(self._n_features)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net.to(device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([p['pos_class_weight']], device=device))
+        opt = torch.optim.AdamW(self.net.parameters(),
+                                lr=p['learning_rate'],
+                                weight_decay=p['weight_decay'])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=p['max_epochs'])
+
+        ds = TensorDataset(torch.from_numpy(Xt), torch.from_numpy(yt))
+        dl = DataLoader(ds, batch_size=p['batch_size'], shuffle=True,
+                        drop_last=False)
+        Xv_t = torch.from_numpy(Xv).to(device)
+
+        best_auc = -1.0
+        best_state = None
+        bad = 0
+        for epoch in range(p['max_epochs']):
+            self.net.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = self.net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            sched.step()
+            self.net.eval()
+            with torch.no_grad():
+                vl = torch.sigmoid(self.net(Xv_t)).cpu().numpy()
+            auc = _auc_safe(yv, vl)
+            if verbose:
+                print(f'  ep{epoch:02d} val_auc={auc:.4f}')
+            if auc > best_auc + 1e-4:
+                best_auc = auc
+                best_state = {k: v.detach().clone() for k, v in
+                              self.net.state_dict().items()}
+                self._best_epoch = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['patience']:
+                    break
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if self.net is None:
+            raise RuntimeError('Model not fit')
+        if X.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru.predict_proba expects 3D input (N, T, F); '
+                f'got shape {X.shape}.')
+        device = next(self.net.parameters()).device
+        X = np.asarray(X, dtype=np.float32)
+        X = np.clip(X, -8.0, 8.0)
+        self.net.eval()
+        with torch.no_grad():
+            logits = self.net(torch.from_numpy(X).to(device))
+            return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+
+    @property
+    def best_iteration(self):
+        return self._best_epoch
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pt')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        torch.save({'state_dict': self.net.state_dict(),
+                    'n_features': self._n_features,
+                    'seq_len': self._seq_len}, model_path)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_epoch': self._best_epoch,
+            'n_features': self._n_features,
+            'seq_len': self._seq_len,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pt')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst._seq_len = meta.get('seq_len')
+        inst.net = inst._build_net(inst._n_features)
+        state = torch.load(model_path, weights_only=True)
+        inst.net.load_state_dict(state['state_dict'])
+        inst._best_epoch = meta.get('best_epoch')
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -6322,7 +6776,8 @@ TRAINERS = {
     'xgb_regime_blend': XGBoostRegimeBlendTrainer,
     'xgb_recency_consensus': XGBoostRecencyConsensusTrainer,
     'xgb_day_quality_consensus': XGBoostDayQualityConsensusTrainer,
-    # 'neural': NeuralTrainer,  # add when v2 NN trainer lands
+    'torch_attentive_mlp': TorchAttentiveMLPTrainer,
+    'torch_seq_gru': TorchSeqGRUTrainer,
 }
 
 

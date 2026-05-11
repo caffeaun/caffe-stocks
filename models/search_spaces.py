@@ -795,6 +795,36 @@ SEARCH_SPACES: dict[str, dict] = {
         'day_quality_floor':      (0.05, 0.60),
         'day_quality_weight':     (0.25, 2.5),
     },
+    # First NN trainer post-pyc loss. The HP space is intentionally small so
+    # train mode can converge quickly. The two structural knobs that matter
+    # most are dropout (regularization vs underfit) and pos_class_weight
+    # (precision vs recall trade-off — XGB family converged around 1.5-3.5
+    # for this dataset).
+    'torch_attentive_mlp': {
+        'hidden_dim':         [64, 128, 256],
+        'bottleneck_dim':     [32, 64, 128],
+        'dropout':            (0.10, 0.50),
+        'learning_rate':      (5e-4, 3e-3),
+        'weight_decay':       (1e-5, 1e-3),
+        'batch_size':         [256, 512, 1024],
+        'max_epochs':         [30, 50, 80],
+        'patience':           [4, 6, 10],
+        'pos_class_weight':   (1.0, 4.0),
+    },
+    # Iter #711 — sequence-aware GRU. Consumes raw (N, 20, F) so the model
+    # can read temporal regime evolution rather than the 4-stat aggregate.
+    # Kept small (hidden ≤ 128, max_epochs ≤ 16) to fit per-window training
+    # under the 30-min wall budget across 7 walk-forward windows on CPU.
+    'torch_seq_gru': {
+        'hidden_dim':         [32, 48, 64, 96],
+        'dropout':            (0.10, 0.45),
+        'learning_rate':      (5e-4, 3e-3),
+        'weight_decay':       (1e-5, 1e-3),
+        'batch_size':         [256, 512, 1024],
+        'max_epochs':         [8, 12, 16],
+        'patience':           [3, 4, 6],
+        'pos_class_weight':   (1.0, 3.5),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

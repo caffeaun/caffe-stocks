@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_day_quality_consensus",
+  "trainer": "torch_seq_gru",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from xgb_recency_consensus (15-iter sweep #676-690 plateaued at iter #688's 5/7 ann +27.2%, no monotone improvement past that point \u2014 sweep is saturating its 14-dim HP space). New xgb_day_quality_consensus default 1/7 ann +1.1% is SIGNIFICANTLY higher than recency_consensus's own claude-default of 1/7 ann -28.8% \u2014 same window count but +30pp avg_ann lift unsweep. Adds two novel HP axes (day_quality_floor, day_quality_weight) that train mode hasn't probed. Default w=1.0 / floor=0.30 over-suppresses on bear test (W7 worsened from -9.8%\u2192-45.7%) but DOUBLES W3 ann (+21.9%\u2192+73.9%), showing head-C signal magnitude is real. Train mode should prioritize day_quality_weight \u2208 [0.25, 0.75] with day_quality_floor \u2208 [0.40, 0.60] (gentler head-C influence) \u2014 that subspace is where the auxiliary head adds regularization without overwhelming the recency-based core. If no HP combo beats recency_consensus's iter #688 5/7 after 10-15 sweep iters, next claude iter should pivot back.",
-  "claude_iter_id": 691,
-  "designated_at": "2026-05-11T15:18:16"
+  "rationale": "Pivot from xgb_day_quality_consensus (20-iter sweep #691-710 saturated at avg_ann ~0%, only iter #688's xgb_recency_consensus hit 5/7 +27%). torch_seq_gru default produced 1/7 +22% \u2014 comparable on windows passed but +22pp in avg_ann, and crucially is the first non-tabular trainer (consumes_sequences=True). W3 +122% / W6 +96% / W7 +75% prove the temporal inductive bias finds signal the XGB-aggregate family cannot. Failures are all WR<40% (model is too aggressive) \u2014 train mode should sweep pos_class_weight \u2208 [1.0, 3.5] and dropout \u2208 [0.25, 0.45] to trade selectivity for win quality. Even modest WR lift on W3/W6/W7 (3.5pp each) would push 4/7 windows over the per-window gate.",
+  "claude_iter_id": 711,
+  "designated_at": "2026-05-11T21:08:23"
 }
