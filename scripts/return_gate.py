@@ -39,15 +39,27 @@ BASE_PATH = os.path.expanduser('~/projects/caffe-stocks')
 # Walk-forward calendar splits. Train/test pairs covering 2023-05 → 2026-04.
 # Each test window is 4–6 months. We annualize per-window so the goal is
 # evaluated consistently regardless of window length.
+def _rolling_recent_split() -> tuple:
+    """W7: 6 mo train ending 2025-12-31; test from 2026-01-01 to today.
+
+    Test_end is computed at module load so the recent window naturally
+    rolls forward as data ingests. Functionally a monthly rolling
+    cross-validation slice — every iteration sees the freshest regime
+    instead of a fixed 2025-09..2026-02 slice that gets stale.
+    """
+    from datetime import date as _date
+    return ('2025-07-01', '2025-12-31', '2026-01-01', _date.today().isoformat())
+
+
 SPLIT_DEFS = [
     # (train_start, train_end,        test_start, test_end)
-    ('2023-05-01', '2023-10-31', '2023-11-01', '2024-02-28'),  # 4 mo test
-    ('2023-07-01', '2023-12-31', '2024-01-01', '2024-04-30'),
-    ('2023-11-01', '2024-04-30', '2024-05-01', '2024-08-31'),
-    ('2024-03-01', '2024-08-31', '2024-09-01', '2024-12-31'),
-    ('2024-07-01', '2024-12-31', '2025-01-01', '2025-04-30'),
-    ('2024-11-01', '2025-04-30', '2025-05-01', '2025-08-31'),
-    ('2025-03-01', '2025-08-31', '2025-09-01', '2026-02-28'),
+    ('2023-05-01', '2023-10-31', '2023-11-01', '2024-02-28'),  # W1 — 4mo test
+    ('2023-07-01', '2023-12-31', '2024-01-01', '2024-04-30'),  # W2
+    ('2023-11-01', '2024-04-30', '2024-05-01', '2024-08-31'),  # W3
+    ('2024-03-01', '2024-08-31', '2024-09-01', '2024-12-31'),  # W4
+    ('2024-07-01', '2024-12-31', '2025-01-01', '2025-04-30'),  # W5
+    ('2024-11-01', '2025-04-30', '2025-05-01', '2025-08-31'),  # W6
+    _rolling_recent_split(),                                    # W7 — rolling recent
 ]
 
 # v1 gate (whitepaper §9). Per-window has no ann_return floor — the absolute
@@ -88,6 +100,8 @@ def is_candidate(windows: list[dict], prior_best_ann: 'float | None') -> bool:
     if prior_best_ann is None:
         return avg_ann > 0.0
     return avg_ann > prior_best_ann
+
+
 
 # Score threshold for entry. 0.5 is the model's natural decision boundary;
 # higher = more selective. We try a small grid per window to give the trader

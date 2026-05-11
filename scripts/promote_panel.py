@@ -42,10 +42,13 @@ PANEL_DIR = BASE / 'models' / 'panel'
 
 
 def select_top_candidates(k: int = 3, days: int = 30) -> list[dict]:
-    """Top-k by WR, current-registry trainers only, gate_passed not required.
+    """Top-k by WR, **one per trainer family**, current-registry only,
+    gate_passed not required.
 
-    Dedupes on (trainer, hyperparams) so the same model with the same HPs
-    can't take two slots.
+    Diversity matters more than marginal WR: 3 distinct families produce
+    uncorrelated drawdowns. 3 of the same family ride the same regime
+    failure into the ground together. So dedupe on `trainer` alone, not
+    on (trainer, hyperparams).
     """
     fb.init_db()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
@@ -60,15 +63,14 @@ def select_top_candidates(k: int = 3, days: int = 30) -> list[dict]:
               AND trainer IN ({valid_trainers})
               AND total_trades > 0
             ORDER BY avg_win_rate DESC, avg_max_dd ASC
-            LIMIT 50
+            LIMIT 100
         """, (cutoff,)).fetchall()
-    seen = set()
+    seen_families = set()
     out = []
     for r in rows:
-        sig = (r['trainer'], r['hyperparams'])
-        if sig in seen:
+        if r['trainer'] in seen_families:
             continue
-        seen.add(sig)
+        seen_families.add(r['trainer'])
         out.append(dict(r))
         if len(out) == k:
             break
@@ -173,6 +175,14 @@ def main():
         print(f'\n=== production_panel updated ({len(new_panel)} rows) ===')
         for row in new_panel:
             print(f"  rank {row['rank']}  iter#{row['iteration_id']}  {row['trainer']}")
+        # Sync paper-trade portfolios — keeps current_capital intact, only
+        # updates (iteration_id, trainer) so daily summary labels correctly.
+        try:
+            from scripts import paper_book
+            paper_book.update_panel_metadata()
+            print('paper_portfolios metadata refreshed')
+        except Exception as e:
+            print(f'paper_book.update_panel_metadata failed: {e!r}')
     else:
         print('\nNo candidates trained successfully — panel unchanged.')
 

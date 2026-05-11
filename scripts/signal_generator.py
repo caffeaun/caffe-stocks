@@ -296,12 +296,41 @@ def format_telegram(signals: list[dict], latest_date: str, n_symbols: int,
     return '\n'.join(lines)
 
 
+def _record_paper_signals(signals: list[dict]) -> None:
+    """Persist each emit as a paper-trade signal — one per panel rank, no
+    dedup (3 ranks → 3 signaled rows even if same symbol). The morning
+    fill script (paper_trade_fill.py) picks them up at next-day open.
+    Telegram alerts on individual trades are intentionally suppressed —
+    only the end-of-day paper_trade_summary.py message goes out.
+    """
+    if not signals:
+        return
+    try:
+        from scripts import paper_book
+    except Exception as e:
+        print(f'paper_book import failed; skipping paper-trade record: {e}',
+              file=sys.stderr)
+        return
+    for s in signals:
+        try:
+            paper_book.record_signal(
+                portfolio_rank=int(s['rank']),
+                signal_date=s['date'],
+                symbol=s['symbol'],
+                entry_score=float(s.get('score', 0)),
+            )
+        except Exception as e:
+            print(f'paper_book.record_signal failed for {s.get("symbol")}: {e}',
+                  file=sys.stderr)
+
+
 def main():
     if not _system_active():
         print('Skipping signal generation: system status is not active')
         return
     signals, latest_date, n_symbols, panel, rule_pass = generate_signals()
     signals = _enrich_with_price(signals, latest_date)
+    _record_paper_signals(signals)
     print(format_telegram(signals, latest_date, n_symbols, panel, rule_pass))
 
 

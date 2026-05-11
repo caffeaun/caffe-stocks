@@ -135,3 +135,10 @@ PYEOF
 echo "Message: $MSG"
 send_telegram "$MSG"
 echo "Sent OK"
+
+# v1 paper-trade panel: evaluate exits on all open paper trades. Silent —
+# no per-trade Telegram alerts. The daily summary at 20:30 reports outcomes.
+echo "--- paper_trade_exit ---"
+export PYTHONPATH="$HOME/projects/caffe-stocks"
+"$PYTHON" "$HOME/projects/caffe-stocks/scripts/paper_trade_exit.py" || \
+    echo "WARN: paper_trade_exit.py failed"

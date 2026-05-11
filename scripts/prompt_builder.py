@@ -151,17 +151,45 @@ Do NOT submit a "decompile the .pyc" data request — git history is the canonic
 {open_requests}
 
 ==================================================================
-6. YOUR JOB — pick ONE of these to do this iteration
+6. YOUR JOB — diagnose first, then change (evidence-backed)
 ==================================================================
 
-A. Add a new trainer to models/trainers.py (any algorithm family — trees, LSTM/Transformer, LoRA/QLoRA on a foundation model, RL, ensemble, anything from a recent paper). Then add the search space in models/search_spaces.py and a sample HP config to test.
-B. Modify models/feature_eng.py — add/drop features. Don't change CURATED_FEATURES casually; the comment block explains why each feature is there.
-C. Modify models/labels.py — change the label definition or friction model. The current COMMISSION_PCT (1.1%) is conservative — real BLS rate is closer to 0.4%.
-D. Modify models/sequence_loader.py — change data prep, add augmentation.
-E. Modify scripts/return_gate.py gate criteria — only if you can defend the change against ml-training.md §9.
-F. Submit a data request via scripts/feedback.py log_data_request — when no code change can help (e.g., need more historical data, need foreign-flow data, etc.).
+Reality check: the loop has 30+ trainers and hundreds of iterations, 0 gate-passing. Adding more trainers without evidence is no longer the highest-EV move — the marginal trainer adds noise to the registry and confusion to the panel. Every run MUST start with diagnosis. The structural change (if any) must cite that diagnosis.
 
-You may use WebSearch / WebFetch to research recent ML techniques (post-2024 papers, GitHub repos). The list of "trainer families in scope" in ml-loop.md is a starting point, not a cage.
+PART A — DIAGNOSE  (mandatory, must include all three in your JSON report)
+
+A.1. **Baselines** — what does a non-model strategy score on this same gate?
+   - `random_topk` baseline: for each test date, pick the top-K symbols by a uniformly random score; apply the gate. Run this once and report the 7-window result.
+   - `rule_only` baseline: select symbols where `atr/close > 0.03 AND volume_ratio > 2.0 AND 30 <= RSI <= 65 AND close >= 1.0`; the highest-`volume_ratio` symbol per date is the trade. Apply the gate.
+   - If your proposed model change can't clearly beat both baselines on at least 5/7 windows, it's noise and you should not propose it.
+   - You may reuse the baseline numbers across iterations if the underlying data hasn't changed materially — cache via `data/baselines.json` if helpful. Re-run them weekly.
+
+A.2. **Per-window regime stats** — for each of the 7 walk-forward TEST windows, compute on the test slice only:
+   - SET index return (close-on-close)
+   - SET volatility (20d realized std of returns)
+   - Market breadth (mean % of symbols above their 20d SMA, across the window)
+   - Foreign-flow direction (positive / negative aggregate net for the window)
+   Report a small table. Flag windows that look hostile (negative SET return + high vol + bearish foreign flow). This tells you whether failures are regime-correlated.
+
+A.3. **Failure pattern across last 20 iterations** — query feedback DB. Cross-tab `trainer × window`: which windows consistently fail across trainers? If W1, W4, W5 fail in 18/20 recent runs regardless of trainer family, the bottleneck is in those regimes' data, not model architecture.
+
+PART B — PROPOSE ONE CHANGE  (must cite Part A evidence in `hypothesis`)
+
+  B.1. Add or modify a feature in models/feature_eng.py — cite a Part A finding that motivates it (e.g., "W1 has bearish foreign flow regime so I'm adding foreign_flow_5d_zscore").
+  B.2. Add a new trainer in models/trainers.py — encouraged when the new family represents a **genuinely different inductive bias** not present in the registry. The current registry (see §3) is heavy on XGBoost / LightGBM loss variants. Under-represented families that the loop has barely explored or never tried (a sample, not a fixed list):
+      - **NN families**: MLP / CNN / LSTM / Transformer / TabNet / FT-Transformer. The torch_* trainers from earlier iterations were lost and never rebuilt.
+      - **Self-supervised / unsupervised pretraining**: masked-reconstruction encoders on the full SET universe, autoencoder + downstream linear head, contrastive (SimCLR-style on time-series windows).
+      - **Foundation-model PEFT**: LoRA / QLoRA / IA3 over time-series foundation models (Chronos, Lag-Llama, Moirai, TimeGPT).
+      - **RL**: PPO / DQN on the daily-close action space.
+      - **Bayesian / probabilistic**: Gaussian Process classifiers, MC-Bayesian neural nets.
+      "We haven't tried <novel inductive bias>" IS a valid hypothesis — those families may break the saturation pattern the XGB-loss variants are stuck in. "We haven't tried <yet another XGB loss tweak>" is not.
+  B.3. Modify models/labels.py — propose label/friction changes only as a v2-whitepaper data request (see B.5). Do NOT change labels in code without explicit human sign-off — the label is the contract the gate evaluates against.
+  B.4. Modify models/sequence_loader.py — data prep / augmentation; cite Part A.
+  B.5. Submit a data request via scripts/feedback.py log_data_request when Part A reveals something no code change can address (e.g., "W1/W5 are bear-regime test slices following bull-train; need more 2022 bear data" → request additional historical ingest).
+
+Evidence-free trainer additions will be reviewed harshly. The bar going forward: this run produced data and an insight, not just code. If after Part A you have no actionable insight, it is acceptable (and preferable) to skip Part B and emit a data request explaining what's blocking you.
+
+You may use WebSearch / WebFetch to research recent ML techniques. The list of "trainer families in scope" in ml-loop.md is a starting point, not a cage.
 
 ==================================================================
 7. WORKFLOW (must follow)
@@ -213,8 +241,19 @@ them this iteration.
     "models/trainers.py: added LSTMTrainer (PyTorch, 2-layer, dropout 0.3)",
     "models/search_spaces.py: lstm entry"
   ],
-  "hypothesis": "<one sentence — what change, why you expect it to help>",
+  "hypothesis": "<one sentence — what change, why you expect it to help. MUST cite a Part A finding>",
   "backbone": "<for PEFT only: which pre-trained model, e.g. 'lag-llama-1b'>",
+  "diagnosis": {{
+    "baselines": {{
+      "random_topk":  {{"windows_passed": 0, "avg_win_rate": 0.0, "avg_annualized_return": 0.0, "avg_max_dd": 0.0, "total_trades": 0}},
+      "rule_only":    {{"windows_passed": 0, "avg_win_rate": 0.0, "avg_annualized_return": 0.0, "avg_max_dd": 0.0, "total_trades": 0}}
+    }},
+    "regime_stats": [
+      {{"window": "2023-11..2024-02", "set_return": 0.0, "set_vol_20d": 0.0, "breadth_above_sma20": 0.0, "foreign_flow_net": 0.0, "hostile": false}},
+      "... 6 more rows, one per walk-forward window ..."
+    ],
+    "failure_pattern": "<one short paragraph: which windows fail consistently across last 20 iterations, regardless of trainer>"
+  }},
   "gate_result": {{
     "gate_passed": false,
     "windows_passed": 1,
