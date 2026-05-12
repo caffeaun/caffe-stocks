@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Iter #714 torch_seq_gru_day_gate is the new best at default HPs: 2/7 windows pass (vs #711's 1/7), avg_ann +28.6% (vs +22%), W3 lifted from 35% to 40% WR (passes), W1 lifted from 46% to 47% WR (passes); 5 new tunable knobs (day_gate depth/n_estimators/lr/min_child_weight + blend coefficient) \u2014 train mode should sweep especially day_gate_blend (default 0.5 hurt W7 vs raw GRU; lower blend may erase the day-gate effect there while keeping W1/W3 wins) and day_gate_max_depth (try 2 for stronger regularization given ~120 unique training dates).",
-  "claude_iter_id": 714,
-  "designated_at": "2026-05-12T12:11:17"
+  "rationale": "Same trainer family as #714, but with new set_ret_5d_zscore_60d feature in the curated set and widened day_gate_blend search [0.20, 0.95]. Default blend=0.5 over-compresses now that the feature itself encodes regime \u2014 train mode should hunt the 0.75-0.95 sweet spot and prefer day_gate_max_depth=2 (the new feature is dominant; deeper trees overfit ~120 unique training dates).",
+  "claude_iter_id": 715,
+  "designated_at": "2026-05-12T15:13:20"
 }

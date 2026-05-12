@@ -907,7 +907,7 @@ SEARCH_SPACES: dict[str, dict] = {
         'day_gate_n_estimators':      [40, 60, 80, 120],
         'day_gate_learning_rate':     (0.03, 0.10),
         'day_gate_min_child_weight':  (1.0, 10.0),
-        'day_gate_blend':             (0.20, 0.80),
+        'day_gate_blend':             (0.20, 0.95),
     },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }

@@ -228,6 +228,44 @@ def compute_cross_features(df):
     return df
 
 
+def compute_set_regime_zscore(df, window=60, min_periods=30):
+    """Add ``set_ret_5d_zscore_60d`` — a market-wide regime feature.
+
+    Iter #714 lesson: the day-gate XGB needs a sharper bear-regime signal to
+    avoid over-filtering bull regimes (W7) while properly demoting bear ones
+    (W5). ``set_ret_5d`` is constant across all symbols on a given date, so its
+    rolling 60-day z-score is computed on the unique daily series and broadcast
+    back to every (date, symbol) row.
+
+    Z-score is the right shape because it's regime-invariant by construction:
+    a -3% 5-day SET drop has different meaning in low-vol vs high-vol periods,
+    but its rank vs the trailing 60d distribution is comparable across splits.
+    The day-gate (last-timestep mean across symbols) sees this value exactly;
+    the GRU sees its full 20-day trajectory.
+    """
+    if 'set_ret_5d_zscore_60d' in df.columns:
+        return df
+    if 'set_ret_5d' not in df.columns:
+        return df
+
+    sort_col = 'timestamp' if 'timestamp' in df.columns else 'date'
+    # Unique date series for set_ret_5d (market-wide → same value all symbols).
+    daily = (df[[sort_col, 'set_ret_5d']]
+             .dropna()
+             .groupby(sort_col, as_index=False)['set_ret_5d'].first()
+             .sort_values(sort_col)
+             .reset_index(drop=True))
+    rolling_mean = daily['set_ret_5d'].rolling(window, min_periods=min_periods).mean()
+    rolling_std = daily['set_ret_5d'].rolling(window, min_periods=min_periods).std()
+    safe_std = rolling_std.where(rolling_std > 1e-9, 1.0)
+    daily['set_ret_5d_zscore_60d'] = ((daily['set_ret_5d'] - rolling_mean)
+                                       / safe_std).clip(-5.0, 5.0)
+
+    df = df.merge(daily[[sort_col, 'set_ret_5d_zscore_60d']],
+                  on=sort_col, how='left')
+    return df
+
+
 # Curated feature set: hybrid absolute + xrank + regime context (attempt 136).
 #
 # Key insight from attempts 131-135:
@@ -293,6 +331,15 @@ CURATED_FEATURES = [
     # across all market regimes — exactly what walk-forward needs.
     'momentum_volume_cross',   # rsi_xrank * volume_ratio_xrank (confirmed-breakout signal)
     'market_sector_aligned',   # market_breadth_adv * sector_breadth (regime concordance)
+    # SET-index regime z-score (1) — iter #715
+    # Same value across all symbols on a given date, so the day-gate XGB
+    # (per-date last-timestep mean) sees it exactly; lets the gate sharpen
+    # bear-regime detection (W5 -13.2% set_ret/31% breadth) without
+    # over-filtering bull regimes (W7 +16.3% set_ret/53% breadth) the way
+    # raw set_ret_5d would under per-window RobustScaler drift. Z-score
+    # over a trailing 60-day SET-index window is regime-invariant by
+    # construction → comparable meaning across all 7 walk-forward splits.
+    'set_ret_5d_zscore_60d',
 ]
 
 
@@ -329,6 +376,7 @@ def prepare_data(df, features=None):
     df = compute_percentile_ranks(df)
     df = compute_cross_sectional_ranks(df)
     df = compute_cross_features(df)
+    df = compute_set_regime_zscore(df)
 
     if features is None:
         features = get_available_features(df)
