@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep torch_seq_gru_day_gate \u2014 iter #714 (2/7, avg_ann +28.6%) remains the strongest baseline; iter #718 reverted both additive variants. Train mode should keep sweeping the existing multiplicative day_gate_blend (0.20, 0.95) range and day_gate_max_depth/n_estimators. Do NOT pivot.",
-  "claude_iter_id": 718,
-  "designated_at": "2026-05-13T00:13:13"
+  "rationale": "Keep torch_seq_gru_day_gate \u2014 iter #714 (2/7, avg_ann +28.6%) remains the strongest baseline; iter #719 reverted (regressor day-gate regressed to 1/7, -27.9%). Train mode should continue sweeping the existing multiplicative binary-classifier day-gate's day_gate_blend (0.20, 0.95) range and day_gate_max_depth/n_estimators. Do NOT pivot \u2014 both #717 options (a additive, b regression) are now refuted, so structural change should wait for iter #720+ (richer per-date features or different family).",
+  "claude_iter_id": 719,
+  "designated_at": "2026-05-13T03:09:41"
 }
