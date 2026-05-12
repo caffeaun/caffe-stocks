@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Stay on torch_seq_gru_day_gate \u2014 still the strongest baseline at iter #714 (2/7 pass, avg_ann +28.6%). My #716 change regressed and was reverted; the same search space (day_gate_blend, day_gate_max_depth, etc) is intact and train mode should keep sweeping it. The two follow-up ideas (top-K-by-GRU label + max-floor formula) need a per-date inference fix and proper out-of-fold GRU scores before the next claude iter retries them.",
-  "claude_iter_id": 716,
-  "designated_at": "2026-05-12T18:14:24"
+  "rationale": "Keep torch_seq_gru_day_gate \u2014 iter #714 remains the strongest baseline (2/7, avg_ann +28.6%) and is fully intact after the iter #717 revert. Train mode should keep sweeping day_gate_blend / day_gate_max_depth / day_gate_n_estimators in the existing space; do NOT pivot.",
+  "claude_iter_id": 717,
+  "designated_at": "2026-05-12T21:12:06"
 }
