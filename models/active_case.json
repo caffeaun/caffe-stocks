@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep torch_seq_gru_day_gate \u2014 iter #714 remains the strongest baseline (2/7, avg_ann +28.6%) and is fully intact after the iter #717 revert. Train mode should keep sweeping day_gate_blend / day_gate_max_depth / day_gate_n_estimators in the existing space; do NOT pivot.",
-  "claude_iter_id": 717,
-  "designated_at": "2026-05-12T21:12:06"
+  "rationale": "Keep torch_seq_gru_day_gate \u2014 iter #714 (2/7, avg_ann +28.6%) remains the strongest baseline; iter #718 reverted both additive variants. Train mode should keep sweeping the existing multiplicative day_gate_blend (0.20, 0.95) range and day_gate_max_depth/n_estimators. Do NOT pivot.",
+  "claude_iter_id": 718,
+  "designated_at": "2026-05-13T00:13:13"
 }
