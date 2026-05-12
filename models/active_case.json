@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Same trainer family as #714, but with new set_ret_5d_zscore_60d feature in the curated set and widened day_gate_blend search [0.20, 0.95]. Default blend=0.5 over-compresses now that the feature itself encodes regime \u2014 train mode should hunt the 0.75-0.95 sweet spot and prefer day_gate_max_depth=2 (the new feature is dominant; deeper trees overfit ~120 unique training dates).",
-  "claude_iter_id": 715,
-  "designated_at": "2026-05-12T15:13:20"
+  "rationale": "Stay on torch_seq_gru_day_gate \u2014 still the strongest baseline at iter #714 (2/7 pass, avg_ann +28.6%). My #716 change regressed and was reverted; the same search space (day_gate_blend, day_gate_max_depth, etc) is intact and train mode should keep sweeping it. The two follow-up ideas (top-K-by-GRU label + max-floor formula) need a per-date inference fix and proper out-of-fold GRU scores before the next claude iter retries them.",
+  "claude_iter_id": 716,
+  "designated_at": "2026-05-12T18:14:24"
 }
