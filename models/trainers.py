@@ -7536,6 +7536,380 @@ class TorchSeqGRUAbstainTrainer(BaseTrainer):
         return inst
 
 
+# Iter #714 — date-level day-quality gate over the #711 single GRU.
+#
+# Part A diagnosis: W7 (test 2026-01..05, +14.5% mkt, breadth 53.6%) fails
+# 0/20 in last-20-iter cross-tab — best regime in the panel, yet zero passes,
+# i.e. precision-bound on good days. W5 (test 2025-01..04, -12.7% mkt,
+# breadth 31.7%) fails 4/20 — genuine bear regime hostility. W3 (-6.9% mkt
+# but 11/20 pass) shows precision and regime are nearly orthogonal: the
+# model can find signal in a mild bear if it's not catastrophically wrong on
+# the precision side. Single-GRU (#711) had +96% ann on W6 / +75% on W7
+# with WR 33-37% — within 3-7 pp of the 40% pass.
+#
+# Iter #713 lessons explicitly call for option (b): "learned day-quality
+# head over daily aggregate features (breadth, vol, foreign-flow) that
+# abstains at the date level rather than per-row". Per-row hard abstain
+# (#713) hurt because high-EV ↔ high p_std are correlated in this task —
+# removing variance removed the right tail. Date-level abstention sidesteps
+# that: it doesn't penalize disagreement within a day, it filters whether
+# the DAY itself is tradeable based on regime aggregates that the GRU's
+# 20-step recurrence may compress away by the last hidden state.
+#
+# Architecture:
+#   Stage 1: single GRU (identical to TorchSeqGRUTrainer) → p_gru
+#   Stage 2: XGBoost classifier on per-date features → p_day_quality
+#     - Per-date label: mean(pnl on that date across all rows) > 0
+#     - Per-date features: take last timestep of every sequence, then
+#       deduplicate to one row per date (mean across symbols on that date)
+#       so XGB learns date-level patterns, not symbol-level.
+#     - Trained on train+val combined dates (small N ~120 dates) with
+#       conservative HPs to avoid overfitting.
+#   Inference: score = p_gru * (0.5 + 0.5 * p_day_quality)
+#     - Soft multiplier in [0.5*p_gru, 1.0*p_gru] preserves p_gru ranking
+#       on good days, demotes (not erases) right-tail picks on bad days.
+#     - Compatible with the gate's threshold sweep — no API change.
+class TorchSeqGRUDayGateTrainer(BaseTrainer):
+    name = 'torch_seq_gru_day_gate'
+    consumes_sequences = True
+
+    def __init__(self,
+                 hidden_dim: int = 64,
+                 dropout: float = 0.30,
+                 learning_rate: float = 1.5e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 max_epochs: int = 12,
+                 patience: int = 4,
+                 pos_class_weight: float = 2.0,
+                 day_gate_max_depth: int = 3,
+                 day_gate_n_estimators: int = 60,
+                 day_gate_learning_rate: float = 0.05,
+                 day_gate_min_child_weight: float = 5.0,
+                 day_gate_blend: float = 0.5,
+                 random_state: int = 42):
+        self._params = dict(
+            hidden_dim=int(hidden_dim),
+            dropout=float(dropout),
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay),
+            batch_size=int(batch_size),
+            max_epochs=int(max_epochs),
+            patience=int(patience),
+            pos_class_weight=float(pos_class_weight),
+            day_gate_max_depth=int(day_gate_max_depth),
+            day_gate_n_estimators=int(day_gate_n_estimators),
+            day_gate_learning_rate=float(day_gate_learning_rate),
+            day_gate_min_child_weight=float(day_gate_min_child_weight),
+            day_gate_blend=float(day_gate_blend),
+            random_state=int(random_state),
+        )
+        self.net = None
+        self.day_gate = None
+        self._best_epoch = None
+        self._n_features = None
+        self._seq_len = None
+
+    def _build_net(self, n_features):
+        import torch
+        import torch.nn as nn
+        p = self._params
+
+        class SeqGRU(nn.Module):
+            def __init__(self, F, H, dp):
+                super().__init__()
+                self.gru = nn.GRU(input_size=F, hidden_size=H,
+                                  num_layers=1, batch_first=True)
+                self.norm = nn.LayerNorm(H)
+                self.drop = nn.Dropout(dp)
+                self.head = nn.Sequential(
+                    nn.Linear(H, max(8, H // 2)), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(max(8, H // 2), 1),
+                )
+
+            def forward(self, x):
+                _, h_T = self.gru(x)
+                z = self.norm(h_T.squeeze(0))
+                z = self.drop(z)
+                return self.head(z).squeeze(-1)
+
+        return SeqGRU(n_features, p['hidden_dim'], p['dropout'])
+
+    def _fit_gru(self, Xt, yt, Xv, yv, device, verbose=False):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+        p = self._params
+        torch.manual_seed(p['random_state'])
+        self.net = self._build_net(self._n_features).to(device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([p['pos_class_weight']], device=device))
+        opt = torch.optim.AdamW(self.net.parameters(),
+                                lr=p['learning_rate'],
+                                weight_decay=p['weight_decay'])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=p['max_epochs'])
+        ds = TensorDataset(torch.from_numpy(Xt), torch.from_numpy(yt))
+        dl = DataLoader(ds, batch_size=p['batch_size'], shuffle=True,
+                        drop_last=False)
+        Xv_t = torch.from_numpy(Xv).to(device)
+
+        best_auc = -1.0
+        best_state = None
+        bad = 0
+        for epoch in range(p['max_epochs']):
+            self.net.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = self.net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            sched.step()
+            self.net.eval()
+            with torch.no_grad():
+                vl = torch.sigmoid(self.net(Xv_t)).cpu().numpy()
+            auc = _auc_safe(yv, vl)
+            if verbose:
+                print(f'  GRU ep{epoch:02d} val_auc={auc:.4f}')
+            if auc > best_auc + 1e-4:
+                best_auc = auc
+                best_state = {k: v.detach().clone() for k, v in
+                              self.net.state_dict().items()}
+                self._best_epoch = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['patience']:
+                    break
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
+
+    def _build_day_features(self, X, dates):
+        """Aggregate (N, T, F) sequences into one row per unique date.
+
+        Per-row daily features = mean across symbols on that date of the
+        LAST timestep of the sequence. Daily-aggregate cols (breadth,
+        market_new_highs, foreign_flow_pctrank, ...) are already constant
+        within a date so the mean is exact for them; per-symbol cols
+        (rsi_xrank, ret_*_xrank, ...) collapse to ~0.5 for xranks but the
+        XGB can still pick up the residual market-tilt features (atr_pct
+        median, volume_ratio median, up_days_5d median) that vary day-by-day.
+
+        Returns (X_day, date_keys) where X_day is (D, F) and date_keys is
+        (D,) parallel.
+        """
+        last = X[:, -1, :]  # (N, F)
+        dates_arr = np.asarray(dates)
+        unique_dates = np.sort(np.unique(dates_arr))
+        X_day = np.zeros((len(unique_dates), last.shape[1]), dtype=np.float32)
+        for i, d in enumerate(unique_dates):
+            mask = dates_arr == d
+            X_day[i] = last[mask].mean(axis=0)
+        return X_day, unique_dates
+
+    def _build_day_labels(self, pnl, dates):
+        """Per-date label: mean pnl across all rows on that date > 0.
+
+        This proxies day-quality: a date where random picks are net-positive
+        on average is a "tradeable day"; a date where the average row loses
+        money (bear day, sell-off, low-quality candidates) is "untradeable".
+        """
+        pnl_arr = np.asarray(pnl)
+        dates_arr = np.asarray(dates)
+        unique_dates = np.sort(np.unique(dates_arr))
+        y_day = np.zeros(len(unique_dates), dtype=np.int32)
+        for i, d in enumerate(unique_dates):
+            mask = dates_arr == d
+            y_day[i] = int(pnl_arr[mask].mean() > 0.0)
+        return y_day, unique_dates
+
+    def _fit_day_gate(self, X_train, X_val, pnl_train, pnl_val,
+                      dates_train, dates_val, verbose=False):
+        """Train XGBoost classifier on per-date aggregates → P(good day).
+
+        Combines train and val dates (~120 unique dates) since the GRU has
+        no second-level model that needs holdout for early stopping; XGB
+        uses fixed n_estimators with conservative HPs (depth=3, n=60) to
+        avoid overfitting the small N.
+        """
+        import xgboost as xgb
+        if dates_train is None or pnl_train is None:
+            # Without dates/pnl we cannot build the day gate; fall back to
+            # all-days-equal (p_day=0.5) by leaving day_gate=None.
+            return
+
+        # Build per-date training set from train + val combined
+        X_all = np.concatenate([X_train, X_val], axis=0)
+        pnl_all = np.concatenate([np.asarray(pnl_train), np.asarray(pnl_val)])
+        dates_all = np.concatenate([np.asarray(dates_train),
+                                    np.asarray(dates_val) if dates_val is not None
+                                    else np.array([])])
+        X_day, day_keys_x = self._build_day_features(X_all, dates_all)
+        y_day, day_keys_y = self._build_day_labels(pnl_all, dates_all)
+        assert (day_keys_x == day_keys_y).all()
+
+        # Degenerate guard: if all days are good or all bad, skip the gate.
+        if len(set(y_day.tolist())) < 2:
+            if verbose:
+                print(f'  day-gate: degenerate label distribution '
+                      f'(all={y_day.mean():.2f}); skipping')
+            return
+
+        p = self._params
+        # Class balance: positive rate of "good days" is ~0.4-0.6 typically;
+        # use scale_pos_weight = neg/pos to balance.
+        n_pos = float(y_day.sum())
+        n_neg = float(len(y_day) - y_day.sum())
+        spw = max(0.25, min(4.0, n_neg / max(1.0, n_pos)))
+
+        self.day_gate = xgb.XGBClassifier(
+            max_depth=p['day_gate_max_depth'],
+            n_estimators=p['day_gate_n_estimators'],
+            learning_rate=p['day_gate_learning_rate'],
+            min_child_weight=p['day_gate_min_child_weight'],
+            subsample=0.9, colsample_bytree=0.9,
+            reg_alpha=0.1, reg_lambda=0.5,
+            scale_pos_weight=spw,
+            tree_method='hist',
+            use_label_encoder=False,
+            eval_metric='logloss',
+            random_state=p['random_state'],
+            n_jobs=1,
+            verbosity=0,
+        )
+        self.day_gate.fit(X_day, y_day)
+        if verbose:
+            train_pred = self.day_gate.predict_proba(X_day)[:, 1]
+            print(f'  day-gate: trained on {len(y_day)} unique dates '
+                  f'(pos={n_pos:.0f}/{len(y_day)}, spw={spw:.2f}); '
+                  f'mean_pred={train_pred.mean():.3f} '
+                  f'range=[{train_pred.min():.3f}, {train_pred.max():.3f}]')
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru_day_gate expects 3D sequence input (N, T, F); '
+                f'got shape {X_train.shape}.')
+        if len(set(y_train)) < 2 or len(set(y_val)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        Xt = np.clip(np.asarray(X_train, dtype=np.float32), -8.0, 8.0)
+        Xv = np.clip(np.asarray(X_val, dtype=np.float32), -8.0, 8.0)
+        yt = np.asarray(y_train, dtype=np.float32)
+        yv = np.asarray(y_val, dtype=np.float32)
+        self._n_features = Xt.shape[-1]
+        self._seq_len = Xt.shape[1]
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Stage 1: GRU
+        self._fit_gru(Xt, yt, Xv, yv, device, verbose=verbose)
+
+        # Stage 2: day-quality XGB on per-date aggregates
+        self._fit_day_gate(Xt, Xv, pnl_train, pnl_val,
+                            dates_train, dates_val, verbose=verbose)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if self.net is None:
+            raise RuntimeError('Model not fit')
+        if X.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru_day_gate.predict_proba expects 3D input '
+                f'(N, T, F); got shape {X.shape}.')
+        device = next(self.net.parameters()).device
+        X = np.clip(np.asarray(X, dtype=np.float32), -8.0, 8.0)
+        self.net.eval()
+        with torch.no_grad():
+            logits = self.net(torch.from_numpy(X).to(device))
+            p_gru = torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+
+        if self.day_gate is None:
+            # No day gate (degenerate fit); return raw GRU prob.
+            return p_gru
+
+        # Day gate inference: predict on per-row last-timestep features.
+        # Same-date rows naturally get similar p_day because the daily-
+        # aggregate columns (breadth, market_new_highs, foreign_flow_pctrank)
+        # are constant within a date — XGB on those dominates the score.
+        last = X[:, -1, :].astype(np.float32)
+        p_day = self.day_gate.predict_proba(last)[:, 1].astype(np.float64)
+
+        # Soft multiplier in [blend*p_gru, p_gru] (default blend=0.5).
+        # Preserves p_gru ranking on good days, demotes on bad days without
+        # erasing the right tail (unlike #713's hard abstain).
+        blend = float(self._params['day_gate_blend'])
+        return p_gru * (blend + (1.0 - blend) * p_day)
+
+    @property
+    def best_iteration(self):
+        return self._best_epoch
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        import pickle
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pt')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        gate_path = os.path.join(output_dir, 'day_gate.pkl')
+        torch.save({'state_dict': self.net.state_dict(),
+                    'n_features': self._n_features,
+                    'seq_len': self._seq_len}, model_path)
+        if self.day_gate is not None:
+            with open(gate_path, 'wb') as f:
+                pickle.dump(self.day_gate, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_epoch': self._best_epoch,
+            'n_features': self._n_features,
+            'seq_len': self._seq_len,
+            'has_day_gate': self.day_gate is not None,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path,
+                'day_gate': gate_path if self.day_gate is not None else None}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        import pickle
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pt')
+        gate_path = os.path.join(output_dir, 'day_gate.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst._seq_len = meta.get('seq_len')
+        inst.net = inst._build_net(inst._n_features)
+        state = torch.load(model_path, weights_only=True)
+        inst.net.load_state_dict(state['state_dict'])
+        inst._best_epoch = meta.get('best_epoch')
+        if meta.get('has_day_gate') and os.path.exists(gate_path):
+            with open(gate_path, 'rb') as f:
+                inst.day_gate = pickle.load(f)
+        return inst
+
+
 # --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
@@ -7575,6 +7949,7 @@ TRAINERS = {
     'torch_seq_transformer': TorchSeqTransformerTrainer,
     'torch_seq_gru_ensemble': TorchSeqGRUEnsembleTrainer,
     'torch_seq_gru_abstain': TorchSeqGRUAbstainTrainer,
+    'torch_seq_gru_day_gate': TorchSeqGRUDayGateTrainer,
 }
 
 

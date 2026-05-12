@@ -886,6 +886,29 @@ SEARCH_SPACES: dict[str, dict] = {
         'pos_class_weight':      (1.0, 3.5),
         'abstain_quantile':      (0.30, 0.80),
     },
+    # Iter #714 — single GRU + per-date XGB day-quality gate. GRU spaces are
+    # identical to torch_seq_gru so prior single-GRU HP wins transfer. New
+    # knobs are the day-gate XGB (shallow tree, conservative HPs since ~120
+    # unique training dates) and the blend coefficient that controls how
+    # aggressively day-quality demotes scores on predicted-bad days:
+    #   blend=0.0  → score = p_gru * p_day            (hardest demotion)
+    #   blend=0.5  → score = p_gru * (0.5 + 0.5*p_day) (default, soft)
+    #   blend=1.0  → score = p_gru                    (gate disabled)
+    'torch_seq_gru_day_gate': {
+        'hidden_dim':                 [32, 48, 64, 96],
+        'dropout':                    (0.10, 0.45),
+        'learning_rate':              (5e-4, 3e-3),
+        'weight_decay':               (1e-5, 1e-3),
+        'batch_size':                 [256, 512, 1024],
+        'max_epochs':                 [8, 12, 16],
+        'patience':                   [3, 4, 6],
+        'pos_class_weight':           (1.0, 3.5),
+        'day_gate_max_depth':         [2, 3, 4],
+        'day_gate_n_estimators':      [40, 60, 80, 120],
+        'day_gate_learning_rate':     (0.03, 0.10),
+        'day_gate_min_child_weight':  (1.0, 10.0),
+        'day_gate_blend':             (0.20, 0.80),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
