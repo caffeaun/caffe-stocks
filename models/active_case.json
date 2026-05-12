@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "torch_seq_transformer at default HPs underperforms torch_seq_gru (0/7 vs 1/7, avg_ann -7.6% vs +0%, avg_wr 29% vs 33%) \u2014 more attention-capacity made selectivity WORSE, not better. The negative finding is that the WR bottleneck is general across sequence-model families, not GRU-specific. Keep the prior GRU sweep on pos_class_weight / dropout \u2014 those knobs directly target the diagnosed WR-bound failure mode and the GRU's smaller capacity is acting as helpful regularization.",
-  "claude_iter_id": 712,
-  "designated_at": "2026-05-12T00:20:47"
+  "rationale": "Iter #711 torch_seq_gru showed real temporal signal at default HPs (+22% avg ann across 7 windows; W6 +96%, W7 +75%) and its HP space (hidden_dim, dropout, lr, pos_class_weight, max_epochs) has not been swept yet \u2014 higher EV than another architectural pivot, especially after #712 transformer and #713 abstain both underperformed it.",
+  "claude_iter_id": 713,
+  "designated_at": "2026-05-12T09:11:14"
 }

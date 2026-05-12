@@ -845,6 +845,47 @@ SEARCH_SPACES: dict[str, dict] = {
         'patience':           [3, 4, 6],
         'pos_class_weight':   (1.0, 3.5),
     },
+    # Iter #713 — deep-ensemble GRU. Same per-member space as torch_seq_gru
+    # (hidden_dim / dropout / pos_class_weight / lr) plus the two new
+    # ensemble knobs: n_models (3-7, the precision-vs-time trade-off; K=5
+    # default fits ~14 min of training in the 30-min wall) and
+    # disagreement_penalty (0.5-2.5, the λ in score = mean − λ·std; higher
+    # λ = stricter abstention, fewer trades but higher precision).
+    # max_epochs trimmed to 8-12 vs single-GRU 8-16 because K members
+    # multiply runtime; rely on ensemble averaging to recover the variance
+    # reduction that more epochs gave a single net.
+    'torch_seq_gru_ensemble': {
+        'n_models':              [3, 5, 7],
+        'hidden_dim':            [32, 48, 64, 96],
+        'dropout':               (0.10, 0.45),
+        'learning_rate':         (5e-4, 3e-3),
+        'weight_decay':          (1e-5, 1e-3),
+        'batch_size':            [256, 512, 1024],
+        'max_epochs':            [8, 10, 12],
+        'patience':              [3, 4],
+        'pos_class_weight':      (1.0, 3.5),
+        'disagreement_penalty':  (0.5, 2.5),
+    },
+    # Iter #713 — deep-ensemble GRU with HARD abstention by epistemic
+    # uncertainty quantile. `abstain_quantile` is the key knob: it is the q
+    # such that τ = quantile(val_std, q); rows with test-time std > τ are
+    # forced to score -1e9 (skipped by every gate threshold). Lower q =
+    # stricter (more rows abstain, fewer trades, higher WR if signal is
+    # real). Range [0.30, 0.80] explores the WR/n_trades trade-off; default
+    # 0.50 abstains on the noisiest 50% of predictions. Same per-member
+    # spaces as torch_seq_gru_ensemble; n_models capped at 7 for wall-time.
+    'torch_seq_gru_abstain': {
+        'n_models':              [3, 5, 7],
+        'hidden_dim':            [32, 48, 64, 96],
+        'dropout':               (0.10, 0.45),
+        'learning_rate':         (5e-4, 3e-3),
+        'weight_decay':          (1e-5, 1e-3),
+        'batch_size':            [256, 512, 1024],
+        'max_epochs':            [8, 10, 12],
+        'patience':              [3, 4],
+        'pos_class_weight':      (1.0, 3.5),
+        'abstain_quantile':      (0.30, 0.80),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

@@ -6996,6 +6996,546 @@ class TorchSeqTransformerTrainer(BaseTrainer):
         return inst
 
 
+# Iter #713 — deep-ensemble GRU with disagreement-based selectivity.
+#
+# Diagnosis (last 20 iters cross-tab):
+#   W7 0/20 passes — strong-bull regime that nobody trades successfully.
+#   W1/W4/W5 4-5/20; W3/W6 11-13/20. Even sequence-aware iter #711 (GRU)
+#   captured massive ANN on W6/W7 (+96% / +75%) but failed every per-window
+#   gate on WR (best 37%, need 40%). Iter #712 (Transformer) hit the same
+#   WR ceiling — adding more attention-capacity did not help selectivity.
+#
+# Hypothesis: the WR ceiling reflects EPISTEMIC uncertainty the GRU cannot
+# express. A single sigmoid output gives mean prediction but no confidence;
+# the gate's threshold sweep can only re-rank, not abstain. A deep ensemble
+# of K=5 independently-initialised GRUs yields a per-sample posterior; the
+# disagreement (std across members) is well-known to correlate with
+# prediction errors (Lakshminarayanan 2017). Score = mean − λ·std penalises
+# high-disagreement samples so the gate's "take top-K per day" picks
+# *confident* positives — directly targeting the diagnosed WR-bound failure
+# rather than searching for yet another encoder.
+#
+# Architecture: K independent SeqGRU instances (same hyperparams, seeds
+# {seed, seed+1, ..., seed+K-1}). At inference: clip(mean − λ·std, 0, 1).
+# Score remains in [0, 1] so the gate's SCORE_THRESHOLDS sweep works
+# unchanged; high-disagreement samples drop near zero and are excluded
+# even at threshold 0.0 (since top-K is by score-desc).
+#
+# Cost budget: K=5 × ~25s/window × 7 windows ≈ 14 min train, within the
+# 30-min wall. The K=5 default is conservative; train mode can sweep K
+# and λ within search_spaces.
+class TorchSeqGRUEnsembleTrainer(BaseTrainer):
+    name = 'torch_seq_gru_ensemble'
+    consumes_sequences = True
+
+    def __init__(self,
+                 n_models: int = 5,
+                 hidden_dim: int = 64,
+                 dropout: float = 0.30,
+                 learning_rate: float = 1.5e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 max_epochs: int = 10,
+                 patience: int = 3,
+                 pos_class_weight: float = 2.0,
+                 disagreement_penalty: float = 1.5,
+                 random_state: int = 42):
+        self._params = dict(
+            n_models=int(n_models),
+            hidden_dim=int(hidden_dim),
+            dropout=float(dropout),
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay),
+            batch_size=int(batch_size),
+            max_epochs=int(max_epochs),
+            patience=int(patience),
+            pos_class_weight=float(pos_class_weight),
+            disagreement_penalty=float(disagreement_penalty),
+            random_state=int(random_state),
+        )
+        self.nets = []
+        self._best_epochs = []
+        self._n_features = None
+        self._seq_len = None
+
+    def _build_net(self, n_features):
+        import torch
+        import torch.nn as nn
+        p = self._params
+
+        class SeqGRU(nn.Module):
+            def __init__(self, F, H, dp):
+                super().__init__()
+                self.gru = nn.GRU(input_size=F, hidden_size=H,
+                                  num_layers=1, batch_first=True)
+                self.norm = nn.LayerNorm(H)
+                self.drop = nn.Dropout(dp)
+                self.head = nn.Sequential(
+                    nn.Linear(H, max(8, H // 2)), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(max(8, H // 2), 1),
+                )
+
+            def forward(self, x):
+                _, h_T = self.gru(x)
+                z = self.norm(h_T.squeeze(0))
+                z = self.drop(z)
+                return self.head(z).squeeze(-1)
+
+        return SeqGRU(n_features, p['hidden_dim'], p['dropout'])
+
+    def _train_one(self, seed, Xt, yt, Xv, yv, device, verbose=False):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+        p = self._params
+        torch.manual_seed(int(seed))
+        net = self._build_net(self._n_features).to(device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([p['pos_class_weight']], device=device))
+        opt = torch.optim.AdamW(net.parameters(),
+                                lr=p['learning_rate'],
+                                weight_decay=p['weight_decay'])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=p['max_epochs'])
+        ds = TensorDataset(torch.from_numpy(Xt), torch.from_numpy(yt))
+        dl = DataLoader(ds, batch_size=p['batch_size'], shuffle=True,
+                        drop_last=False,
+                        generator=torch.Generator().manual_seed(int(seed)))
+        Xv_t = torch.from_numpy(Xv).to(device)
+
+        best_auc = -1.0
+        best_state = None
+        best_ep = 0
+        bad = 0
+        for epoch in range(p['max_epochs']):
+            net.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            sched.step()
+            net.eval()
+            with torch.no_grad():
+                vl = torch.sigmoid(net(Xv_t)).cpu().numpy()
+            auc = _auc_safe(yv, vl)
+            if verbose:
+                print(f'    seed={seed} ep{epoch:02d} val_auc={auc:.4f}')
+            if auc > best_auc + 1e-4:
+                best_auc = auc
+                best_state = {k: v.detach().clone() for k, v in
+                              net.state_dict().items()}
+                best_ep = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['patience']:
+                    break
+        if best_state is not None:
+            net.load_state_dict(best_state)
+        return net, best_ep
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru_ensemble expects 3D sequence input (N, T, F); '
+                f'got shape {X_train.shape}.')
+        if len(set(y_train)) < 2 or len(set(y_val)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        Xt = np.clip(np.asarray(X_train, dtype=np.float32), -8.0, 8.0)
+        Xv = np.clip(np.asarray(X_val, dtype=np.float32), -8.0, 8.0)
+        yt = np.asarray(y_train, dtype=np.float32)
+        yv = np.asarray(y_val, dtype=np.float32)
+        self._n_features = Xt.shape[-1]
+        self._seq_len = Xt.shape[1]
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.nets = []
+        self._best_epochs = []
+        base = p['random_state']
+        for k in range(p['n_models']):
+            seed = base + k
+            if verbose:
+                print(f'  ensemble member {k+1}/{p["n_models"]} (seed={seed})')
+            net, best_ep = self._train_one(
+                seed, Xt, yt, Xv, yv, device, verbose=verbose)
+            self.nets.append(net)
+            self._best_epochs.append(int(best_ep))
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if not self.nets:
+            raise RuntimeError('Model not fit')
+        if X.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru_ensemble.predict_proba expects 3D input '
+                f'(N, T, F); got shape {X.shape}.')
+        device = next(self.nets[0].parameters()).device
+        X = np.clip(np.asarray(X, dtype=np.float32), -8.0, 8.0)
+        Xt = torch.from_numpy(X).to(device)
+        probs = []
+        with torch.no_grad():
+            for net in self.nets:
+                net.eval()
+                probs.append(
+                    torch.sigmoid(net(Xt)).cpu().numpy().astype(np.float64))
+        P = np.stack(probs, axis=0)              # (K, N)
+        p_mean = P.mean(axis=0)
+        p_std = P.std(axis=0)
+        lam = float(self._params['disagreement_penalty'])
+        score = p_mean - lam * p_std
+        return np.clip(score, 0.0, 1.0)
+
+    @property
+    def best_iteration(self):
+        if not self._best_epochs:
+            return None
+        return int(round(float(np.mean(self._best_epochs))))
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        member_paths = []
+        for i, net in enumerate(self.nets):
+            mp = os.path.join(output_dir, f'model_{i}.pt')
+            torch.save({'state_dict': net.state_dict()}, mp)
+            member_paths.append(mp)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_epochs': self._best_epochs,
+            'n_features': self._n_features,
+            'seq_len': self._seq_len,
+            'member_paths': member_paths,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'metadata': meta_path, 'members': member_paths}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst._seq_len = meta.get('seq_len')
+        inst.nets = []
+        for mp in meta.get('member_paths', []):
+            net = inst._build_net(inst._n_features)
+            state = torch.load(mp, weights_only=True)
+            net.load_state_dict(state['state_dict'])
+            inst.nets.append(net)
+        inst._best_epochs = meta.get('best_epochs', [])
+        return inst
+
+
+# Iter #713 — selectivity layer via hard epistemic abstention.
+#
+# Diagnosis (Part A, last 20 iters): W7 (test 2026-01..05) is a +15% bull
+# regime with low vol (16%) and positive breadth (54%), yet 0/20 iterations
+# pass — failure cannot be blamed on regime hostility. Iter #711 GRU and
+# iter #712 Transformer both produced massive ANN signal (+75% and +20% on
+# W7) but win-rates 33-37% — i.e. the signal is there, precision is not.
+# Iter #712 lessons explicitly call for a *selectivity layer*: deep-ensemble
+# disagreement filter or conformal abstention, not another encoder.
+#
+# Why the existing torch_seq_gru_ensemble is not enough: it does soft
+# re-ranking via `score = mean - λ·std` clipped to [0,1]. At threshold=0.0
+# the gate still picks top-K per date — re-ranking only changes WHICH high-
+# uncertainty trade gets taken, not WHETHER any is. Result: 0/7 pass.
+#
+# This trainer adds HARD abstention. After fitting K GRU members, we
+# compute per-row epistemic uncertainty (std across members) on the inner-
+# val set and store the q-th quantile as τ. At predict time, any row with
+# p_std > τ has its score forced to -1e9, which is below every gate
+# threshold including 0.0 — so the gate's `score < threshold: continue`
+# branch literally skips that signal. The next-best (lower-uncertainty)
+# symbol on the same date can fill the slot, or the slot stays empty if
+# every same-day candidate is uncertain. This is a *day-aware* filter
+# even though it operates on (date, symbol) rows: hostile days where all
+# K members disagree on every symbol will drop out entirely.
+#
+# τ-calibration on inner-val (not test) is critical for honesty — it's the
+# same split used for early stopping, so no test peeking.
+class TorchSeqGRUAbstainTrainer(BaseTrainer):
+    name = 'torch_seq_gru_abstain'
+    consumes_sequences = True
+
+    def __init__(self,
+                 n_models: int = 5,
+                 hidden_dim: int = 64,
+                 dropout: float = 0.30,
+                 learning_rate: float = 1.5e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 max_epochs: int = 10,
+                 patience: int = 3,
+                 pos_class_weight: float = 2.0,
+                 abstain_quantile: float = 0.50,
+                 random_state: int = 42):
+        self._params = dict(
+            n_models=int(n_models),
+            hidden_dim=int(hidden_dim),
+            dropout=float(dropout),
+            learning_rate=float(learning_rate),
+            weight_decay=float(weight_decay),
+            batch_size=int(batch_size),
+            max_epochs=int(max_epochs),
+            patience=int(patience),
+            pos_class_weight=float(pos_class_weight),
+            abstain_quantile=float(abstain_quantile),
+            random_state=int(random_state),
+        )
+        self.nets = []
+        self._best_epochs = []
+        self._n_features = None
+        self._seq_len = None
+        self._tau_std = None  # calibrated abstention threshold
+
+    def _build_net(self, n_features):
+        import torch
+        import torch.nn as nn
+        p = self._params
+
+        class SeqGRU(nn.Module):
+            def __init__(self, F, H, dp):
+                super().__init__()
+                self.gru = nn.GRU(input_size=F, hidden_size=H,
+                                  num_layers=1, batch_first=True)
+                self.norm = nn.LayerNorm(H)
+                self.drop = nn.Dropout(dp)
+                self.head = nn.Sequential(
+                    nn.Linear(H, max(8, H // 2)), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(max(8, H // 2), 1),
+                )
+
+            def forward(self, x):
+                _, h_T = self.gru(x)
+                z = self.norm(h_T.squeeze(0))
+                z = self.drop(z)
+                return self.head(z).squeeze(-1)
+
+        return SeqGRU(n_features, p['hidden_dim'], p['dropout'])
+
+    def _train_one(self, seed, Xt, yt, Xv, yv, device, verbose=False):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+        p = self._params
+        torch.manual_seed(int(seed))
+        net = self._build_net(self._n_features).to(device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([p['pos_class_weight']], device=device))
+        opt = torch.optim.AdamW(net.parameters(),
+                                lr=p['learning_rate'],
+                                weight_decay=p['weight_decay'])
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=p['max_epochs'])
+        ds = TensorDataset(torch.from_numpy(Xt), torch.from_numpy(yt))
+        dl = DataLoader(ds, batch_size=p['batch_size'], shuffle=True,
+                        drop_last=False,
+                        generator=torch.Generator().manual_seed(int(seed)))
+        Xv_t = torch.from_numpy(Xv).to(device)
+
+        best_auc = -1.0
+        best_state = None
+        best_ep = 0
+        bad = 0
+        for epoch in range(p['max_epochs']):
+            net.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            sched.step()
+            net.eval()
+            with torch.no_grad():
+                vl = torch.sigmoid(net(Xv_t)).cpu().numpy()
+            auc = _auc_safe(yv, vl)
+            if verbose:
+                print(f'    seed={seed} ep{epoch:02d} val_auc={auc:.4f}')
+            if auc > best_auc + 1e-4:
+                best_auc = auc
+                best_state = {k: v.detach().clone() for k, v in
+                              net.state_dict().items()}
+                best_ep = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['patience']:
+                    break
+        if best_state is not None:
+            net.load_state_dict(best_state)
+        return net, best_ep
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru_abstain expects 3D sequence input (N, T, F); '
+                f'got shape {X_train.shape}.')
+        if len(set(y_train)) < 2 or len(set(y_val)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        p = self._params
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        Xt = np.clip(np.asarray(X_train, dtype=np.float32), -8.0, 8.0)
+        Xv = np.clip(np.asarray(X_val, dtype=np.float32), -8.0, 8.0)
+        yt = np.asarray(y_train, dtype=np.float32)
+        yv = np.asarray(y_val, dtype=np.float32)
+        self._n_features = Xt.shape[-1]
+        self._seq_len = Xt.shape[1]
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.nets = []
+        self._best_epochs = []
+        base = p['random_state']
+        for k in range(p['n_models']):
+            seed = base + k
+            if verbose:
+                print(f'  abstain ensemble member {k+1}/{p["n_models"]} '
+                      f'(seed={seed})')
+            net, best_ep = self._train_one(
+                seed, Xt, yt, Xv, yv, device, verbose=verbose)
+            self.nets.append(net)
+            self._best_epochs.append(int(best_ep))
+
+        # Calibrate the abstention threshold τ on inner-val predictions.
+        # We collect K member probabilities on the val set, compute per-row
+        # std, and pick the q-th quantile so that exactly (1-q) of val rows
+        # exceed τ — those are the rows we will abstain on at test time.
+        Xv_t = torch.from_numpy(Xv).to(device)
+        probs = []
+        with torch.no_grad():
+            for net in self.nets:
+                net.eval()
+                probs.append(
+                    torch.sigmoid(net(Xv_t)).cpu().numpy().astype(np.float64))
+        P = np.stack(probs, axis=0)  # (K, N_val)
+        val_std = P.std(axis=0)
+        q = float(np.clip(p['abstain_quantile'], 0.05, 0.95))
+        self._tau_std = float(np.quantile(val_std, q))
+        if verbose:
+            print(f'  abstention τ (val std @ q={q:.2f}) = {self._tau_std:.4f} '
+                  f'— {(1.0 - q) * 100:.0f}% of val rows would abstain')
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if not self.nets:
+            raise RuntimeError('Model not fit')
+        if X.ndim != 3:
+            raise ValueError(
+                f'torch_seq_gru_abstain.predict_proba expects 3D input '
+                f'(N, T, F); got shape {X.shape}.')
+        device = next(self.nets[0].parameters()).device
+        X = np.clip(np.asarray(X, dtype=np.float32), -8.0, 8.0)
+        Xt = torch.from_numpy(X).to(device)
+        probs = []
+        with torch.no_grad():
+            for net in self.nets:
+                net.eval()
+                probs.append(
+                    torch.sigmoid(net(Xt)).cpu().numpy().astype(np.float64))
+        P = np.stack(probs, axis=0)              # (K, N)
+        p_mean = P.mean(axis=0)
+        p_std = P.std(axis=0)
+
+        score = p_mean.copy()
+        if self._tau_std is not None and self._tau_std > 0:
+            # Hard abstention: anything above τ gets a sentinel score that is
+            # strictly below every entry in scripts/return_gate.SCORE_THRESHOLDS
+            # (lowest is 0.0), so the gate's `if score < threshold: continue`
+            # skips it for every sweep iteration.
+            abstain_mask = p_std > self._tau_std
+            score[abstain_mask] = -1e9
+        return score
+
+    @property
+    def best_iteration(self):
+        if not self._best_epochs:
+            return None
+        return int(round(float(np.mean(self._best_epochs))))
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        member_paths = []
+        for i, net in enumerate(self.nets):
+            mp = os.path.join(output_dir, f'model_{i}.pt')
+            torch.save({'state_dict': net.state_dict()}, mp)
+            member_paths.append(mp)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_epochs': self._best_epochs,
+            'n_features': self._n_features,
+            'seq_len': self._seq_len,
+            'tau_std': self._tau_std,
+            'member_paths': member_paths,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'metadata': meta_path, 'members': member_paths}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst._seq_len = meta.get('seq_len')
+        inst._tau_std = meta.get('tau_std')
+        inst.nets = []
+        for mp in meta.get('member_paths', []):
+            net = inst._build_net(inst._n_features)
+            state = torch.load(mp, weights_only=True)
+            net.load_state_dict(state['state_dict'])
+            inst.nets.append(net)
+        inst._best_epochs = meta.get('best_epochs', [])
+        return inst
+
+
 # --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
@@ -7033,6 +7573,8 @@ TRAINERS = {
     'torch_attentive_mlp': TorchAttentiveMLPTrainer,
     'torch_seq_gru': TorchSeqGRUTrainer,
     'torch_seq_transformer': TorchSeqTransformerTrainer,
+    'torch_seq_gru_ensemble': TorchSeqGRUEnsembleTrainer,
+    'torch_seq_gru_abstain': TorchSeqGRUAbstainTrainer,
 }
 
 
