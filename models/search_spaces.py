@@ -909,6 +909,37 @@ SEARCH_SPACES: dict[str, dict] = {
         'day_gate_min_child_weight':  (1.0, 10.0),
         'day_gate_blend':             (0.20, 0.95),
     },
+    # Iter #734 — sklearn ExtraTreesClassifier. Genuinely different inductive
+    # bias from every XGB/LGBM variant in the registry: at each split it picks
+    # a RANDOM threshold (not the greedy-optimal one) on a random feature
+    # subset, then averages many fully-grown trees. Hypothesis: the XGB family
+    # has plateaued at 5-6/7 because greedy splits latch onto training
+    # patterns that don't transfer through W5 (bull→bear flip) and W7 (recent
+    # foreign-flow-divergent rally). Extra Trees' built-in randomisation
+    # softens that overfit.
+    #
+    # HP space — kept small (8 knobs) so train mode can cover it in ~50 draws:
+    #   n_estimators ∈ {300, 500, 800, 1200} — more trees = less variance;
+    #     wall-time is ~1-3 s/window even at 1200 (parallel n_jobs=-1).
+    #   max_depth ∈ {0=None, 8, 12, 20} — None = fully grown (classic ExtraTrees);
+    #     limited depth regularises further.
+    #   min_samples_leaf ∈ {5, 10, 20, 50} — leaf-size regulariser; ~20 default
+    #     keeps leaves stable on ~80k training rows.
+    #   min_samples_split ∈ {2, 10, 20}
+    #   max_features ∈ {'sqrt', 'log2', 0.3, 0.5} — fraction or rule for
+    #     candidate features at each split (sklearn accepts float in [0,1]).
+    #   bootstrap ∈ {False, True} — False = classic ExtraTrees (Geurts 2006),
+    #     True = combines random-split + bag-row variance reduction.
+    #   pos_class_weight ∈ [1.0, 4.0] — handles the ~25% positive label rate.
+    'sklearn_extra_trees': {
+        'n_estimators':       [300, 500, 800, 1200],
+        'max_depth':          [0, 8, 12, 20],
+        'min_samples_leaf':   [5, 10, 20, 50],
+        'min_samples_split':  [2, 10, 20],
+        'max_features':       ['sqrt', 'log2'],
+        'bootstrap':          [0, 1],
+        'pos_class_weight':   (1.0, 4.0),
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

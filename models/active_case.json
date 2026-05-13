@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_quarterly_dro",
+  "trainer": "sklearn_extra_trees",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot away from torch_seq_gru_day_gate after 7 consecutive failed iters (#714-#721) exhausted all 5 untried branches without breaking iter #714's 2/7 +28.6% ceiling. xgb_quarterly_dro is the strongest historic non-GRU baseline (iter #589: 6/7 windows, +26.2% avg_ann) \u2014 a fundamentally different inductive bias (quarterly distributionally-robust optimization over XGB rather than recurrent state + per-date binary gate) that the recent claude iters have not revisited. Train mode can productively sweep its DRO HPs (rho, n_quarters, alpha) for the next hour while next claude iter designs a genuinely new family (TCN / SSL pretraining / foundation-model PEFT / RL \u2014 see lessons).",
-  "claude_iter_id": 721,
-  "designated_at": "2026-05-13T09:11:08"
+  "rationale": "Pivot to the new ExtraTrees family so train mode can explore its untested HP space (n_estimators, depth caps, leaf sizes, max_features, class_weight); defaults trade too aggressively (avg_wr 24.5%, 378 trades) \u2014 selective HPs (deeper leaf caps, higher min_samples_leaf, lower pos_class_weight) are the natural next sweep direction. xgb_quarterly_dro has been swept 43 iters post-fix with no breakthrough.",
+  "claude_iter_id": 734,
+  "designated_at": "2026-05-13T12:11:52"
 }

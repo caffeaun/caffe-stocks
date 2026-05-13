@@ -7911,6 +7911,136 @@ class TorchSeqGRUDayGateTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Extremely Randomized Trees — sklearn ExtraTreesClassifier
+#
+# Why this trainer / what gap it fills:
+#   Diagnosis over 300+ post-fix iters shows every XGBoost-family variant
+#   (xgb_rank_fusion, xgb_quarterly_dro, xgb_meta_label, xgb_temporal_mixup,
+#   xgb_recency_consensus, xgb_adv_val, …) plateaus at 5-6/7 windows. W5
+#   (Jan-Apr 2025 SET -17.4%) and W7 (Jan-May 2026 SET +18.3% with foreign-
+#   flow divergence) are the systematic killers — both involve a train→test
+#   regime flip the XGB greedy splitter latches onto training artefacts that
+#   do NOT generalise.
+#
+#   ExtraTrees uses a fundamentally different inductive bias: at each split
+#   it samples a RANDOM threshold (not the best greedy threshold) on a
+#   random subset of features, and averages predictions across many fully
+#   grown trees. The combination of randomised splits + bagging is well
+#   known (Geurts et al. 2006) to be less prone to overfit specific
+#   training patterns than greedy GBDT, at the cost of slightly higher bias.
+#   For a regime-shifted out-of-sample window the bias-variance trade is
+#   often favourable.
+#
+#   This is the novel-inductive-bias slot §6 calls out — pure XGBoost-loss
+#   sweeps cannot reach it, only a structural change can.
+# --------------------------------------------------------------------- #
+class SklearnExtraTreesTrainer(BaseTrainer):
+    name = 'sklearn_extra_trees'
+
+    def __init__(self,
+                 n_estimators: int = 500,
+                 max_depth: Optional[int] = None,
+                 min_samples_leaf: int = 20,
+                 min_samples_split: int = 10,
+                 max_features: str = 'sqrt',
+                 bootstrap: bool = False,
+                 pos_class_weight: float = 2.0,
+                 random_state: int = 42):
+        self._params = dict(
+            n_estimators=int(n_estimators),
+            max_depth=None if max_depth in (None, 0, -1) else int(max_depth),
+            min_samples_leaf=int(min_samples_leaf),
+            min_samples_split=int(min_samples_split),
+            max_features=str(max_features),
+            bootstrap=bool(bootstrap),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.clf = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.ensemble import ExtraTreesClassifier
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # ExtraTrees has no early stopping; fit val into the same tree pool
+        # via concatenation so all available labelled data informs splits.
+        # The inner val rows are still kept distinct in evaluate_window for
+        # the gate's threshold sweep, which is the real selection mechanism.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        self.clf = ExtraTreesClassifier(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            min_samples_leaf=p['min_samples_leaf'],
+            min_samples_split=p['min_samples_split'],
+            max_features=p['max_features'],
+            bootstrap=p['bootstrap'],
+            class_weight={0: 1.0, 1: p['pos_class_weight']},
+            random_state=p['random_state'],
+            n_jobs=-1,
+        )
+        self.clf.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        if self.clf is None:
+            return None
+        return self.clf.feature_importances_
+
+    @property
+    def best_iteration(self):
+        return self._params['n_estimators']
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.clf, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.clf = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -7950,6 +8080,7 @@ TRAINERS = {
     'torch_seq_gru_ensemble': TorchSeqGRUEnsembleTrainer,
     'torch_seq_gru_abstain': TorchSeqGRUAbstainTrainer,
     'torch_seq_gru_day_gate': TorchSeqGRUDayGateTrainer,
+    'sklearn_extra_trees': SklearnExtraTreesTrainer,
 }
 
 
