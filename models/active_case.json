@@ -1,12 +1,12 @@
 {
-  "trainer": "gaussian_nb",
+  "trainer": "kernel_logreg",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from qda_classifier (16 sweeps, plateaued at 1/7 best with FLAT threshold sweep \u2014 saturated posteriors disable SCORE_THRESHOLDS, so no HP can fix the over-trading). gaussian_nb's default config already shows threshold sweep biting (W2 thr=0.55, W3 thr=0.5, W6 thr=0.7, W7 thr=0.6); 210-config search space (var_smoothing 7 \u00d7 pca 5 \u00d7 prior_class1 6) is untouched. The factorized class-conditional likelihood is genuinely different from QDA's full-covariance discriminant and from every other registry trainer.",
-  "claude_iter_id": 788,
-  "designated_at": "2026-05-14T00:08:05"
+  "rationale": "Pivot from gaussian_nb (31 sweeps, saturated at 0/7 with flat threshold sweep \u2014 posteriors collapse to {\u22480,\u22481} so SCORE_THRESHOLDS no-op). Default kernel_logreg HP already hit 2/7 (W4, W6), avg_ann -3.9% (vs gaussian_nb best -8%), threshold sweep alive (0.0-0.7 across windows), W3 ann flipped -23%\u2192+17% and W4 -76%\u2192+15% \u2014 clear bear-regime breakthrough that the 1600-config HP grid (n_components \u00d7 gamma \u00d7 C \u00d7 pca \u00d7 class_weight) is untouched in. First kernel-space classifier in 41-trainer registry \u2014 genuinely new inductive bias slot for train mode to deepen.",
+  "claude_iter_id": 819,
+  "designated_at": "2026-05-14T06:11:03"
 }

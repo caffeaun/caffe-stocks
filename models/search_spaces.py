@@ -1004,6 +1004,54 @@ SEARCH_SPACES: dict[str, dict] = {
         'pca_components':     [0, 16, 32, 48, 64],
         'prior_class1':       [0.0, 0.10, 0.15, 0.20, 0.30, 0.40],
     },
+    # Iter #804: XGB classifier with CV-fit isotonic post-hoc calibration.
+    # Hypothesis is that GaussianNB and QDA saturate scores in the bear
+    # windows (W3/W4/W5) so threshold sweep does not bite; the calibrator
+    # makes thr=0.55 mean "training WR ≥ 55%" by construction. HP space
+    # mirrors xgboost (the underlying classifier) plus calibration knobs
+    # — method ∈ {isotonic, sigmoid} and cv ∈ {3, 5}. Tighter reg_lambda
+    # range than xgboost since CV-folds are smaller and overfit-prone
+    # without early stopping.
+    'xgb_iso_calibrated': {
+        'max_depth':          [3, 4, 6, 8],
+        'learning_rate':      (0.02, 0.08),
+        'n_estimators':       [200, 300, 500],
+        'min_child_weight':   [5, 10, 20, 40],
+        'gamma':              (0.0, 0.4),
+        'subsample':          (0.6, 1.0),
+        'colsample_bytree':   (0.5, 0.9),
+        'reg_alpha':          (0.0, 0.5),
+        'reg_lambda':         (1.0, 4.0),
+        'calib_cv':           [3, 5],
+        'calib_method':       ['isotonic', 'sigmoid'],
+    },
+    # Kernel logistic regression via Nyström RBF approximation (iter #819).
+    # Hypothesis: first kernel-space classifier in the registry — smooth
+    # nonlinear local-conjunction modelling that trees fragment and linear
+    # methods miss. Key knobs:
+    #   n_components ∈ {150, 300, 500, 800} — Nyström landmark count. More
+    #     landmarks → better kernel approximation but slower fit; 300 is
+    #     the default sweet spot for 96-d aggregates.
+    #   gamma ∈ {0.0 ('scale'), 0.01, 0.05, 0.1, 0.5} — RBF bandwidth.
+    #     0.0 = sklearn 'scale' (= 1/(n_features * X.var())); smaller gamma
+    #     = wider kernel (more global similarity); larger gamma = narrower
+    #     (more local).
+    #   C ∈ {0.1, 0.5, 1.0, 3.0, 10.0} — inverse L2 regularization on LR
+    #     head. Small C = strong regularization; large C = fits training
+    #     decision boundary tightly.
+    #   pca_components ∈ {0, 16, 32, 64} — pre-kernel decorrelation.
+    #     0 = use full 96-d (default; preserves regime feature scales);
+    #     >0 = orthogonal projection collapses redundant temporal aggregates.
+    #   class_weight ∈ {'balanced', 'none'} — re-weight loss by class
+    #     frequency. balanced compensates for the ~22% positive class
+    #     without resampling.
+    'kernel_logreg': {
+        'n_components':       [150, 300, 500, 800],
+        'gamma':              [0.0, 0.01, 0.05, 0.1, 0.5],
+        'C':                  [0.1, 0.5, 1.0, 3.0, 10.0],
+        'pca_components':     [0, 16, 32, 64],
+        'class_weight':       ['balanced', 'none'],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

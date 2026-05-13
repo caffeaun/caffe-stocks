@@ -8575,6 +8575,369 @@ class GaussianNaiveBayesClassifierTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# XGBoost Isotonic-Calibrated Classifier (iter #804)
+#
+# Diagnosis (Part A — this iteration):
+#   * Per-window failure pattern across last 20 iters: W3 (-35% avg_ann,
+#     20% WR, 76 trades), W4 (-72%, 17% WR, 69 trades), W5 (-77%, 15% WR,
+#     76 trades). All three are bear regimes (W3 SET -6.9%, W4 -1.6%,
+#     W5 -12.4%, breadth 32-43%, FF -23k to -59k monthly).
+#   * gaussian_nb (last 16 sweeps) and qda_classifier (16 prior sweeps)
+#     both fail with SATURATED posteriors: thr=0.0/0.3/0.5/0.7 all yield
+#     IDENTICAL trade counts in the same window. The score CDF is bimodal
+#     near {0, 1} so SCORE_THRESHOLDS becomes a no-op, leaving the trader
+#     to take top-K per date even when ALL same-day scores are spurious
+#     (bear-regime stop-outs in W3/W4/W5).
+#   * Trade counts of 56-77 per window vs gate floor of 20 confirm the
+#     model is far from over-selective — the WR/DD bar is missed because
+#     too many marginal predictions slip through, not because the model
+#     is too cautious.
+#
+# Hypothesis: isotonic post-hoc calibration via CV gives XGB an
+# empirically-monotonic score → win-rate map. After calibration, thr=0.55
+# means "training WR ≥ 55%" by construction, so the gate's threshold
+# sweep BITES in bear windows where the calibrated score quietly drops
+# (less of training was at high empirical WR for the bear-similar feature
+# regions). Trade count should fall from ~70/win to ~20-30/win in
+# bear windows, lifting WR above the 40% gate floor.
+#
+# Distinct inductive bias from registry:
+#   * vs xgboost: raw logits → sigmoid; uncalibrated, often overconfident
+#     under class imbalance (scale_pos_weight stretches scores toward {0,1})
+#   * vs xgb_meta_label: meta-labeling predicts whether to ACCEPT another
+#     model's signal; this is a single-stage calibrated classifier
+#   * vs xgb_strict_win: hard-label retraining on stricter class; this
+#     keeps the v1 label and corrects only the score function
+#   * vs xgb_focal_loss: re-weighted loss with same uncalibrated output
+#   * vs gaussian_nb / qda_classifier: generative posteriors that saturate;
+#     this is discriminative + post-hoc isotonic (no parametric assumption
+#     about p(x|y))
+#
+# Implementation note: CalibratedClassifierCV with method='isotonic' and
+# cv=3 fits 3 inner XGB models on different folds of the train data, uses
+# each model's out-of-fold predictions to fit an isotonic regressor, then
+# averages the 3 calibrated predictions at inference. The inner XGB does
+# NOT get early stopping (sklearn's CV interface doesn't pass an eval_set)
+# but the n_estimators is held modest (300) and reg_lambda elevated to
+# prevent the smaller-fold over-fit that early stopping would otherwise
+# catch. Time budget per window: ~6-8s (3× the base XGB fit).
+# --------------------------------------------------------------------- #
+class XGBoostIsotonicCalibratedTrainer(BaseTrainer):
+    """XGB classifier wrapped in CV-based isotonic calibration."""
+
+    name = 'xgb_iso_calibrated'
+
+    def __init__(self,
+                 max_depth: int = 4,
+                 learning_rate: float = 0.05,
+                 n_estimators: int = 300,
+                 subsample: float = 0.8,
+                 colsample_bytree: float = 0.6,
+                 reg_alpha: float = 0.1,
+                 reg_lambda: float = 2.0,
+                 min_child_weight: float = 10.0,
+                 gamma: float = 0.1,
+                 calib_cv: int = 3,
+                 calib_method: str = 'isotonic',
+                 pos_class_weight: float = 0.0,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            max_depth=int(max_depth),
+            learning_rate=float(learning_rate),
+            n_estimators=int(n_estimators),
+            subsample=float(subsample),
+            colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha),
+            reg_lambda=float(reg_lambda),
+            min_child_weight=float(min_child_weight),
+            gamma=float(gamma),
+            calib_cv=int(calib_cv),
+            calib_method=str(calib_method),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.clf = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+        from sklearn.calibration import CalibratedClassifierCV
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # Use full train+val data for calibration fitting (more rows → better
+        # isotonic regression). The CV inside CalibratedClassifierCV provides
+        # the train/calib separation needed to avoid the in-bag calibration
+        # bias that would arise from fitting on the same rows used for XGB.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        if p['pos_class_weight'] > 0:
+            spw = p['pos_class_weight']
+        else:
+            pos_rate = float(np.mean(y_full))
+            spw = float(min((1.0 - pos_rate) / max(pos_rate, 1e-6), 15.0))
+
+        base_xgb = xgb.XGBClassifier(
+            n_estimators=p['n_estimators'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            subsample=p['subsample'],
+            colsample_bytree=p['colsample_bytree'],
+            scale_pos_weight=spw,
+            reg_alpha=p['reg_alpha'],
+            reg_lambda=p['reg_lambda'],
+            min_child_weight=p['min_child_weight'],
+            gamma=p['gamma'],
+            objective='binary:logistic',
+            eval_metric='logloss',
+            random_state=p['random_state'],
+            n_jobs=-1,
+            tree_method='hist',
+            verbosity=0,
+        )
+        self.clf = CalibratedClassifierCV(
+            base_xgb,
+            method=p['calib_method'],
+            cv=p['calib_cv'],
+            n_jobs=1,
+        )
+        self.clf.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'calibrated.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.clf, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'calibrated.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.clf = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
+# Kernel Logistic Regression via Nyström RBF approximation (iter #819)
+#
+# Diagnosis (Part A — this iteration):
+#   * Per-window failure across last 20 iters (#799–818, all gaussian_nb):
+#       W1 wr=0.31 ann=+146% dd=0.20 (close — fails on WR floor 0.40)
+#       W2 wr=0.28 ann=+27%  dd=0.26 (fails on WR + DD)
+#       W3 wr=0.21 ann=-23%  dd=0.31 (bear — uniformly hostile)
+#       W4 wr=0.17 ann=-76%  dd=0.43 (mild SET decline but high DD)
+#       W5 wr=0.14 ann=-79%  dd=0.45 (severe bear, breadth 32%)
+#       W6 wr=0.31 ann=+143% dd=0.20 (close)
+#       W7 wr=0.25 ann=-16%  dd=0.23 (close-to-passing)
+#     gaussian_nb is fully saturated (31 iters, 0 pass).
+#   * Regime stats: W3 (-7% SET, breadth 38%), W4 (-2% SET, breadth 43%),
+#     W5 (-13% SET, breadth 32%) are the bear-regime test windows; trainers
+#     fail uniformly here regardless of family. W4 is mild macro but still
+#     a 43% DD trainwreck — model picks wrong stocks, not too many.
+#   * Baseline reference: random_topk = -30% avg_ann (1/7 pass via W5
+#     happenstance); rule_only = -28% (0/7). The model's job is to beat
+#     these by picking BETTER per-date trades, not by trading less.
+#
+# Hypothesis: kernel methods are the largest under-represented inductive-
+# bias slot in the 41-trainer registry. Existing families are all axis-
+# aligned trees (XGB/LightGBM/ExtraTrees), distance (KNN), linear
+# (logistic_elastic_net), full-covariance generative (QDA),
+# factorized generative (GaussianNB), sequence-recurrent (torch_seq_*),
+# or attention-MLP (torch_attentive_mlp). NONE map features into an RBF
+# kernel space and learn a max-margin / max-likelihood boundary there.
+#
+# RBF kernel logistic regression captures *local* conjunctions:
+#   "high volume_ratio AND positive sector_breadth AND atr_pct in [0.02,0.05]"
+# becomes a single bump in kernel space, vs trees fragmenting it into
+# many leaves. In bear regimes (W3/W5) where the win-class manifold is
+# sparser, kernel methods can model the thin winning region without the
+# spurious axis-aligned splits that trees fall into when training on a
+# bull-heavy mix.
+#
+# Implementation:
+#   * Nyström RBF approximation with n_components=300: O(N*m^2) vs O(N^2)
+#     for exact kernel SVM. 300 components are enough to span the local
+#     structure of the 96-d aggregate feature space without blowing wall
+#     time. Random landmark sampling.
+#   * Logistic regression (sklearn LogisticRegression with lbfgs) on the
+#     Nyström-transformed features. Gives true probabilities (well
+#     calibrated by construction, unlike NB/QDA saturating posteriors).
+#   * class_weight='balanced' to compensate for ~22% positive class rate
+#     without hard re-sampling.
+#   * StandardScaler first (kernel methods are scale-sensitive, RBF
+#     gamma is computed in scaled space).
+#   * Optional PCA reduction before Nyström (de-correlate the 96-d
+#     last/mean/std/dev aggregate; defaults to off for the gate run since
+#     PCA loses the absolute-level info that breadth/SET features carry).
+#
+# Distinct inductive bias vs registry: first kernel-space classifier.
+# vs KNN: KNN is local but unsmoothed and uniform-weight; this is local
+#         but smoothed (Gaussian kernel) and max-likelihood weighted.
+# vs logistic_elastic_net: same final classifier head, but in 300-d
+#         nonlinear kernel feature space instead of 96-d raw features.
+# vs trees: smooth nonlinear surface vs axis-aligned step function.
+# vs QDA/NB: discriminative (no class-conditional Gaussian assumption);
+#         calibrated proba (no saturation pathology).
+# --------------------------------------------------------------------- #
+class KernelLogRegTrainer(BaseTrainer):
+    """RBF-kernel logistic regression via Nyström approximation."""
+
+    name = 'kernel_logreg'
+
+    def __init__(self,
+                 n_components: int = 300,
+                 gamma: float = 0.0,  # 0 → 1/(n_features * X.var())
+                 C: float = 1.0,
+                 max_iter: int = 200,
+                 pca_components: int = 0,
+                 class_weight: str = 'balanced',
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_components=int(n_components),
+            gamma=float(gamma),
+            C=float(C),
+            max_iter=int(max_iter),
+            pca_components=int(pca_components),
+            class_weight=str(class_weight),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.decomposition import PCA
+        from sklearn.kernel_approximation import Nystroem
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        # Cap n_components by available rows (Nyström subsamples landmarks
+        # from X; can't sample more than the row count).
+        ncomp = min(p['n_components'], X_full.shape[0])
+        gamma = p['gamma'] if p['gamma'] > 0 else 'scale'
+
+        cw = p['class_weight'] if p['class_weight'] != 'none' else None
+
+        steps = [('scaler', StandardScaler(with_mean=True, with_std=True))]
+        if p['pca_components'] > 0:
+            n_pca = min(p['pca_components'], X_full.shape[1], X_full.shape[0])
+            steps.append(('pca', PCA(
+                n_components=n_pca, random_state=p['random_state'])))
+        # Nyström: 1/(n_features * X.var()) when gamma='scale'. Per sklearn
+        # 1.8 API, Nystroem.gamma accepts None to auto-set; we mimic that
+        # with explicit 'scale' handling: compute on post-scaler features.
+        steps.append(('nystroem', Nystroem(
+            kernel='rbf',
+            gamma=None if gamma == 'scale' else gamma,
+            n_components=ncomp,
+            random_state=p['random_state'],
+        )))
+        steps.append(('clf', LogisticRegression(
+            C=p['C'],
+            solver='lbfgs',
+            max_iter=p['max_iter'],
+            class_weight=cw,
+            random_state=p['random_state'],
+        )))
+        self.pipe = Pipeline(steps)
+        self.pipe.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        # No per-input-feature importance after the Nyström map.
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -8619,6 +8982,8 @@ TRAINERS = {
     'knn_classifier': KNNClassifierTrainer,
     'qda_classifier': QDAClassifierTrainer,
     'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
+    'xgb_iso_calibrated': XGBoostIsotonicCalibratedTrainer,
+    'kernel_logreg': KernelLogRegTrainer,
 }
 
 
