@@ -1,12 +1,12 @@
 {
-  "trainer": "knn_classifier",
+  "trainer": "qda_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot to the new knn_classifier family \u2014 first non-parametric trainer in the registry. Default HP (k=100, distance, manhattan, pca=0) already beats both baselines (avg_ann -3.3% vs random_topk -30.2% / rule_only -27.8%) AND the prior logistic_elastic_net default (-8.8%) AND produces a clean W2 pass (+79.5% ann / 40.9% WR). HP space is wide and untouched: n_neighbors \u2208 {25,50,100,200,400}, weights, metric, pca_components \u2208 {0,16,32,64}, leaf_size \u2014 the bias-variance dial alone has 5 unexplored points, and pca_components > 0 (collapsing 96-d redundant aggregates) is the most promising untested move.",
-  "claude_iter_id": 756,
-  "designated_at": "2026-05-13T18:08:26"
+  "rationale": "Pivot from knn_classifier (16 sweeps, plateaued at best 3/7 #770 +47.9% ann, last 4 iters 1-2/7) to qda_classifier \u2014 first generative classifier in registry. Default reg_param=0.6 pca=16 already passes W6 cleanly (40.9% WR / 13.8% DD); the 105-config search space (reg_param \u2208 7 values \u00d7 pca \u2208 5 \u00d7 tol \u2208 3) is untouched. The genuinely different inductive bias (class-conditional Gaussian densities \u2192 Bayes posterior) is the next experiment after knn's distance-weighted heuristic plateaued.",
+  "claude_iter_id": 772,
+  "designated_at": "2026-05-13T21:10:09"
 }

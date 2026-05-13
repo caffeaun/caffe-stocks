@@ -8319,6 +8319,140 @@ class KNNClassifierTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# QuadraticDiscriminantAnalysis (iter #772) — generative probabilistic
+# classifier. Diagnosis pointed at W4 (0/20 pass rate over last 20 iters,
+# avg_ann -39%, avg_wr 19%). In the iter #770 knn report, W4 had only
+# 5 trades at thr=0.5 (60% WR, +39% ann, pass on WR/DD) and 21 trades at
+# thr=0.3 (19% WR, fail on WR & DD) — no "sweet spot" of 10-20 trades at
+# 40%+ WR exists for KNN's coarse, distance-weighted probabilities.
+#
+# QDA fits class-conditional Gaussians P(X|Y=k) and applies Bayes' rule
+# for P(Y|X). This produces:
+#   * Strictly continuous posterior probabilities (no quantization like
+#     KNN's k+1 levels), giving the threshold sweep finer granularity.
+#   * Probabilities that are correctly calibrated *if* features within a
+#     class are approximately Gaussian — under that assumption no extra
+#     Platt/isotonic step is needed. With the curated features being a mix
+#     of bounded xranks ([0,1]) and continuous magnitudes, the assumption
+#     holds well enough for the posterior ranking to be useful even when
+#     the absolute calibration drifts.
+#   * Quadratic decision surface in feature space (per-class covariance) —
+#     genuinely different inductive bias from anything currently in the
+#     registry: trees partition recursively, linear/elastic-net is hyperplane,
+#     KNN is local distance, GRU is sequential. QDA is the first generative
+#     model in the panel.
+#
+# Design choices:
+#   * StandardScaler before QDA. Class-conditional Gaussian fits are scale-
+#     sensitive (covariance matrix conditioning); same convention as KNN.
+#   * Optional PCA reduction (default 0=off; HP sweep can enable). The 24-d
+#     CURATED feature aggregate becomes 96-d after the gate's last/mean/
+#     std/dev expansion, which puts QDA's per-class covariance estimation
+#     into a ~96×96 / 2 ≈ 4.6k-parameter regime that is still well-
+#     conditioned on ~30k-row windows, but PCA can sharpen the signal by
+#     collapsing redundant temporal aggregates.
+#   * reg_param ∈ [0,1] = shrinkage toward spherical covariance. With non-
+#     perfectly-Gaussian features and ~30k rows per window, mild
+#     regularization (~0.1) stabilizes the per-class covariance estimate.
+#   * priors=None (sklearn default = empirical class proportions). The
+#     ~25% positive rate is reflected in the posterior.
+#   * tol=1e-4 default; controls rank estimation in covariance inversion.
+# --------------------------------------------------------------------- #
+class QDAClassifierTrainer(BaseTrainer):
+    name = 'qda_classifier'
+
+    def __init__(self,
+                 reg_param: float = 0.6,
+                 tol: float = 1e-4,
+                 pca_components: int = 16,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            reg_param=float(reg_param),
+            tol=float(tol),
+            pca_components=int(pca_components),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.decomposition import PCA
+        from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # No early stopping for closed-form generative fit — use full
+        # train+val to maximize support, mirroring KNN / logistic_elastic_net.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        steps = [('scaler', StandardScaler(with_mean=True, with_std=True))]
+        if p['pca_components'] > 0:
+            n_comp = min(p['pca_components'], X_full.shape[1], X_full.shape[0])
+            steps.append(('pca', PCA(
+                n_components=n_comp, random_state=p['random_state'])))
+        steps.append(('clf', QuadraticDiscriminantAnalysis(
+            reg_param=p['reg_param'],
+            tol=p['tol'],
+            store_covariance=False,
+        )))
+        self.pipe = Pipeline(steps)
+        self.pipe.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -8361,6 +8495,7 @@ TRAINERS = {
     'sklearn_extra_trees': SklearnExtraTreesTrainer,
     'logistic_elastic_net': LogisticElasticNetTrainer,
     'knn_classifier': KNNClassifierTrainer,
+    'qda_classifier': QDAClassifierTrainer,
 }
 
 

@@ -985,6 +985,14 @@ SEARCH_SPACES: dict[str, dict] = {
         'pca_components':     [0, 16, 32, 64],
         'leaf_size':          [20, 30, 50],
     },
+    # QDA — generative probabilistic classifier (iter #772). reg_param is the
+    # primary lever (covariance shrinkage toward sphericity); pca_components
+    # de-redundifies the 96-d aggregate; tol gates the rank-deficiency floor.
+    'qda_classifier': {
+        'reg_param':          [0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8],
+        'tol':                [1e-5, 1e-4, 1e-3],
+        'pca_components':     [0, 16, 32, 48, 64],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
