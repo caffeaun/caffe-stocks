@@ -1,12 +1,12 @@
 {
-  "trainer": "qda_classifier",
+  "trainer": "gaussian_nb",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from knn_classifier (16 sweeps, plateaued at best 3/7 #770 +47.9% ann, last 4 iters 1-2/7) to qda_classifier \u2014 first generative classifier in registry. Default reg_param=0.6 pca=16 already passes W6 cleanly (40.9% WR / 13.8% DD); the 105-config search space (reg_param \u2208 7 values \u00d7 pca \u2208 5 \u00d7 tol \u2208 3) is untouched. The genuinely different inductive bias (class-conditional Gaussian densities \u2192 Bayes posterior) is the next experiment after knn's distance-weighted heuristic plateaued.",
-  "claude_iter_id": 772,
-  "designated_at": "2026-05-13T21:10:09"
+  "rationale": "Pivot from qda_classifier (16 sweeps, plateaued at 1/7 best with FLAT threshold sweep \u2014 saturated posteriors disable SCORE_THRESHOLDS, so no HP can fix the over-trading). gaussian_nb's default config already shows threshold sweep biting (W2 thr=0.55, W3 thr=0.5, W6 thr=0.7, W7 thr=0.6); 210-config search space (var_smoothing 7 \u00d7 pca 5 \u00d7 prior_class1 6) is untouched. The factorized class-conditional likelihood is genuinely different from QDA's full-covariance discriminant and from every other registry trainer.",
+  "claude_iter_id": 788,
+  "designated_at": "2026-05-14T00:08:05"
 }

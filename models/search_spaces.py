@@ -993,6 +993,17 @@ SEARCH_SPACES: dict[str, dict] = {
         'tol':                [1e-5, 1e-4, 1e-3],
         'pca_components':     [0, 16, 32, 48, 64],
     },
+    # GaussianNB — feature-independence generative (iter #788). var_smoothing
+    # is the primary regularization (added to variance for numerical
+    # stability; tiny=brittle, large=quasi-uniform); pca_components
+    # decorrelates inputs so the independence assumption holds by
+    # construction; prior_class1 explicitly tilts the prior (0 = MLE from
+    # the training base rate ≈ 0.22).
+    'gaussian_nb': {
+        'var_smoothing':      [1e-12, 1e-10, 1e-9, 1e-7, 1e-5, 1e-3, 1e-1],
+        'pca_components':     [0, 16, 32, 48, 64],
+        'prior_class1':       [0.0, 0.10, 0.15, 0.20, 0.30, 0.40],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

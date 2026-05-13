@@ -8452,6 +8452,128 @@ class QDAClassifierTrainer(BaseTrainer):
         return inst
 
 
+class GaussianNaiveBayesClassifierTrainer(BaseTrainer):
+    """Gaussian Naive Bayes — generative classifier with feature-independence prior.
+
+    Iter #788: pivot from qda_classifier (16 sweeps, flat threshold sweep —
+    saturated probabilities make SCORE_THRESHOLDS useless, scores collapsed
+    to {≈0, ≈1} for QDA's full-covariance discriminant). QDA's W3/W4/W5
+    over-trading (78-93 trades, 12-17% WR, 40-60% DD) is structural to
+    full-covariance modelling on a 96-d aggregate where bear-regime test
+    rows fall inside the trained "win" class manifold and threshold gating
+    cannot filter them out.
+
+    GaussianNB factorizes class-conditional likelihood per feature
+    (independence assumption). Combined with upstream PCA decorrelation,
+    the independence assumption holds by construction on the orthogonalized
+    components, and the resulting posterior is a product of Gaussian CDFs
+    that varies SMOOTHLY across [0,1] — restoring threshold-sweep
+    sensitivity that QDA loses to its bimodal score distribution.
+
+    Distinct inductive bias from all 40 prior trainers in the registry:
+    neither trees (XGB / LightGBM / sklearn_extra_trees), nor neural nets
+    (torch_*), nor distance (KNN), nor full-covariance generative (QDA),
+    nor discriminative linear (logistic_elastic_net) factorize the
+    likelihood per feature the way Gaussian NB does. The factorization
+    means rows with macro features inconsistent with the trained "win"
+    Gaussians (low breadth, negative SET-zscore, bear foreign flow) get
+    multiplicatively suppressed posteriors — the right inductive bias
+    for the W3/W4/W5 bear-regime bottleneck identified in Part A.3.
+    """
+    name = 'gaussian_nb'
+
+    def __init__(self,
+                 var_smoothing: float = 1e-9,
+                 pca_components: int = 16,
+                 prior_class1: float = 0.0,  # 0 = estimate from data
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            var_smoothing=float(var_smoothing),
+            pca_components=int(pca_components),
+            prior_class1=float(prior_class1),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.decomposition import PCA
+        from sklearn.naive_bayes import GaussianNB
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        priors = None
+        if 0.0 < p['prior_class1'] < 1.0:
+            priors = [1.0 - p['prior_class1'], p['prior_class1']]
+
+        steps = [('scaler', StandardScaler(with_mean=True, with_std=True))]
+        if p['pca_components'] > 0:
+            n_comp = min(p['pca_components'], X_full.shape[1], X_full.shape[0])
+            steps.append(('pca', PCA(
+                n_components=n_comp, random_state=p['random_state'])))
+        steps.append(('clf', GaussianNB(
+            priors=priors,
+            var_smoothing=p['var_smoothing'],
+        )))
+        self.pipe = Pipeline(steps)
+        self.pipe.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
 # --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
@@ -8496,6 +8618,7 @@ TRAINERS = {
     'logistic_elastic_net': LogisticElasticNetTrainer,
     'knn_classifier': KNNClassifierTrainer,
     'qda_classifier': QDAClassifierTrainer,
+    'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
 }
 
 
