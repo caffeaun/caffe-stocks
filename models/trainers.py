@@ -8041,6 +8041,144 @@ class SklearnExtraTreesTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Logistic regression with elastic net + polynomial interaction features.
+#
+# Iter #750 hypothesis (diagnostic-driven, see claude_iter #750 report):
+#   All 37 prior trainers are tree-based (XGB/LGBM/ExtraTrees, axis-aligned
+#   step-function splits) or NN-based (GRU/Transformer/MLP, smooth via
+#   ReLU/sigmoid stacks). Part-A diagnosis shows W1 (bull +6.3%, only 6 mo
+#   train, 0/20 pass) and W5 (hostile bear -12.7%, breadth 0.10, 1/20 pass)
+#   are the binding regimes. Both failure modes are classic high-variance
+#   estimator problems: trees overfit small-sample regimes (W1) and produce
+#   wild axis-aligned scores on out-of-distribution rows (W5).
+#
+# A linear classifier with degree-2 interaction features is a genuinely
+# different inductive bias: convex MLE objective (no local minima), smooth
+# logistic decision surface, provably calibrated P(y=1|x) under MLE, and a
+# strong inductive bias (linearity in φ(x)) that lowers variance for small
+# samples. Elastic net (L1+L2) handles correlated curated features and
+# auto-sparsifies; pairwise interactions let the linear surface model
+# "regime × signal" interactions that single-feature linear cannot.
+# --------------------------------------------------------------------- #
+class LogisticElasticNetTrainer(BaseTrainer):
+    name = 'logistic_elastic_net'
+
+    def __init__(self,
+                 C: float = 0.1,
+                 l1_ratio: float = 0.5,
+                 pos_class_weight: float = 2.0,
+                 # degree=1 default: pure linear in 96 aggregate features —
+                 # SAGA fit ~5-15s/window vs ~2-4min/window at degree=2
+                 # (4656 polynomial features). Train mode can sweep degree=2
+                 # over the next hours if degree=1 shows promise.
+                 degree: int = 1,
+                 max_iter: int = 1000,
+                 tol: float = 1e-3,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            C=float(C),
+            l1_ratio=float(l1_ratio),
+            pos_class_weight=float(pos_class_weight),
+            degree=int(degree),
+            max_iter=int(max_iter),
+            tol=float(tol),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # No inner-val early stopping for LR — concatenate to maximize the
+        # MLE sample. Threshold sweep in the gate handles selection.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        steps = []
+        if p['degree'] > 1:
+            # interaction_only=True: drop x_i^2 terms (RobustScaler-centered
+            # inputs already capture magnitude via |x|; squares are redundant
+            # and double the parameter count).
+            steps.append(('poly', PolynomialFeatures(
+                degree=p['degree'], interaction_only=True, include_bias=False,
+            )))
+        # Re-standardize after PolynomialFeatures so the L1 penalty applies
+        # uniformly across feature scales (products of [0,1] features stay
+        # small but products of std/slope aggregates can blow up).
+        steps.append(('scaler', StandardScaler(with_mean=True, with_std=True)))
+        # sklearn 1.8 deprecated explicit penalty='elasticnet' / n_jobs in favor
+        # of inferring penalty from l1_ratio alone; pass C + l1_ratio only.
+        steps.append(('clf', LogisticRegression(
+            C=p['C'],
+            l1_ratio=p['l1_ratio'],
+            solver='saga',
+            class_weight={0: 1.0, 1: p['pos_class_weight']},
+            max_iter=p['max_iter'],
+            tol=p['tol'],
+            random_state=p['random_state'],
+            verbose=1 if verbose else 0,
+        )))
+        self.pipe = Pipeline(steps)
+        self.pipe.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        # Polynomial expansion makes per-input importance lossy; skip.
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -8081,6 +8219,7 @@ TRAINERS = {
     'torch_seq_gru_abstain': TorchSeqGRUAbstainTrainer,
     'torch_seq_gru_day_gate': TorchSeqGRUDayGateTrainer,
     'sklearn_extra_trees': SklearnExtraTreesTrainer,
+    'logistic_elastic_net': LogisticElasticNetTrainer,
 }
 
 

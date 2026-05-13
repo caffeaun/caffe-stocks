@@ -1,12 +1,12 @@
 {
-  "trainer": "sklearn_extra_trees",
+  "trainer": "logistic_elastic_net",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot to the new ExtraTrees family so train mode can explore its untested HP space (n_estimators, depth caps, leaf sizes, max_features, class_weight); defaults trade too aggressively (avg_wr 24.5%, 378 trades) \u2014 selective HPs (deeper leaf caps, higher min_samples_leaf, lower pos_class_weight) are the natural next sweep direction. xgb_quarterly_dro has been swept 43 iters post-fix with no breakthrough.",
-  "claude_iter_id": 734,
-  "designated_at": "2026-05-13T12:11:52"
+  "rationale": "Pivot to the new logistic_elastic_net family for HP sweep \u2014 first-run degree=1 default already beats both baselines on avg_ann (-8.8% vs random_topk -30.2%, rule_only -27.8%) and hits +84% ann / 35% WR on W3, the bear window every tree-family trainer fails on. The HP space is wide (C/l1_ratio/pos_class_weight/degree\u2208{1,2}/max_iter) and untouched; degree=2 in particular is unexplored and adds 4560 interaction features that should lift the WR ceiling that all 37 prior trainers saturate at ~30%.",
+  "claude_iter_id": 750,
+  "designated_at": "2026-05-13T15:21:20"
 }

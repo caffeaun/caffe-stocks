@@ -940,6 +940,25 @@ SEARCH_SPACES: dict[str, dict] = {
         'bootstrap':          [0, 1],
         'pos_class_weight':   (1.0, 4.0),
     },
+    # Logistic regression with elastic net + polynomial interaction features.
+    # Genuinely new inductive bias vs the rest of the registry (no other linear
+    # model). Convex MLE objective + smooth logistic surface lower variance for
+    # small-sample regimes (W1) and extrapolate more sanely on out-of-distribution
+    # rows (W5 hostile-bear). Train mode sweep knobs:
+    #   C ∈ [0.01, 10]   — inverse reg strength; smaller = stronger penalty,
+    #     more useful when degree=2 polynomial features explode dimensionality.
+    #   l1_ratio ∈ [0.1, 0.9] — elasticnet mix; higher = more L1 sparsity.
+    #   pos_class_weight ∈ [1.0, 5.0] — handles the ~11% positive label rate.
+    #   degree ∈ {1, 2} — 1 = pure linear (fast, 96 features); 2 = pairwise
+    #     interactions (4656 features, ~30s/window fit, captures "regime × signal").
+    #   max_iter ∈ {500, 1000, 2000} — SAGA convergence budget.
+    'logistic_elastic_net': {
+        'C':                 (0.01, 10.0),
+        'l1_ratio':          (0.1, 0.9),
+        'pos_class_weight':  (1.0, 5.0),
+        'degree':            [1, 2],
+        'max_iter':          [500, 1000, 2000],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
