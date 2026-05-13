@@ -195,10 +195,10 @@ A.1. **Baselines** — what does a non-model strategy score on this same gate?
    - You may reuse the baseline numbers across iterations if the underlying data hasn't changed materially — cache via `data/baselines.json` if helpful. Re-run them weekly.
 
 A.2. **Per-window regime stats** — for each of the 7 walk-forward TEST windows, compute on the test slice only:
-   - SET index return (close-on-close)
+   - SET index return (close-on-close). If `data/candles.db.investing_set_index` is empty for the window (it currently only covers 2026-02..2026-03), fall back to equal-weighted close-to-close return aggregated from `candles` — same shape, smaller bias.
    - SET volatility (20d realized std of returns)
    - Market breadth (mean % of symbols above their 20d SMA, across the window)
-   - Foreign-flow direction (positive / negative aggregate net for the window)
+   - Foreign-flow direction (positive / negative aggregate net for the window). The daily table `data/candles.db.foreign_flows` is sparsely populated (~2026 only). The monthly table `data/candles.db.foreign_flows_monthly` (columns: month TEXT 'YYYY-MM', net_value REAL) holds 1995-01..2026-02 and IS sufficient for window-level direction — sum `net_value` across the months overlapping the test window. Do not submit a data request to backfill daily foreign_flows; the monthly table already meets Part A.2's requirement.
    Report a small table. Flag windows that look hostile (negative SET return + high vol + bearish foreign flow). This tells you whether failures are regime-correlated.
 
 A.3. **Failure pattern across last 20 iterations** — query feedback DB. Cross-tab `trainer × window`: which windows consistently fail across trainers? If W1, W4, W5 fail in 18/20 recent runs regardless of trainer family, the bottleneck is in those regimes' data, not model architecture.
