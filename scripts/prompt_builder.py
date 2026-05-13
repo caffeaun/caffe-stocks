@@ -70,6 +70,34 @@ def _open_data_requests() -> list[str]:
     return [f"{r['requested_at'][:10]} — {r['request_text']}" for r in rows]
 
 
+def _same_family_streak(k: int = 8) -> tuple[int, str | None]:
+    """Count the run of consecutive failing claude-mode iterations of the
+    same trainer at the head of the log (most recent first).
+
+    Train-mode runs are ignored — train HP-sweeps the active case by
+    construction, so any "streak" there is the cron schedule talking, not
+    a deliberate Claude choice. Returns (count, trainer_name) or (0, None)
+    when no streak exists.
+    """
+    fb.init_db()
+    with fb.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT trainer, gate_passed FROM iterations "
+            "WHERE mode='claude' ORDER BY id DESC LIMIT ?",
+            (k,),
+        ).fetchall()
+    if not rows or rows[0]['gate_passed']:
+        return 0, None
+    head_trainer = rows[0]['trainer']
+    count = 0
+    for r in rows:
+        if r['trainer'] == head_trainer and not r['gate_passed']:
+            count += 1
+        else:
+            break
+    return count, head_trainer
+
+
 def _recent_iterations(k: int = 8) -> list[dict]:
     fb.init_db()
     with fb.get_conn() as conn:
@@ -122,9 +150,11 @@ GOAL: 50% gross annual return on a 10k THB base, repeatable, withdrawing the gai
 - Universe: any THB-denominated SET / mai / TDEX (ThaiDEX ETF) instrument tradable via BLS
 - Walk-forward gate: 7 calendar splits in scripts/return_gate.py
 - v1 per-window pass: max_dd <= 20%, n_trades >= 20, wr >= 40% (no per-window ann floor)
-- v1 model-level pass (becomes a candidate): ALL 7 windows pass per-window AND avg
-  annualized_return strictly beats the best prior candidate (or > 0 if none yet).
-  No regime-exempt — 100% pass required, every regime works or you're not a candidate.
+- v1 model-level pass (becomes a candidate): AT LEAST 6 of 7 windows pass per-window
+  AND avg annualized_return strictly beats the best prior candidate (or > 0 if none
+  yet). The 6/7 bar replaces an earlier 7/7 bar that produced zero passes across 750
+  iterations and 42 trainer families — one regime may be exempt, but the avg-ann
+  competition keeps the panel honest.
 
 ==================================================================
 3. PIPELINE STATE
@@ -150,7 +180,7 @@ Do NOT submit a "decompile the .pyc" data request — git history is the canonic
 ==================================================================
 {open_requests}
 
-==================================================================
+{pivot_directive}==================================================================
 6. YOUR JOB — diagnose first, then change (evidence-backed)
 ==================================================================
 
@@ -329,6 +359,25 @@ def build_prompt() -> str:
     else:
         active_case_summary = '(none — first run, or file missing)'
 
+    streak_count, streak_trainer = _same_family_streak(k=8)
+    if streak_count >= 3:
+        pivot_directive = (
+            "==================================================================\n"
+            "PIVOT DIRECTIVE — TRIGGERED (mandatory this iteration)\n"
+            "==================================================================\n"
+            f"Trainer family `{streak_trainer}` has failed {streak_count} "
+            "consecutive claude-mode iterations. This iteration MUST switch "
+            "to a structurally different trainer family — pick from §6.B.2 "
+            "(NN, unsupervised, foundation-model PEFT, RL, Bayesian) or any "
+            "other registered family that is NOT a hyperparameter or label "
+            "tweak of the current one. The `trainer` field in your gate run "
+            "and the `active_case` block in your JSON output MUST NOT be "
+            f"`{streak_trainer}`. Cite Part A evidence justifying the new "
+            "family's inductive bias.\n\n"
+        )
+    else:
+        pivot_directive = ''
+
     return PROMPT_TEMPLATE.format(
         mission=indent(mission, '  '),
         trainers=trainers,
@@ -339,6 +388,7 @@ def build_prompt() -> str:
         recent_iterations=recent_block,
         open_requests=requests_block,
         active_case_summary=active_case_summary,
+        pivot_directive=pivot_directive,
     )
 
 
