@@ -41,14 +41,84 @@ from scripts import feedback as fb
 PANEL_DIR = BASE / 'models' / 'panel'
 
 
+# Engine-family map for panel diversity. Trainers that share an underlying
+# inductive bias (XGB ranker objective, XGB binary classifier, XGB regressor,
+# NN, etc.) tend to ride the same regime failures together — registry-key
+# dedupe alone is too loose because half the registry is XGB-flavored.
+# Unknown trainers fall back to their own name in `_engine_family`, so a
+# brand-new family is automatically treated as distinct.
+ENGINE_FAMILY = {
+    # Learning-to-rank objectives (pairwise / per-date groups)
+    'ev_gated_ranker':          'ranker',
+    'bagged_ev_gated_ranker':   'ranker',
+    'stacked_ranker':           'ranker',
+    'xgb_ranker':               'ranker',
+    'xgb_ranker_dart':          'ranker',
+    'xgb_rank_fusion':          'ranker',
+    'xgb_win_ranker':           'ranker',
+    'lightgbm_ranker':          'ranker',
+
+    # XGB / LightGBM binary classifiers (various loss / sampling variants)
+    'xgboost':                  'xgb_classifier',
+    'lightgbm':                 'xgb_classifier',
+    'xgb_focal_loss':           'xgb_classifier',
+    'xgb_group_balanced_focal': 'xgb_classifier',
+    'xgb_strict_win':           'xgb_classifier',
+    'xgb_magnitude_classifier': 'xgb_classifier',
+    'xgb_topk_classifier':      'xgb_classifier',
+    'xgb_mcdropout_classifier': 'xgb_classifier',
+    'xgb_meta_label':           'xgb_classifier',
+    'xgb_day_quality_consensus':'xgb_classifier',
+    'xgb_recency_consensus':    'xgb_classifier',
+    'xgb_jtt':                  'xgb_classifier',
+    'xgb_adv_val':              'xgb_classifier',
+    'xgb_quarterly_dro':        'xgb_classifier',
+    'xgb_regime_blend':         'xgb_classifier',
+    'xgb_temporal_mixup':       'xgb_classifier',
+
+    # XGB / LightGBM regressors (continuous targets)
+    'xgb_regressor':            'xgb_regressor',
+    'xgb_huber_regressor':      'xgb_regressor',
+    'xgb_quantile':             'xgb_regressor',
+    'xgb_dual_quantile':        'xgb_regressor',
+    'bagged_xgb_regressor':     'xgb_regressor',
+    'lightgbm_regressor':       'xgb_regressor',
+
+    # Non-XGB trees (randomized splits — different inductive bias from greedy XGB)
+    'sklearn_extra_trees':      'tree_other',
+
+    # Linear / kernel
+    'logistic_elastic_net':     'linear',
+
+    # Neural networks (MLP / GRU / Transformer)
+    'torch_attentive_mlp':      'nn',
+    'torch_seq_gru':            'nn',
+    'torch_seq_gru_abstain':    'nn',
+    'torch_seq_gru_day_gate':   'nn',
+    'torch_seq_gru_ensemble':   'nn',
+    'torch_seq_transformer':    'nn',
+}
+
+
+def _engine_family(trainer: str) -> str:
+    """Map a registry key to an engine family for panel diversity.
+
+    Unknown trainers fall back to their own registry key — so a freshly
+    added family that hasn't been categorized yet is automatically treated
+    as distinct from everything else.
+    """
+    return ENGINE_FAMILY.get(trainer, trainer)
+
+
 def select_top_candidates(k: int = 3, days: int = 30) -> list[dict]:
-    """Top-k by WR, **one per trainer family**, current-registry only,
+    """Top-k by WR, **one per engine family**, current-registry only,
     gate_passed not required.
 
-    Diversity matters more than marginal WR: 3 distinct families produce
-    uncorrelated drawdowns. 3 of the same family ride the same regime
-    failure into the ground together. So dedupe on `trainer` alone, not
-    on (trainer, hyperparams).
+    Diversity matters more than marginal WR: 3 distinct engine families
+    produce uncorrelated drawdowns. 3 from the same family (e.g. three
+    XGB rankers, even with different sub-keys) ride the same regime
+    failure into the ground together. So dedupe on engine family from
+    ENGINE_FAMILY, not on the registry key.
     """
     fb.init_db()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
@@ -63,14 +133,15 @@ def select_top_candidates(k: int = 3, days: int = 30) -> list[dict]:
               AND trainer IN ({valid_trainers})
               AND total_trades > 0
             ORDER BY avg_win_rate DESC, avg_max_dd ASC
-            LIMIT 100
+            LIMIT 200
         """, (cutoff,)).fetchall()
     seen_families = set()
     out = []
     for r in rows:
-        if r['trainer'] in seen_families:
+        fam = _engine_family(r['trainer'])
+        if fam in seen_families:
             continue
-        seen_families.add(r['trainer'])
+        seen_families.add(fam)
         out.append(dict(r))
         if len(out) == k:
             break
