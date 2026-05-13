@@ -959,6 +959,32 @@ SEARCH_SPACES: dict[str, dict] = {
         'degree':            [1, 2],
         'max_iter':          [500, 1000, 2000],
     },
+    # KNN classifier — non-parametric, memory-based, locally adaptive.
+    # First trainer in the registry that does not fit a global parametric
+    # model. Targets W1's small-train slice (8k rows) where parametric
+    # variance dominates, and W3/W4's OOD bear-regime rows where global
+    # decision surfaces (linear or axis-aligned trees) misbehave.
+    #   n_neighbors ∈ {25..400} — bias/variance dial. Smaller = more local,
+    #     higher variance but adapts to regime shifts; larger = smoother,
+    #     more reliable probabilities. 100 is the bias-variance sweet spot
+    #     given ~10% positive label rate (≥10 positives among 100 neighbors).
+    #   weights ∈ {uniform, distance} — distance-weighted sharpens the
+    #     probability estimate; uniform is the K-vote classic.
+    #   metric ∈ {manhattan, euclidean} — L1 robust to heavy-tailed
+    #     features (atr_pct, volume_ratio outliers); L2 is the textbook
+    #     default.
+    #   pca_components ∈ {0, 16, 32, 64} — 0 = full 96-d (no reduction);
+    #     >0 = PCA reduction (mitigates curse of dimensionality, collapses
+    #     redundant last/mean/std/dev axes).
+    #   leaf_size ∈ {20, 30, 50} — ball_tree internal — query speed knob;
+    #     accuracy invariant.
+    'knn_classifier': {
+        'n_neighbors':        [25, 50, 100, 200, 400],
+        'weights':            ['uniform', 'distance'],
+        'metric':             ['manhattan', 'euclidean'],
+        'pca_components':     [0, 16, 32, 64],
+        'leaf_size':          [20, 30, 50],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

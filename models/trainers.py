@@ -8179,6 +8179,146 @@ class LogisticElasticNetTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# KNN classifier (sklearn) — non-parametric, memory-based, locally adaptive.
+#
+# Motivation (claude iter #756):
+# Per-window regime diagnosis shows W1 is the smallest train slice (~8k rows
+# vs 20–40k for W2..W7) AND fails 0/20 across the last 20 iterations
+# regardless of trainer family. W3 (bear -6.6%, breadth 0.378) and W4
+# (mildly bear -1.6%) also fail 0/20. Every prior trainer in the registry is
+# either a tree (axis-aligned splits, high variance on small samples / OOD
+# rows) or a parametric NN (likewise needs many samples) or a global linear
+# (low variance but cannot model local nonlinearity — caps WR at ~35%).
+#
+# KNN occupies a strictly different bias slot:
+#   * Non-parametric — no global parameters, can't overfit at the model
+#     level. Variance is bounded by 1/sqrt(K).
+#   * Locally adaptive — each test row's score uses only its K nearest
+#     training rows in feature space. Regime drift is handled implicitly:
+#     if a test row is far from any training row, its K-nearest are still
+#     the "best available" historical analogs.
+#   * Cheap to fit (essentially memorization), bounded predict cost via
+#     ball_tree (~O(d log n) per query).
+#
+# Design choices:
+#   * StandardScaler on top of the gate's RobustScaler. KNN distance is
+#     scale-sensitive; we want each feature on roughly the same scale.
+#   * Optional PCA reduction (default 0=off; HP sweep can enable). 96-d
+#     curated aggregates have heavy redundancy (last/mean/std/dev of the
+#     same 24 features); PCA collapses correlated axes and mitigates the
+#     curse of dimensionality.
+#   * weights='distance' so nearby rows count more — sharpens the
+#     probability estimate vs uniform K-vote.
+#   * metric='manhattan' (L1) default. With heavy-tailed atr_pct /
+#     volume_ratio aggregates, L1 is less dominated by single-feature
+#     outliers than L2.
+# --------------------------------------------------------------------- #
+class KNNClassifierTrainer(BaseTrainer):
+    name = 'knn_classifier'
+
+    def __init__(self,
+                 n_neighbors: int = 100,
+                 weights: str = 'distance',
+                 metric: str = 'manhattan',
+                 leaf_size: int = 30,
+                 pca_components: int = 0,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_neighbors=int(n_neighbors),
+            weights=str(weights),
+            metric=str(metric),
+            leaf_size=int(leaf_size),
+            pca_components=int(pca_components),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.decomposition import PCA
+        from sklearn.neighbors import KNeighborsClassifier
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # KNN has no inner-val early stopping concept — concatenate train+val
+        # to maximize the support set, mirroring logistic_elastic_net.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+
+        steps = [('scaler', StandardScaler(with_mean=True, with_std=True))]
+        if p['pca_components'] > 0:
+            n_comp = min(p['pca_components'], X_full.shape[1], X_full.shape[0])
+            steps.append(('pca', PCA(
+                n_components=n_comp, random_state=p['random_state'])))
+        # ball_tree works with manhattan / euclidean / minkowski; let sklearn
+        # auto-select based on metric. n_jobs=1 — within-window fit is fast
+        # enough and parallel KNN queries blow up RSS on the 96-d feature set.
+        steps.append(('clf', KNeighborsClassifier(
+            n_neighbors=p['n_neighbors'],
+            weights=p['weights'],
+            metric=p['metric'],
+            algorithm='auto',
+            leaf_size=p['leaf_size'],
+            n_jobs=1,
+        )))
+        self.pipe = Pipeline(steps)
+        self.pipe.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        # KNN has no per-feature importance.
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -8220,6 +8360,7 @@ TRAINERS = {
     'torch_seq_gru_day_gate': TorchSeqGRUDayGateTrainer,
     'sklearn_extra_trees': SklearnExtraTreesTrainer,
     'logistic_elastic_net': LogisticElasticNetTrainer,
+    'knn_classifier': KNNClassifierTrainer,
 }
 
 

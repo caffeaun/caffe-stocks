@@ -1,12 +1,12 @@
 {
-  "trainer": "logistic_elastic_net",
+  "trainer": "knn_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot to the new logistic_elastic_net family for HP sweep \u2014 first-run degree=1 default already beats both baselines on avg_ann (-8.8% vs random_topk -30.2%, rule_only -27.8%) and hits +84% ann / 35% WR on W3, the bear window every tree-family trainer fails on. The HP space is wide (C/l1_ratio/pos_class_weight/degree\u2208{1,2}/max_iter) and untouched; degree=2 in particular is unexplored and adds 4560 interaction features that should lift the WR ceiling that all 37 prior trainers saturate at ~30%.",
-  "claude_iter_id": 750,
-  "designated_at": "2026-05-13T15:21:20"
+  "rationale": "Pivot to the new knn_classifier family \u2014 first non-parametric trainer in the registry. Default HP (k=100, distance, manhattan, pca=0) already beats both baselines (avg_ann -3.3% vs random_topk -30.2% / rule_only -27.8%) AND the prior logistic_elastic_net default (-8.8%) AND produces a clean W2 pass (+79.5% ann / 40.9% WR). HP space is wide and untouched: n_neighbors \u2208 {25,50,100,200,400}, weights, metric, pca_components \u2208 {0,16,32,64}, leaf_size \u2014 the bias-variance dial alone has 5 unexplored points, and pca_components > 0 (collapsing 96-d redundant aggregates) is the most promising untested move.",
+  "claude_iter_id": 756,
+  "designated_at": "2026-05-13T18:08:26"
 }
