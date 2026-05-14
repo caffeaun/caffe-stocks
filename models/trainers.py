@@ -9927,6 +9927,59 @@ class TabMClassifierTrainer(BaseTrainer):
             json.dump(meta, f, indent=2)
 
 
+class TabMLCBClassifierTrainer(TabMClassifierTrainer):
+    # TabM with Lower-Confidence-Bound scoring: score = mean(p_k) - lam * std(p_k).
+    # Iter #921 diagnosis: WR < 40% is the dominant gate failure (17-19/20 across
+    # last 20 iters). TabM's plain mean throws away the k=32 BatchEnsemble
+    # dispersion — exactly the signal that distinguishes "all members agree this
+    # wins" from "members disagree, mean happens to be high". Precedent:
+    # torch_seq_gru_ensemble uses the same form on a 5-net independent ensemble
+    # and is the only trainer that explicitly penalises disagreement.
+    name = 'tabm_lcb'
+
+    # NOTE: get_trainer() filters kwargs via __init__.__code__.co_varnames, so
+    # the full HP surface must be named here even though TabMClassifierTrainer
+    # already exposes them.
+    def __init__(self,
+                 k=32,
+                 n_blocks=3,
+                 d_block=512,
+                 dropout=0.1,
+                 lr=2e-3,
+                 weight_decay=3e-4,
+                 batch_size=512,
+                 max_epochs=120,
+                 patience=12,
+                 grad_clip=1.0,
+                 disagreement_penalty=0.3,
+                 device=None,
+                 seed=42,
+                 **kwargs):
+        super().__init__(k=k, n_blocks=n_blocks, d_block=d_block, dropout=dropout,
+                         lr=lr, weight_decay=weight_decay, batch_size=batch_size,
+                         max_epochs=max_epochs, patience=patience, grad_clip=grad_clip,
+                         device=device, seed=seed, **kwargs)
+        self.disagreement_penalty = float(disagreement_penalty)
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        X_p = self._preprocess(X, fit=False)
+        self.model.eval()
+        X_t = torch.from_numpy(X_p).to(self.device)
+        score_chunks = []
+        bs = 4096
+        lam = self.disagreement_penalty
+        with torch.no_grad():
+            for i in range(0, X_t.shape[0], bs):
+                logits = self.model(X_t[i:i + bs])      # (B, k, 1)
+                p = torch.sigmoid(logits).squeeze(-1)    # (B, k)
+                mu = p.mean(dim=1)
+                sd = p.std(dim=1, unbiased=False)
+                lcb = (mu - lam * sd).clamp(0.0, 1.0)
+                score_chunks.append(lcb.detach().cpu().numpy())
+        return np.concatenate(score_chunks, axis=0).astype(np.float32)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -9976,6 +10029,7 @@ TRAINERS = {
     'tabpfn_v25': TabPFNV25Trainer,
     'torch_time_moe': TorchTimeMoETrainer,
     'tabm_classifier': TabMClassifierTrainer,
+    'tabm_lcb': TabMLCBClassifierTrainer,
 }
 
 

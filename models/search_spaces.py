@@ -1140,6 +1140,24 @@ SEARCH_SPACES: dict[str, dict] = {
     'grad_clip':    [0.5, 1.0, 2.0],
     'seed':         [0, 1, 42, 2026],
 },
+# TabM with Lower-Confidence-Bound scoring (iter #921). Same training space as
+# tabm_classifier plus `disagreement_penalty` — the λ in score = mean − λ·std
+# over the k=32 BatchEnsemble members. λ=0 reduces to plain TabM; higher λ
+# trades trade-count for win-rate. Range mirrors torch_seq_gru_ensemble.
+'tabm_lcb': {
+    'k':                     [16, 32, 64],
+    'n_blocks':              [2, 3, 4],
+    'd_block':               [128, 256, 512, 768],
+    'dropout':               (0.0, 0.3),
+    'lr':                    (1e-4, 5e-3),
+    'weight_decay':          (1e-5, 1e-1),
+    'batch_size':            [256, 512, 1024],
+    'max_epochs':            [60, 120, 200],
+    'patience':              [6, 12, 20],
+    'grad_clip':             [0.5, 1.0, 2.0],
+    'disagreement_penalty':  (0.1, 2.5),
+    'seed':                  [0, 1, 42, 2026],
+},
 }
 
 

@@ -1,12 +1,12 @@
 {
-  "trainer": "tabm_classifier",
+  "trainer": "tabm_lcb",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from torch_time_moe (saturated 0/7 across 15 HP sweeps iters #893-#906, avg_ann +35% to +58% but never passes any single window's WR/DD jointly) to tabm_classifier. Default-HP first-shot scored 1/7 with avg_ann +30.8% and cracked the W1 graveyard (0/20 across last 20 torch_time_moe+mlp iters \u2192 +220% ann, WR 42.3%, DD 8.6%). The 11-dim TabM HP space has direct levers on the threshold-collapse failure mode (W3-W7 all collapsed to thr=0.0): (a) lower dropout 0.0-0.05 to reduce ensemble-member randomness and sharpen calibration, (b) larger k=64 to add probability dispersion, (c) higher weight_decay 1e-2..1e-1 to regularize against bull-train/bear-test overfit, (d) longer max_epochs=200 + patience=20 to let BatchEnsemble members fully decorrelate. Train mode should focus the sweep here; mlp_classifier and torch_time_moe HP spaces have plateaued.",
-  "claude_iter_id": 907,
-  "designated_at": "2026-05-15T00:07:02"
+  "rationale": "Pivot from tabm_classifier (saturated 1/7 across 14 iters #907-#920, W1-only pass) to tabm_lcb. Default-HP first-shot passed W1 cleanly (45% WR, ann +212%, DD 6.9%); probing lam=0.5 unlocked W2 (45% WR, ann +223%, the 5%-pass-rate window) \u2014 proves disagreement_penalty is window-selective. Train mode should sweep \u03bb \u2208 (0.1, 2.5) plus the inherited TabM dimensions; mid-range \u03bb (~0.5-1.0) may unlock W7 (currently 37% WR, 1pp short).",
+  "claude_iter_id": 921,
+  "designated_at": "2026-05-15T03:15:35"
 }
