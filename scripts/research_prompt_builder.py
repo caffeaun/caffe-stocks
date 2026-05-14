@@ -69,26 +69,22 @@ def _registry_bias() -> str:
 
 
 def _latest_prior_brief() -> str:
-    """One-paragraph context from the most recent brief, if any. Just the
-    'Recommended next action' line — research mode shouldn't dwell on its
-    own history; the goal is fresh external data."""
+    """One-line context from the most recent brief: the technique that was
+    just recommended + scaffolded. Research mode reads this so it knows
+    not to re-propose yesterday's choice. The goal is fresh external data,
+    not iterating on the same recommendation."""
     if not BRIEFS_DIR.exists():
         return '(no prior briefs)'
     briefs = sorted(BRIEFS_DIR.glob('20*.md'))
     if not briefs:
         return '(no prior briefs)'
     text = briefs[-1].read_text(errors='replace')
-    # Pull the line after "## Recommended next action" if present.
-    marker = '## Recommended next action'
-    if marker in text:
-        tail = text.split(marker, 1)[1].strip()
-        # Strip subsequent headers
-        for line in tail.splitlines():
-            if line.startswith('## '):
-                break
-            if line.strip():
-                return f'{briefs[-1].name}: {line.strip()[:200]}'
-    return f'{briefs[-1].name} exists ({len(text)} chars) — no parseable recommendation'
+    # The structured-brief format has the technique name on the
+    # "## Recommended technique:" line.
+    import re as _re
+    m = _re.search(r'^## Recommended technique:\s*(.+?)$', text, _re.MULTILINE)
+    technique = m.group(1).strip() if m else 'UNKNOWN'
+    return f'{briefs[-1].name} → "{technique}" (already scaffolded; DO NOT re-propose)'
 
 
 def _current_registry() -> list[str]:
@@ -137,10 +133,11 @@ The CURRENT date is {today}. Anything dated more than 12 months old is "history"
 PHASE B — CANDIDATE SELECTION (~10 min)
 
 From your research, pick exactly ONE technique that is:
-1. Genuinely under-represented in our registry (cite the registry-bias summary above)
-2. Implementable as a `BaseTrainer` subclass in `models/trainers.py` (i.e., supports `fit(X, y, X_val, y_val)` + `predict_proba(X)` on 2D numeric features — or a clean adapter exists)
-3. Has Python deps installable via pip (no compiled-from-source, no manual model weight curation)
-4. Practical wall-time: training on 190k rows × 96 features × 7 walk-forward windows MUST fit in claude_mode's 30-min budget. If it can't, propose a frozen-encoder + small-head variant.
+1. NOT already in the registry list above. Re-proposing an already-scaffolded trainer is a hard error — the post-script will reject it on idempotency check and the day is wasted. The most-recently-scaffolded technique is named in §2 "Latest prior brief recommendation" — pick something STRUCTURALLY DIFFERENT from it (e.g., if yesterday was a tabular foundation model, don't pick another tabular foundation model; pick a time-series foundation model, an SSL pretrain, a Mamba/SSM, etc.).
+2. Genuinely under-represented as an INDUCTIVE BIAS (not merely as iteration count — every newly-scaffolded trainer starts at 0 iterations; that's not the bar). Cite the family bias in §2.
+3. Implementable as a `BaseTrainer` subclass in `models/trainers.py` (i.e., supports `fit(X, y, X_val, y_val)` + `predict_proba(X)` on 2D numeric features — or a clean adapter exists)
+4. Has Python deps installable via pip (no compiled-from-source, no manual model weight curation)
+5. Practical wall-time: training on 190k rows × 96 features × 7 walk-forward windows MUST fit in claude_mode's 30-min budget. If it can't, propose a frozen-encoder + small-head variant.
 
 Prefer something concrete and shipped over something theoretical. If two options compete, pick the one with a maintained HuggingFace / GitHub repo and fewest install hassles.
 
