@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from gaussian_nb (31 sweeps, saturated at 0/7 with flat threshold sweep \u2014 posteriors collapse to {\u22480,\u22481} so SCORE_THRESHOLDS no-op). Default kernel_logreg HP already hit 2/7 (W4, W6), avg_ann -3.9% (vs gaussian_nb best -8%), threshold sweep alive (0.0-0.7 across windows), W3 ann flipped -23%\u2192+17% and W4 -76%\u2192+15% \u2014 clear bear-regime breakthrough that the 1600-config HP grid (n_components \u00d7 gamma \u00d7 C \u00d7 pca \u00d7 class_weight) is untouched in. First kernel-space classifier in 41-trainer registry \u2014 genuinely new inductive bias slot for train mode to deepen.",
-  "claude_iter_id": 819,
-  "designated_at": "2026-05-14T06:11:03"
+  "rationale": "Keep kernel_logreg sweep active \u2014 15 train iters since the iter-#819 pivot have produced best 4/7 (#829, +0.9% avg ann) and current runs are still cycling 1-3/7 with healthy threshold variance. HP space is wide (800 configs) and not exhausted. The new gaussian_process_classifier slot (this iter) is a hedge for a later pivot, but its default-HP gate (0/7, WR avg 26.6%) is weaker than kernel_logreg's already-explored band \u2014 pivot when kernel_logreg plateaus more firmly or a future iter narrows GP HPs.",
+  "claude_iter_id": 835,
+  "designated_at": "2026-05-14T09:14:27"
 }

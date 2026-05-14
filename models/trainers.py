@@ -8938,6 +8938,219 @@ class KernelLogRegTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# GaussianProcessClassifierTrainer (iter #835) — full Bayesian non-parametric
+#
+# Motivation (Part A diagnosis, iter #835):
+#   * Last-50 per-window pass rate: W4 4%, W5 4%, W3 6%, W6 10%, W1 10%, W7 8%,
+#     W2 16%. Even the easiest regime (W7: +14.9% SET, breadth 73%, +FF) fails
+#     92% of the time. The pattern is uniform-across-trainers, suggesting models
+#     mis-rank picks even in benign macro — not a regime-feature gap.
+#   * Across 42 trainers and 830 iters, 0 passes. Tree-loss variants, kernel-
+#     map MAP regression (kernel_logreg), generative Gaussian (gaussian_nb,
+#     qda_classifier), distance (knn_classifier) all saturated. The remaining
+#     under-explored slot in §6.B.2: full-Bayesian probabilistic classifier.
+#   * kernel_logreg is the closest neighbor in inductive bias: both use RBF
+#     features. But kernel_logreg is MAP (point-estimate logistic head on
+#     Nyström-approximated kernel features). A Gaussian Process Classifier
+#     instead carries a full posterior over the latent function, calibrated
+#     via Laplace approximation, and learns the RBF length-scale via marginal
+#     likelihood maximization (no manual gamma sweep). In feature regions far
+#     from training data (e.g. W5's regime-shifted bear-vol slice that is rare
+#     in W4's bull-heavy training), the posterior naturally widens → predicted
+#     probabilities pull toward the prior mean (~22% positive rate). The
+#     downstream threshold sweep filters those low-confidence picks out, so
+#     hostile-regime false positives should drop.
+#
+# Distinct inductive bias vs registry:
+#   vs kernel_logreg:  Bayesian posterior (Laplace) vs MAP logistic; learned
+#                      length-scale via marginal-likelihood vs fixed gamma; no
+#                      Nyström approximation (exact kernel matrix on subsample).
+#   vs qda/gaussian_nb: non-parametric (kernel) vs parametric Gaussian density;
+#                       no class-conditional Gaussian assumption.
+#   vs trees: smooth function over feature space vs axis-aligned step function.
+#   vs knn:    smoothed (kernel) probability vs unsmoothed point distance.
+#
+# Implementation:
+#   * sklearn.gaussian_process.GaussianProcessClassifier with RBF + ConstantKernel.
+#   * Laplace approximation (default) for the binary-classification posterior.
+#   * Marginal likelihood is exact but O(N^3) in N_train; therefore subsample
+#     to ``n_inducing`` rows (default 600), stratified by class to preserve the
+#     ~22% positive rate, and within-class stratified by date order (uniform
+#     across the train window) to retain temporal coverage. This makes one
+#     fit cost ~600^3 ≈ 2e8 ops → <15s per fold on CPU, 7 folds ≤ 2 min total,
+#     well inside the 30-min wall.
+#   * StandardScaler upstream — GP RBF length-scale is interpreted in scaled
+#     feature units; un-scaled axes (atr_pct ~ 0.03 vs market_breadth_adv ~ 0.5)
+#     would force a single learned length-scale to be a bad compromise.
+# --------------------------------------------------------------------- #
+class GaussianProcessClassifierTrainer(BaseTrainer):
+    """Full-posterior Bayesian RBF Gaussian Process classifier (Laplace approx)."""
+
+    name = 'gaussian_process_classifier'
+
+    def __init__(self,
+                 n_inducing: int = 600,
+                 # length_scale init bumped to 10.0 + upper bound 1e3 after the
+                 # iter-#835 baseline gate logged sklearn's ConvergenceWarning
+                 # ("optimal value close to upper bound 100.0") — marginal
+                 # likelihood wanted a smoother kernel than the default allowed.
+                 length_scale: float = 10.0,
+                 length_scale_bounds_lo: float = 1e-2,
+                 length_scale_bounds_hi: float = 1e3,
+                 constant_value: float = 1.0,
+                 n_restarts_optimizer: int = 1,
+                 max_iter_predict: int = 100,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_inducing=int(n_inducing),
+            length_scale=float(length_scale),
+            length_scale_bounds_lo=float(length_scale_bounds_lo),
+            length_scale_bounds_hi=float(length_scale_bounds_hi),
+            constant_value=float(constant_value),
+            n_restarts_optimizer=int(n_restarts_optimizer),
+            max_iter_predict=int(max_iter_predict),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def _stratified_subsample(self, X, y, dates):
+        """Stratified by class, then within-class uniform-by-date subsample."""
+        p = self._params
+        n_target = min(int(p['n_inducing']), X.shape[0])
+        rng = np.random.RandomState(p['random_state'])
+        y_arr = np.asarray(y).astype(int)
+        idx_pos = np.where(y_arr == 1)[0]
+        idx_neg = np.where(y_arr == 0)[0]
+        # Preserve class ratio
+        pos_frac = len(idx_pos) / max(1, len(y_arr))
+        n_pos = max(2, int(round(n_target * pos_frac)))
+        n_neg = max(2, n_target - n_pos)
+        n_pos = min(n_pos, len(idx_pos))
+        n_neg = min(n_neg, len(idx_neg))
+
+        def _date_strided(idx_class, k):
+            if len(idx_class) <= k:
+                return idx_class
+            if dates is None:
+                return rng.choice(idx_class, size=k, replace=False)
+            # Uniform-by-date: sort by date, take every step-th index.
+            dts = np.asarray(dates)[idx_class]
+            order = np.argsort(dts)
+            sorted_idx = idx_class[order]
+            step = max(1, len(sorted_idx) // k)
+            picks = sorted_idx[::step][:k]
+            if len(picks) < k:
+                # Pad by random fill from remaining
+                remaining = np.setdiff1d(sorted_idx, picks, assume_unique=False)
+                if len(remaining) > 0:
+                    extra = rng.choice(remaining,
+                                       size=k - len(picks), replace=False)
+                    picks = np.concatenate([picks, extra])
+            return picks
+
+        keep = np.concatenate([
+            _date_strided(idx_pos, n_pos),
+            _date_strided(idx_neg, n_neg),
+        ])
+        return keep
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.gaussian_process import GaussianProcessClassifier
+        from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if len(set(np.asarray(y_train).tolist())) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([np.asarray(y_train), np.asarray(y_val)])
+        if dates_train is not None and dates_val is not None:
+            dates_full = np.concatenate(
+                [np.asarray(dates_train), np.asarray(dates_val)])
+        else:
+            dates_full = None
+        self._n_features = X_full.shape[1]
+
+        keep_idx = self._stratified_subsample(X_full, y_full, dates_full)
+        X_sub = X_full[keep_idx]
+        y_sub = y_full[keep_idx]
+
+        kernel = (
+            ConstantKernel(p['constant_value'], constant_value_bounds=(1e-3, 1e3))
+            * RBF(
+                length_scale=p['length_scale'],
+                length_scale_bounds=(
+                    p['length_scale_bounds_lo'],
+                    p['length_scale_bounds_hi'],
+                ),
+            )
+        )
+        gpc = GaussianProcessClassifier(
+            kernel=kernel,
+            n_restarts_optimizer=p['n_restarts_optimizer'],
+            max_iter_predict=p['max_iter_predict'],
+            random_state=p['random_state'],
+            warm_start=False,
+            copy_X_train=False,
+        )
+        self.pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('gpc', gpc),
+        ])
+        self.pipe.fit(X_sub, y_sub)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -8984,6 +9197,7 @@ TRAINERS = {
     'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
     'xgb_iso_calibrated': XGBoostIsotonicCalibratedTrainer,
     'kernel_logreg': KernelLogRegTrainer,
+    'gaussian_process_classifier': GaussianProcessClassifierTrainer,
 }
 
 

@@ -1052,6 +1052,28 @@ SEARCH_SPACES: dict[str, dict] = {
         'pca_components':     [0, 16, 32, 64],
         'class_weight':       ['balanced', 'none'],
     },
+    # Full-Bayesian Gaussian Process Classifier (iter #835). Knobs:
+    #   n_inducing ∈ {300, 600, 1000} — subsample size for the exact kernel
+    #     matrix (O(N^3) in n_inducing). 600 ≈ 15s per fold; 1000 ≈ 50s.
+    #   length_scale ∈ {0.5, 1.0, 2.0, 5.0} — RBF initial length-scale; the
+    #     optimizer refines it via marginal likelihood within
+    #     [length_scale_bounds_lo, length_scale_bounds_hi].
+    #   constant_value ∈ {0.5, 1.0, 2.0} — ConstantKernel amplitude prior.
+    #   n_restarts_optimizer ∈ {0, 1, 3} — number of random restarts for the
+    #     marginal-likelihood optimizer; higher = better hyperparameters
+    #     but slower fit. 1 is a good default.
+    #   max_iter_predict ∈ {50, 100, 200} — Laplace approximation Newton
+    #     iterations. 100 default is normally enough; raise if posterior
+    #     looks under-converged.
+    'gaussian_process_classifier': {
+        'n_inducing':              [300, 600, 1000],
+        'length_scale':            [0.5, 1.0, 2.0, 5.0],
+        'length_scale_bounds_lo':  [1e-3, 1e-2, 1e-1],
+        'length_scale_bounds_hi':  [1e1, 1e2, 1e3],
+        'constant_value':          [0.5, 1.0, 2.0],
+        'n_restarts_optimizer':    [0, 1, 3],
+        'max_iter_predict':        [50, 100, 200],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 
