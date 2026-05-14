@@ -1126,6 +1126,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'embed_pool':         ['mean', 'last'],
     'random_state':       [42, 7, 1337],
 },
+    # models/search_spaces.py — entry to add to SEARCH_SPACES dict
+'tabm_classifier': {
+    'k':            [16, 32, 64],
+    'n_blocks':     [2, 3, 4],
+    'd_block':      [128, 256, 512, 768],
+    'dropout':      (0.0, 0.3),
+    'lr':           (1e-4, 5e-3),
+    'weight_decay': (1e-5, 1e-1),
+    'batch_size':   [256, 512, 1024],
+    'max_epochs':   [60, 120, 200],
+    'patience':     [6, 12, 20],
+    'grad_clip':    [0.5, 1.0, 2.0],
+    'seed':         [0, 1, 42, 2026],
+},
 }
 
 

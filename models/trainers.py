@@ -9719,6 +9719,195 @@ class TorchTimeMoETrainer(BaseTrainer):
             json.dump(meta, f, indent=2, default=str)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+
+class TabMClassifierTrainer(BaseTrainer):
+    name = 'tabm_classifier'
+    consumes_sequences = False
+
+    def __init__(self,
+                 k=32,
+                 n_blocks=3,
+                 d_block=512,
+                 dropout=0.1,
+                 lr=2e-3,
+                 weight_decay=3e-4,
+                 batch_size=512,
+                 max_epochs=120,
+                 patience=12,
+                 grad_clip=1.0,
+                 device=None,
+                 seed=42,
+                 **kwargs):
+        self.k = int(k)
+        self.n_blocks = int(n_blocks)
+        self.d_block = int(d_block)
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.max_epochs = int(max_epochs)
+        self.patience = int(patience)
+        self.grad_clip = float(grad_clip)
+        self.seed = int(seed)
+        import torch as _torch
+        self.device = device or ('cuda' if _torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.imputer = None
+        self.scaler = None
+        self.n_features_ = None
+
+    def _make_model(self, n_features):
+        import torch
+        from tabm import TabM
+        return TabM.make(
+            n_num_features=n_features,
+            cat_cardinalities=[],
+            d_out=1,
+            n_blocks=self.n_blocks,
+            d_block=self.d_block,
+            dropout=self.dropout,
+            k=self.k,
+        ).to(self.device)
+
+    def _to_2d(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 3:
+            X = X[:, -1, :]
+        return X
+
+    def _preprocess(self, X, fit=False):
+        from sklearn.impute import SimpleImputer
+        from sklearn.preprocessing import StandardScaler
+        X = self._to_2d(X)
+        if fit:
+            self.imputer = SimpleImputer(strategy='median')
+            self.scaler = StandardScaler()
+            X = self.imputer.fit_transform(X)
+            X = self.scaler.fit_transform(X)
+            self.n_features_ = X.shape[1]
+        else:
+            X = self.imputer.transform(X)
+            X = self.scaler.transform(X)
+        return np.clip(X.astype(np.float32), -10.0, 10.0)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        from torch.utils.data import DataLoader, TensorDataset
+
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        X_tr_p = self._preprocess(X_tr, fit=True)
+        X_val_p = self._preprocess(X_val, fit=False)
+        y_tr_a = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        y_val_a = np.asarray(y_val, dtype=np.float32).reshape(-1)
+
+        self.model = self._make_model(self.n_features_)
+        opt = optim.AdamW(self.model.parameters(),
+                          lr=self.lr, weight_decay=self.weight_decay)
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        X_tr_t = torch.from_numpy(X_tr_p)
+        y_tr_t = torch.from_numpy(y_tr_a).unsqueeze(1)
+        X_val_t = torch.from_numpy(X_val_p).to(self.device)
+        y_val_t = torch.from_numpy(y_val_a).unsqueeze(1).to(self.device)
+
+        loader = DataLoader(
+            TensorDataset(X_tr_t, y_tr_t),
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=False,
+        )
+
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        for epoch in range(self.max_epochs):
+            self.model.train()
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+                opt.zero_grad()
+                logits = self.model(xb)  # (B, k, 1)
+                yb_rep = yb.unsqueeze(1).expand_as(logits)
+                loss = loss_fn(logits, yb_rep)
+                loss.backward()
+                if self.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                opt.step()
+
+            self.model.eval()
+            with torch.no_grad():
+                logits_val = self.model(X_val_t)
+                yv_rep = y_val_t.unsqueeze(1).expand_as(logits_val)
+                val_loss = loss_fn(logits_val, yv_rep).item()
+
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {kk: vv.detach().cpu().clone()
+                              for kk, vv in self.model.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+                if bad >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        X_p = self._preprocess(X, fit=False)
+        self.model.eval()
+        X_t = torch.from_numpy(X_p).to(self.device)
+        probs_chunks = []
+        bs = 4096
+        with torch.no_grad():
+            for i in range(0, X_t.shape[0], bs):
+                logits = self.model(X_t[i:i + bs])  # (B, k, 1)
+                p = torch.sigmoid(logits).mean(dim=1).squeeze(-1)
+                probs_chunks.append(p.detach().cpu().numpy())
+        return np.concatenate(probs_chunks, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        import torch
+        import joblib
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(self.model.state_dict(),
+                   os.path.join(model_dir, 'tabm_state.pt'))
+        joblib.dump(
+            {'imputer': self.imputer, 'scaler': self.scaler},
+            os.path.join(model_dir, 'tabm_preproc.joblib'),
+        )
+        meta = {
+            'name': self.name,
+            'k': self.k,
+            'n_blocks': self.n_blocks,
+            'd_block': self.d_block,
+            'dropout': self.dropout,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            'batch_size': self.batch_size,
+            'max_epochs': self.max_epochs,
+            'patience': self.patience,
+            'grad_clip': self.grad_clip,
+            'n_features': self.n_features_,
+            'seed': self.seed,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'tabm_meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -9767,6 +9956,7 @@ TRAINERS = {
     'mlp_classifier': MLPClassifierTrainer,
     'tabpfn_v25': TabPFNV25Trainer,
     'torch_time_moe': TorchTimeMoETrainer,
+    'tabm_classifier': TabMClassifierTrainer,
 }
 
 
