@@ -216,11 +216,17 @@ def insert_scaffold(scaffold_code: str, registry_line: str) -> bool:
                 + scaffold_code.strip() + '\n\n\n'
                 + text[anchor_pos:])
 
-    # Insert registry_line into TRAINERS dict. Look for the closing '}' of
-    # the first dict declaration starting at our anchor.
-    # Strategy: find the dict's closing brace by counting braces from the
-    # anchor's '{'.
-    dict_open = new_text.find('{', new_text.find('TRAINERS', anchor_pos))
+    # Insert registry_line into TRAINERS dict. Re-anchor on the modified
+    # text using the same line-anchored regex — scaffold code routinely
+    # mentions "TRAINERS" in comments (e.g., "append before TRAINERS dict"),
+    # so a plain substring search after anchor_pos would find the comment
+    # first and corrupt an unrelated dict literal inside the class body.
+    m2 = TRAINERS_ANCHOR.search(new_text)
+    if not m2:
+        print('FATAL: TRAINERS_ANCHOR not findable after scaffold insert',
+              file=sys.stderr)
+        return False
+    dict_open = new_text.find('{', m2.start())
     if dict_open < 0:
         print('FATAL: could not find TRAINERS dict opening brace', file=sys.stderr)
         return False
@@ -398,6 +404,15 @@ def main():
         print('Missing scaffold_code or registry_line — aborting.', file=sys.stderr)
         telegram(f'⚠️ ml_scaffold: brief missing scaffold/registry code')
         sys.exit(4)
+
+    # Snapshot the working-tree content of the files we're about to edit
+    # so we can restore on validate failure WITHOUT touching concurrent
+    # uncommitted claude_mode work elsewhere. `git checkout --` is too
+    # blunt — it discards every uncommitted change in the file, including
+    # in-flight trainer additions from a concurrent iteration.
+    pre_trainers = TRAINERS_PY.read_text()
+    pre_search = SEARCH_SPACES_PY.read_text() if SEARCH_SPACES_PY.exists() else None
+
     if not insert_scaffold(parsed['scaffold_code'], parsed['registry_line']):
         telegram(f'⚠️ ml_scaffold: trainers.py edit failed')
         sys.exit(5)
@@ -408,10 +423,12 @@ def main():
 
     # 5. validate import
     if not validate_import(parsed['registry_key']):
-        # Revert trainers.py to keep the registry importable
-        subprocess.run(['git', '-C', str(BASE), 'checkout', '--',
-                        'models/trainers.py', 'models/search_spaces.py'])
-        telegram(f'⚠️ ml_scaffold: {parsed["registry_key"]} failed import; reverted')
+        # Surgical restore from in-memory snapshot — preserves whatever
+        # uncommitted state was in the working tree before we touched it.
+        TRAINERS_PY.write_text(pre_trainers)
+        if pre_search is not None:
+            SEARCH_SPACES_PY.write_text(pre_search)
+        telegram(f'⚠️ ml_scaffold: {parsed["registry_key"]} failed import; restored snapshot')
         sys.exit(6)
 
     # 6. commit
