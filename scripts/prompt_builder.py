@@ -70,6 +70,25 @@ def _open_data_requests() -> list[str]:
     return [f"{r['requested_at'][:10]} — {r['request_text']}" for r in rows]
 
 
+def _research_brief(max_lines: int = 80) -> str:
+    """Return the truncated body of data/research_briefs/latest.md.
+
+    Truncated to ``max_lines`` so the brief doesn't dominate the prompt
+    (it's already self-contained and the scaffold's already in trainers.py
+    by the time claude_mode sees this). Returns a sentinel string if no
+    brief exists yet — the daily research run hasn't fired its first time.
+    """
+    path = BASE / 'data' / 'research_briefs' / 'latest.md'
+    if not path.exists():
+        return '(no research brief yet — daily research_mode at 03:00 will produce one)'
+    text = path.read_text(errors='replace')
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        head = '\n'.join(lines[:max_lines])
+        return head + f'\n\n... [truncated, full brief at {path.relative_to(BASE)}]'
+    return text
+
+
 def _same_family_streak(k: int = 8) -> tuple[int, str | None]:
     """Count the run of consecutive failing claude-mode iterations of the
     same trainer at the head of the log (most recent first).
@@ -179,6 +198,13 @@ Do NOT submit a "decompile the .pyc" data request — git history is the canonic
 5. OPEN DATA REQUESTS
 ==================================================================
 {open_requests}
+
+==================================================================
+5b. TODAY'S RESEARCH BRIEF
+==================================================================
+The daily research_mode (03:00 cron) produces a focused brief on a SOTA technique we haven't tried. The scaffold post-script auto-installs deps + writes the trainer code, so by the time you read this the trainer should be in the registry above. If the brief recommends a specific trainer, that is the highest-EV thing for you to try this iteration — your hypothesis must explicitly cite this brief, or explain why you're choosing not to follow it (e.g. it was already attempted in the last 3 iters).
+
+{research_brief}
 
 {pivot_directive}==================================================================
 6. YOUR JOB — diagnose first, then change (evidence-backed)
@@ -389,6 +415,7 @@ def build_prompt() -> str:
         open_requests=requests_block,
         active_case_summary=active_case_summary,
         pivot_directive=pivot_directive,
+        research_brief=_research_brief(),
     )
 
 
