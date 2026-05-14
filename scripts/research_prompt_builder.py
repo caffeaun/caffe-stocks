@@ -93,7 +93,7 @@ def _current_registry() -> list[str]:
 
 PROMPT_TEMPLATE = """You are running ONE iteration of the Caffe-Stocks ML loop in RESEARCH MODE.
 
-Research mode runs ONCE PER DAY (03:00 local). Your job is to write today's research whitepaper to `data/research_briefs/{today}.md`. You do NOT run the gate. You do NOT install dependencies. You do NOT write trainer code. You do NOT pivot active_case. A SEPARATE post-script (`scripts/ml_scaffold.py`) reads your brief and does the mechanical work — installs, scaffolds, registry registration. So your output is a markdown file, nothing else.
+Research mode runs ONCE PER DAY (03:00 local). Your job is to write today's research whitepaper to `data/research_briefs/{brief_filename}.md`. You do NOT run the gate. You do NOT install dependencies. You do NOT write trainer code. You do NOT pivot active_case. A SEPARATE post-script (`scripts/ml_scaffold.py`) reads your brief and does the mechanical work — installs, scaffolds, registry registration. So your output is a markdown file, nothing else.
 
 Hard wall-time: 45 minutes.
 
@@ -143,7 +143,7 @@ Prefer something concrete and shipped over something theoretical. If two options
 
 PHASE C — WRITE THE BRIEF (~10 min)
 
-Write the brief to `data/research_briefs/{today}.md` using the EXACT structure below. The post-script parses it mechanically — section headers and code-block fences must match.
+Write the brief to `data/research_briefs/{brief_filename}.md` using the EXACT structure below. The post-script parses it mechanically — section headers and code-block fences must match.
 
 ```markdown
 # Research brief — {today}
@@ -240,7 +240,7 @@ After writing the .md file:
 ==================================================================
 ```json
 {{
-  "brief_path": "data/research_briefs/{today}.md",
+  "brief_path": "data/research_briefs/{brief_filename}.md",
   "technique": "<human-readable technique name>",
   "registry_key": "<torch_xxx or similar — must NOT collide with existing keys>",
   "deps": ["package-1", "package-2"],
@@ -266,9 +266,14 @@ Proceed.
 
 
 def build_prompt() -> str:
-    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    # Filename includes HHMM so multiple runs on the same day don't clobber.
+    # Lex-sortable: 20YY-MM-DD_HHMM sorts chronologically with `glob('20*.md')`.
+    brief_filename = now.strftime('%Y-%m-%d_%H%M')
     return PROMPT_TEMPLATE.format(
         today=today,
+        brief_filename=brief_filename,
         registry_bias=_registry_bias(),
         n_trainers=len(_current_registry()),
         trainers=', '.join(_current_registry()),
