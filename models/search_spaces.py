@@ -1074,6 +1074,35 @@ SEARCH_SPACES: dict[str, dict] = {
         'n_restarts_optimizer':    [0, 1, 3],
         'max_iter_predict':        [50, 100, 200],
     },
+    # MLP classifier (iter #851). Knobs:
+    #   hidden_layer_1 ∈ {32, 64, 128, 256} — first hidden width. 64 default
+    #     gives ~6k params on 96-d input; 256 explodes to ~25k (risk of
+    #     overfit on ~30k-row windows).
+    #   hidden_layer_2 ∈ {0, 16, 32, 64} — second hidden width. 0 collapses
+    #     to a single hidden layer.
+    #   alpha ∈ {1e-4, 1e-3, 5e-3, 1e-2} — L2 regularization strength. Larger
+    #     = smoother decision surface; the diagnosis-cited W4/W5 anti-
+    #     selection should respond to higher alpha.
+    #   learning_rate_init ∈ {3e-4, 1e-3, 3e-3} — Adam LR. 1e-3 sklearn
+    #     default; lower trades training speed for stability.
+    #   max_iter ∈ {150, 300, 500} — epoch cap. Early stopping usually cuts
+    #     well below the cap; raise only if val loss is still trending.
+    #   batch_size ∈ {128, 256, 512} — minibatch size for Adam. Smaller =
+    #     noisier gradient (implicit regularizer); larger = faster.
+    #   activation ∈ {'relu', 'tanh'} — non-linearity. relu default; tanh
+    #     bounds activations and can stabilize on noisy financial features.
+    #   n_iter_no_change ∈ {10, 15, 25} — early-stopping patience. Higher
+    #     gives the optimizer more time to escape plateaus.
+    'mlp_classifier': {
+        'hidden_layer_1':       [32, 64, 128, 256],
+        'hidden_layer_2':       [0, 16, 32, 64],
+        'alpha':                [1e-4, 1e-3, 5e-3, 1e-2],
+        'learning_rate_init':   [3e-4, 1e-3, 3e-3],
+        'max_iter':             [150, 300, 500],
+        'batch_size':           [128, 256, 512],
+        'activation':           ['relu', 'tanh'],
+        'n_iter_no_change':     [10, 15, 25],
+    },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
 }
 

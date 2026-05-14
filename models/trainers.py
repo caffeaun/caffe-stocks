@@ -9151,6 +9151,188 @@ class GaussianProcessClassifierTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# MLPClassifierTrainer (iter #851) — pure tabular feed-forward neural net
+#
+# Motivation (Part A diagnosis, iter #851):
+#   * Per-window pass rate across last 200 mixed-trainer iters:
+#       W1 14%, W2 26%, W3 24%, W4 17%, W5 15%, W6 23%, W7 12%.
+#     W4 and W5 are the hostile bear-vol regimes (W4: SET -3.5%, vol 12%,
+#     breadth 43%; W5: SET -15.2%, vol 19.1%, breadth 31.7% — both with
+#     persistent foreign outflows). Both have avg WR (28.7% / 27.6%) BELOW
+#     random_topk's 31.7% — models *anti-select* in these regimes,
+#     i.e. the learned score signal points the wrong way under regime shift.
+#   * The registry has 41 trainers but no pure tabular MLP: the torch_*
+#     trainers are sequence-based (3D X_seq input). On the 96-dim aggregate
+#     [last, mean, std, last-mean], the model space is dominated by tree
+#     ensembles (axis-aligned step boundaries) + kernel maps (Nystroem) +
+#     QDA/GNB (parametric Gaussian) + KNN (local distance). A regularized
+#     feed-forward MLP produces a smooth, learned non-linear decision
+#     surface — fundamentally different from all the above and the natural
+#     under-filled inductive-bias slot in §6.B.2's NN-family bullet.
+#
+# Distinct inductive bias vs registry:
+#   vs trees (xgb/lgbm/extra_trees): smooth learned non-linearity vs
+#       axis-aligned step splits. MLP's weight regularization (alpha) pulls
+#       toward simpler interpolating functions, less prone to memorizing
+#       bull-regime feature thresholds that invert in W4/W5.
+#   vs kernel_logreg: learned hidden representation vs fixed Nyström RBF
+#       map. MLP optimizes the basis jointly with the head, so the learned
+#       features are task-aware rather than data-density-aware.
+#   vs torch_attentive_mlp: pure tabular on aggregated features (96-d) with
+#       sklearn's LBFGS solver and built-in early-stopping — no PyTorch
+#       overhead, no sequence attention, no per-symbol grouping. Different
+#       inductive bias by being structurally simpler.
+#   vs logistic_elastic_net: non-linear vs linear; hidden layer learns
+#       feature interactions that elastic-net cannot represent.
+#
+# Implementation:
+#   * sklearn.neural_network.MLPClassifier with two hidden layers
+#     (default (64, 32)). On ~30k-row windows × 96 features this is
+#     ~6k + 2k + 33 ≈ 8k parameters — well below the overfitting cliff for
+#     this data size; comparable to xgboost's effective complexity at
+#     n_estimators=500 max_depth=6.
+#   * StandardScaler upstream: MLP weight initialization (Glorot/He) is
+#     unit-variance-tuned; unscaled atr_pct (~0.03) vs market_breadth (~0.5)
+#     would push some hidden units to saturation/death.
+#   * solver='adam' with early_stopping=True and validation_fraction=0.15
+#     gives sklearn-native early stopping on a held-out slice of the
+#     train+val concatenation — robust regularizer for noisy financial
+#     labels. n_iter_no_change=15 prevents premature stop on flat loss.
+#   * alpha (L2 reg) defaults to 1e-3 (10x sklearn default) — financial
+#     data is high-noise; stronger regularization toward smoother boundaries
+#     is the structural lever that should dampen W4/W5 anti-selection by
+#     preventing the network from memorizing bull-regime patterns.
+#   * One quiet caveat: MLPClassifier converges with adam stochastically;
+#     fix random_state for reproducibility and let train mode sample over
+#     hidden_layer_sizes / alpha / learning_rate_init in the HP space.
+# --------------------------------------------------------------------- #
+class MLPClassifierTrainer(BaseTrainer):
+    """Two-layer feed-forward MLP for binary win/loss classification."""
+
+    name = 'mlp_classifier'
+
+    def __init__(self,
+                 hidden_layer_1: int = 64,
+                 hidden_layer_2: int = 32,
+                 alpha: float = 1e-3,
+                 learning_rate_init: float = 1e-3,
+                 max_iter: int = 300,
+                 batch_size: int = 256,
+                 activation: str = 'relu',
+                 early_stopping: bool = True,
+                 validation_fraction: float = 0.15,
+                 n_iter_no_change: int = 15,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            hidden_layer_1=int(hidden_layer_1),
+            hidden_layer_2=int(hidden_layer_2),
+            alpha=float(alpha),
+            learning_rate_init=float(learning_rate_init),
+            max_iter=int(max_iter),
+            batch_size=int(batch_size),
+            activation=str(activation),
+            early_stopping=bool(early_stopping),
+            validation_fraction=float(validation_fraction),
+            n_iter_no_change=int(n_iter_no_change),
+            random_state=int(random_state),
+        )
+        self.pipe = None
+        self._n_features = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.neural_network import MLPClassifier
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # Concatenate train+val: MLP's early_stopping uses an internal split.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val]).astype(int)
+        self._n_features = X_full.shape[1]
+
+        hidden = tuple(
+            x for x in (p['hidden_layer_1'], p['hidden_layer_2']) if x > 0
+        )
+        if not hidden:
+            hidden = (32,)
+
+        # batch_size capped by n_samples to avoid sklearn warning.
+        bs = min(p['batch_size'], X_full.shape[0])
+
+        mlp = MLPClassifier(
+            hidden_layer_sizes=hidden,
+            activation=p['activation'],
+            solver='adam',
+            alpha=p['alpha'],
+            batch_size=bs,
+            learning_rate_init=p['learning_rate_init'],
+            max_iter=p['max_iter'],
+            shuffle=True,
+            random_state=p['random_state'],
+            early_stopping=p['early_stopping'],
+            validation_fraction=p['validation_fraction'],
+            n_iter_no_change=p['n_iter_no_change'],
+            verbose=False,
+        )
+
+        self.pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('clf', mlp),
+        ])
+        self.pipe.fit(X_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.pipe is None:
+            raise RuntimeError('Model not fit')
+        return self.pipe.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.pipe, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'pipe.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        with open(model_path, 'rb') as f:
+            inst.pipe = pickle.load(f)
+        return inst
+
+
+# --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
 TRAINERS = {
@@ -9198,6 +9380,7 @@ TRAINERS = {
     'xgb_iso_calibrated': XGBoostIsotonicCalibratedTrainer,
     'kernel_logreg': KernelLogRegTrainer,
     'gaussian_process_classifier': GaussianProcessClassifierTrainer,
+    'mlp_classifier': MLPClassifierTrainer,
 }
 
 

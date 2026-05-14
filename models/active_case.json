@@ -1,12 +1,12 @@
 {
-  "trainer": "kernel_logreg",
+  "trainer": "mlp_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep kernel_logreg sweep active \u2014 15 train iters since the iter-#819 pivot have produced best 4/7 (#829, +0.9% avg ann) and current runs are still cycling 1-3/7 with healthy threshold variance. HP space is wide (800 configs) and not exhausted. The new gaussian_process_classifier slot (this iter) is a hedge for a later pivot, but its default-HP gate (0/7, WR avg 26.6%) is weaker than kernel_logreg's already-explored band \u2014 pivot when kernel_logreg plateaus more firmly or a future iter narrows GP HPs.",
-  "claude_iter_id": 835,
-  "designated_at": "2026-05-14T09:14:27"
+  "rationale": "First-shot default-HP mlp_classifier beat kernel_logreg's current default on avg_ann (+18.2% vs -3.9%) \u2014 model is positive-EV but oversamples picks (WR 29.7%, 256 trades vs kernel_logreg's 202). Failing 7/7 on WR<40% floor, but every window posts within 4-12pp of the bar, and W1 hit +175% ann at threshold 0 (top-K fallback). The HP space (alpha 1e-4..1e-2, hidden_layer_1 32..256, activation relu/tanh, batch_size 128..512) gives train mode 10k+ configs and an obvious dial \u2014 higher alpha + smaller hidden width should sharpen selection and lift WR. Pivots away from kernel_logreg which has 15 train iters since #819 with no movement beyond 4/7.",
+  "claude_iter_id": 851,
+  "designated_at": "2026-05-14T12:10:02"
 }
