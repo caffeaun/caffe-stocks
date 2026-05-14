@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_time_moe",
+  "trainer": "tabm_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from mlp_classifier (saturated 4/7 across 8 alpha-sweep iters #884-#891, no further movement) to torch_time_moe. First-shot default-HP gate is 0/7 but produced the loop's first +400% ann window (W6 +401.5% ann, DD 12.3%, 59 trades) \u2014 structural capacity is real. Train mode should focus the 11-dim HP space on (a) use_raw_features=False to test pure foundation-model signal vs polluted concat, (b) embed_pool='last' (causal-LM style) vs mean, (c) lower learning_rate + higher weight_decay + dropout to suppress W4 catastrophic collapse (-63.9% ann), (d) longer epochs+patience for the trainable head. mlp_classifier (HP) and the 47-trainer GBDT/linear/kernel panel have stalled \u2014 switching the active axis to the first TS-foundation-model + sparse-MoE trainer is the brief's stated highest-EV move.",
-  "claude_iter_id": 892,
-  "designated_at": "2026-05-14T21:17:03"
+  "rationale": "Pivot from torch_time_moe (saturated 0/7 across 15 HP sweeps iters #893-#906, avg_ann +35% to +58% but never passes any single window's WR/DD jointly) to tabm_classifier. Default-HP first-shot scored 1/7 with avg_ann +30.8% and cracked the W1 graveyard (0/20 across last 20 torch_time_moe+mlp iters \u2192 +220% ann, WR 42.3%, DD 8.6%). The 11-dim TabM HP space has direct levers on the threshold-collapse failure mode (W3-W7 all collapsed to thr=0.0): (a) lower dropout 0.0-0.05 to reduce ensemble-member randomness and sharpen calibration, (b) larger k=64 to add probability dispersion, (c) higher weight_decay 1e-2..1e-1 to regularize against bull-train/bear-test overfit, (d) longer max_epochs=200 + patience=20 to let BatchEnsemble members fully decorrelate. Train mode should focus the sweep here; mlp_classifier and torch_time_moe HP spaces have plateaued.",
+  "claude_iter_id": 907,
+  "designated_at": "2026-05-15T00:07:02"
 }

@@ -9754,12 +9754,31 @@ class TabMClassifierTrainer(BaseTrainer):
         self.patience = int(patience)
         self.grad_clip = float(grad_clip)
         self.seed = int(seed)
-        import torch as _torch
-        self.device = device or ('cuda' if _torch.cuda.is_available() else 'cpu')
+        self.device = device or self._pick_device()
         self.model = None
         self.imputer = None
         self.scaler = None
         self.n_features_ = None
+
+    @staticmethod
+    def _pick_device(min_free_mb=1024):
+        import torch as _torch
+        try:
+            if not _torch.cuda.is_available():
+                return 'cpu'
+            best_idx, best_free = -1, -1
+            for i in range(_torch.cuda.device_count()):
+                try:
+                    free, _ = _torch.cuda.mem_get_info(i)
+                except Exception:
+                    free = 0
+                if free > best_free:
+                    best_free, best_idx = free, i
+            if best_free < min_free_mb * 1024 * 1024:
+                return 'cpu'
+            return f'cuda:{best_idx}'
+        except Exception:
+            return 'cpu'
 
     def _make_model(self, n_features):
         import torch
