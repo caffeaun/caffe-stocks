@@ -9463,6 +9463,256 @@ class TabPFNV25Trainer(BaseTrainer):
             json.dump(meta, f, indent=2, default=str)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
+
+try:
+    from transformers import AutoModelForCausalLM
+    _HAS_TRANSFORMERS = True
+except Exception:
+    _HAS_TRANSFORMERS = False
+
+
+class _TimeMoEHead(nn.Module):
+    def __init__(self, in_dim, hidden_dim, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+class TorchTimeMoETrainer(BaseTrainer):
+    """Time-MoE (Maple728/TimeMoE-50M) used as a FROZEN time-series
+    foundation encoder, with a small MLP classification head trained on
+    pooled embeddings concatenated with the raw tabular features.
+
+    Brings two inductive biases that are absent from the registry:
+      (1) time-series foundation-model pretraining (Time-300B), and
+      (2) sparse mixture-of-experts routing — pathways activate per
+          input pattern, which is the natural fit for the regime-
+          shifting bear windows where prior XGB variants have failed.
+
+    Each row's F-dim feature vector is reshaped to a univariate
+    sequence of length F and pushed through Time-MoE; the last-layer
+    hidden states are mean-pooled to a fixed embedding, optionally
+    concatenated with the raw features, then fed to the trainable head.
+    The encoder is loaded once on first fit() and never updated.
+    """
+    name = 'torch_time_moe'
+    consumes_sequences = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not _HAS_TORCH or not _HAS_TRANSFORMERS:
+            raise ImportError(
+                "torch_time_moe needs torch>=2.1 and transformers>=4.40. "
+                "Run `pip install torch transformers accelerate`."
+            )
+        self.model_id = str(kwargs.get('model_id', 'Maple728/TimeMoE-50M'))
+        self.hidden_dim = int(kwargs.get('hidden_dim', 128))
+        self.dropout = float(kwargs.get('dropout', 0.15))
+        self.learning_rate = float(kwargs.get('learning_rate', 1e-3))
+        self.weight_decay = float(kwargs.get('weight_decay', 1e-4))
+        self.batch_size = int(kwargs.get('batch_size', 256))
+        self.encode_batch_size = int(kwargs.get('encode_batch_size', 64))
+        self.epochs = int(kwargs.get('epochs', 12))
+        self.patience = int(kwargs.get('patience', 3))
+        self.use_raw_features = bool(kwargs.get('use_raw_features', True))
+        self.embed_pool = str(kwargs.get('embed_pool', 'mean'))  # 'mean' | 'last'
+        self.random_state = int(kwargs.get('random_state', 42))
+        self._encoder = None
+        self._head = None
+        self._embed_dim = None
+        self._n_features = None
+        self._device = None
+
+    def _pick_device(self):
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _load_encoder(self):
+        if self._encoder is not None:
+            return
+        self._device = self._pick_device()
+        self._encoder = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            device_map=self._device,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
+        self._encoder.eval()
+        for p in self._encoder.parameters():
+            p.requires_grad = False
+
+    def _sanitize(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    @torch.no_grad()
+    def _encode(self, X):
+        # Each row of shape (F,) is treated as a univariate time series of length F.
+        # Time-MoE accepts float-valued (B, T) input via its causal-LM forward pass
+        # and we ask for hidden states explicitly.
+        n = X.shape[0]
+        bs = self.encode_batch_size
+        out = []
+        for i in range(0, n, bs):
+            xb = torch.from_numpy(X[i:i + bs]).to(self._device).float()
+            try:
+                outputs = self._encoder(
+                    input_ids=xb,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            except TypeError:
+                # Some custom Time-MoE forwards expect `inputs_embeds` of shape (B, T, 1)
+                outputs = self._encoder(
+                    inputs_embeds=xb.unsqueeze(-1),
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            h = outputs.hidden_states[-1]  # (B, T, D)
+            if self.embed_pool == 'last':
+                emb = h[:, -1, :]
+            else:
+                emb = h.mean(dim=1)
+            out.append(emb.cpu().numpy().astype(np.float32))
+        return np.concatenate(out, axis=0)
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+        self._load_encoder()
+
+        X_tr = self._sanitize(X_tr)
+        y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+        self._n_features = X_tr.shape[1]
+        Z_tr = self._encode(X_tr)
+        self._embed_dim = Z_tr.shape[1]
+
+        if self.use_raw_features:
+            feed_tr = np.concatenate([Z_tr, X_tr], axis=1)
+        else:
+            feed_tr = Z_tr
+        in_dim = feed_tr.shape[1]
+
+        self._head = _TimeMoEHead(in_dim, self.hidden_dim, self.dropout).to(self._device)
+        opt = torch.optim.AdamW(
+            self._head.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        x_tr_t = torch.from_numpy(feed_tr).to(self._device)
+        y_tr_t = torch.from_numpy(y_tr).to(self._device)
+
+        has_val = X_val is not None and y_val is not None and len(X_val) > 0
+        x_val_t = y_val_t = None
+        if has_val:
+            X_val_s = self._sanitize(X_val)
+            Z_val = self._encode(X_val_s)
+            feed_val = np.concatenate([Z_val, X_val_s], axis=1) if self.use_raw_features else Z_val
+            x_val_t = torch.from_numpy(feed_val).to(self._device)
+            y_val_t = torch.from_numpy(np.asarray(y_val, dtype=np.float32).ravel()).to(self._device)
+
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        n = x_tr_t.shape[0]
+        idx = np.arange(n)
+        for ep in range(self.epochs):
+            np.random.shuffle(idx)
+            self._head.train()
+            for i in range(0, n, self.batch_size):
+                jb = idx[i:i + self.batch_size]
+                xb = x_tr_t[jb]
+                yb = y_tr_t[jb]
+                opt.zero_grad()
+                logits = self._head(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            if has_val:
+                self._head.eval()
+                with torch.no_grad():
+                    val_logits = self._head(x_val_t)
+                    val_loss = loss_fn(val_logits, y_val_t).item()
+                if val_loss < best_val - 1e-5:
+                    best_val = val_loss
+                    bad = 0
+                    best_state = {k: v.detach().clone() for k, v in self._head.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+        if best_state is not None:
+            self._head.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self._head is None:
+            raise RuntimeError("torch_time_moe: predict_proba called before fit()")
+        self._load_encoder()
+        X = self._sanitize(X)
+        Z = self._encode(X)
+        feed = np.concatenate([Z, X], axis=1) if self.use_raw_features else Z
+        self._head.eval()
+        with torch.no_grad():
+            x_t = torch.from_numpy(feed).to(self._device)
+            logits = self._head(x_t)
+            proba = torch.sigmoid(logits).cpu().numpy().astype(np.float32)
+        return proba
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self._head is not None:
+            torch.save(
+                {
+                    'state_dict': self._head.state_dict(),
+                    'embed_dim': self._embed_dim,
+                    'n_features': self._n_features,
+                    'hidden_dim': self.hidden_dim,
+                    'dropout': self.dropout,
+                    'use_raw_features': self.use_raw_features,
+                    'embed_pool': self.embed_pool,
+                },
+                os.path.join(model_dir, 'head.pt'),
+            )
+        meta = {
+            'trainer': self.name,
+            'model_id': self.model_id,
+            'embed_pool': self.embed_pool,
+            'use_raw_features': self.use_raw_features,
+            'device': self._device,
+            'embed_dim': self._embed_dim,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -9510,6 +9760,7 @@ TRAINERS = {
     'gaussian_process_classifier': GaussianProcessClassifierTrainer,
     'mlp_classifier': MLPClassifierTrainer,
     'tabpfn_v25': TabPFNV25Trainer,
+    'torch_time_moe': TorchTimeMoETrainer,
 }
 
 

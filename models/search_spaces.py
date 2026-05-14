@@ -1112,6 +1112,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'max_train_rows':        [10000, 20000, 30000],
     'random_state':          [42, 7, 1337],
 },
+    # models/search_spaces.py — entry to add to SEARCH_SPACES dict
+'torch_time_moe': {
+    'hidden_dim':         [64, 128, 256],
+    'dropout':            (0.0, 0.4),
+    'learning_rate':      (1e-4, 1e-2),
+    'weight_decay':       (1e-6, 1e-3),
+    'batch_size':         [128, 256, 512],
+    'encode_batch_size':  [32, 64, 128],
+    'epochs':             [5, 10, 20],
+    'patience':           [2, 3, 5],
+    'use_raw_features':   [True, False],
+    'embed_pool':         ['mean', 'last'],
+    'random_state':       [42, 7, 1337],
+},
 }
 
 
