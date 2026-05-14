@@ -9547,7 +9547,19 @@ class TorchTimeMoETrainer(BaseTrainer):
         self._device = None
 
     def _pick_device(self):
-        return 'cuda' if torch.cuda.is_available() else 'cpu'
+        if not torch.cuda.is_available():
+            return 'cpu'
+        # Pick the CUDA device with the most free memory — shared workstations
+        # often have one GPU pinned by another process.
+        best_idx, best_free = 0, -1
+        for i in range(torch.cuda.device_count()):
+            try:
+                free, _ = torch.cuda.mem_get_info(i)
+            except Exception:
+                free = 0
+            if free > best_free:
+                best_free, best_idx = free, i
+        return f'cuda:{best_idx}'
 
     def _load_encoder(self):
         if self._encoder is not None:
@@ -9557,7 +9569,7 @@ class TorchTimeMoETrainer(BaseTrainer):
             self.model_id,
             device_map=self._device,
             trust_remote_code=True,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         )
         self._encoder.eval()
         for p in self._encoder.parameters():
@@ -9570,26 +9582,20 @@ class TorchTimeMoETrainer(BaseTrainer):
     @torch.no_grad()
     def _encode(self, X):
         # Each row of shape (F,) is treated as a univariate time series of length F.
-        # Time-MoE accepts float-valued (B, T) input via its causal-LM forward pass
-        # and we ask for hidden states explicitly.
+        # Time-MoE accepts float-valued (B, T) input via its causal-LM forward pass.
+        # use_cache=False bypasses DynamicCache.from_legacy_cache() which was removed
+        # in transformers v5 (Time-MoE's modeling code still calls it via past_key_values).
         n = X.shape[0]
         bs = self.encode_batch_size
         out = []
         for i in range(0, n, bs):
             xb = torch.from_numpy(X[i:i + bs]).to(self._device).float()
-            try:
-                outputs = self._encoder(
-                    input_ids=xb,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-            except TypeError:
-                # Some custom Time-MoE forwards expect `inputs_embeds` of shape (B, T, 1)
-                outputs = self._encoder(
-                    inputs_embeds=xb.unsqueeze(-1),
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+            outputs = self._encoder(
+                input_ids=xb,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
             h = outputs.hidden_states[-1]  # (B, T, D)
             if self.embed_pool == 'last':
                 emb = h[:, -1, :]

@@ -1,12 +1,12 @@
 {
-  "trainer": "mlp_classifier",
+  "trainer": "torch_time_moe",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First-shot default-HP mlp_classifier beat kernel_logreg's current default on avg_ann (+18.2% vs -3.9%) \u2014 model is positive-EV but oversamples picks (WR 29.7%, 256 trades vs kernel_logreg's 202). Failing 7/7 on WR<40% floor, but every window posts within 4-12pp of the bar, and W1 hit +175% ann at threshold 0 (top-K fallback). The HP space (alpha 1e-4..1e-2, hidden_layer_1 32..256, activation relu/tanh, batch_size 128..512) gives train mode 10k+ configs and an obvious dial \u2014 higher alpha + smaller hidden width should sharpen selection and lift WR. Pivots away from kernel_logreg which has 15 train iters since #819 with no movement beyond 4/7.",
-  "claude_iter_id": 851,
-  "designated_at": "2026-05-14T12:10:02"
+  "rationale": "Pivot from mlp_classifier (saturated 4/7 across 8 alpha-sweep iters #884-#891, no further movement) to torch_time_moe. First-shot default-HP gate is 0/7 but produced the loop's first +400% ann window (W6 +401.5% ann, DD 12.3%, 59 trades) \u2014 structural capacity is real. Train mode should focus the 11-dim HP space on (a) use_raw_features=False to test pure foundation-model signal vs polluted concat, (b) embed_pool='last' (causal-LM style) vs mean, (c) lower learning_rate + higher weight_decay + dropout to suppress W4 catastrophic collapse (-63.9% ann), (d) longer epochs+patience for the trainable head. mlp_classifier (HP) and the 47-trainer GBDT/linear/kernel panel have stalled \u2014 switching the active axis to the first TS-foundation-model + sparse-MoE trainer is the brief's stated highest-EV move.",
+  "claude_iter_id": 892,
+  "designated_at": "2026-05-14T21:17:03"
 }
