@@ -1104,6 +1104,14 @@ SEARCH_SPACES: dict[str, dict] = {
         'n_iter_no_change':     [10, 15, 25],
     },
     # When Claude mode adds new trainers (LSTM, LoRA, RL, ...), it appends here.
+    'tabpfn_v25': {
+    'n_estimators':          [2, 4, 8],
+    'softmax_temperature':   (0.5, 1.5),
+    'balance_probabilities': [False, True],
+    'average_before_softmax':[False, True],
+    'max_train_rows':        [10000, 20000, 30000],
+    'random_state':          [42, 7, 1337],
+},
 }
 
 

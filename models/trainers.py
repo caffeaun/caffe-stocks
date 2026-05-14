@@ -9335,6 +9335,134 @@ class MLPClassifierTrainer(BaseTrainer):
 # --------------------------------------------------------------------- #
 # Registry — add new model types here
 # --------------------------------------------------------------------- #
+
+
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import pickle
+import numpy as np
+
+try:
+    import torch
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
+
+try:
+    from tabpfn import TabPFNClassifier
+    _HAS_TABPFN = True
+except Exception:
+    _HAS_TABPFN = False
+
+
+class TabPFNV25Trainer(BaseTrainer):
+    """In-context tabular foundation model (Prior Labs TabPFN-2.5).
+
+    No gradient updates at fit-time: stores the training rows and the
+    pretrained backbone performs in-context Bayesian inference on each
+    predict_proba call. Subsamples (stratified) to max_train_rows to
+    stay inside the published 50k-row support of TabPFN-2.5 and to
+    bound per-window wall-time.
+    """
+    name = 'tabpfn_v25'
+    consumes_sequences = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not _HAS_TABPFN:
+            raise ImportError(
+                "tabpfn not installed. `pip install tabpfn` (Python 3.9+, "
+                "PyTorch>=2.1). CUDA strongly recommended."
+            )
+        self.n_estimators = int(kwargs.get('n_estimators', 4))
+        self.softmax_temperature = float(kwargs.get('softmax_temperature', 0.9))
+        self.balance_probabilities = bool(kwargs.get('balance_probabilities', False))
+        self.average_before_softmax = bool(kwargs.get('average_before_softmax', False))
+        self.ignore_pretraining_limits = bool(kwargs.get('ignore_pretraining_limits', True))
+        self.random_state = int(kwargs.get('random_state', 42))
+        self.max_train_rows = int(kwargs.get('max_train_rows', 30000))
+        self._model = None
+        self._X_train = None
+        self._y_train = None
+        self._device = None
+
+    def _sanitize(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _stratified_subsample(self, X, y):
+        n = len(X)
+        if n <= self.max_train_rows:
+            return X, y
+        rng = np.random.default_rng(self.random_state)
+        pos_idx = np.where(y == 1)[0]
+        neg_idx = np.where(y == 0)[0]
+        frac = self.max_train_rows / float(n)
+        n_pos = max(1, int(round(len(pos_idx) * frac)))
+        n_neg = max(1, min(self.max_train_rows - n_pos, len(neg_idx)))
+        sel_pos = rng.choice(pos_idx, size=n_pos, replace=False)
+        sel_neg = rng.choice(neg_idx, size=n_neg, replace=False)
+        idx = np.concatenate([sel_pos, sel_neg])
+        rng.shuffle(idx)
+        return X[idx], y[idx]
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        X_tr = self._sanitize(X_tr)
+        y_tr = np.asarray(y_tr).astype(np.int64).ravel()
+        X_tr, y_tr = self._stratified_subsample(X_tr, y_tr)
+        self._device = 'cuda' if (_HAS_TORCH and torch.cuda.is_available()) else 'cpu'
+        self._model = TabPFNClassifier(
+            n_estimators=self.n_estimators,
+            softmax_temperature=self.softmax_temperature,
+            balance_probabilities=self.balance_probabilities,
+            average_before_softmax=self.average_before_softmax,
+            ignore_pretraining_limits=self.ignore_pretraining_limits,
+            device=self._device,
+            random_state=self.random_state,
+        )
+        self._model.fit(X_tr, y_tr)
+        self._X_train = X_tr
+        self._y_train = y_tr
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("TabPFNV25Trainer: predict_proba called before fit()")
+        X = self._sanitize(X)
+        proba = self._model.predict_proba(X)
+        if proba.ndim == 2 and proba.shape[1] >= 2:
+            return proba[:, 1].astype(np.float32)
+        return np.asarray(proba, dtype=np.float32).ravel()
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        # The pretrained backbone is reloaded from cache on next fit; we
+        # only need to persist the in-context training data + HP so the
+        # trainer can be reconstructed deterministically.
+        with open(os.path.join(model_dir, 'tabpfn_state.pkl'), 'wb') as f:
+            pickle.dump({
+                'X_train': self._X_train,
+                'y_train': self._y_train,
+                'hp': {
+                    'n_estimators': self.n_estimators,
+                    'softmax_temperature': self.softmax_temperature,
+                    'balance_probabilities': self.balance_probabilities,
+                    'average_before_softmax': self.average_before_softmax,
+                    'ignore_pretraining_limits': self.ignore_pretraining_limits,
+                    'random_state': self.random_state,
+                    'max_train_rows': self.max_train_rows,
+                },
+                'device': self._device,
+            }, f)
+        meta = {'trainer': self.name, 'device': self._device}
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -9381,6 +9509,7 @@ TRAINERS = {
     'kernel_logreg': KernelLogRegTrainer,
     'gaussian_process_classifier': GaussianProcessClassifierTrainer,
     'mlp_classifier': MLPClassifierTrainer,
+    'tabpfn_v25': TabPFNV25Trainer,
 }
 
 
