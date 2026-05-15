@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep histgb_monotonic 12-feature (iter #951) config as train-mode sweep target \u2014 it remains the only trainer family with W6 cracked and avg_ann +43% within reach via HP tuning. Iter #967 negative-monotonic test reverted; the family ceiling (4/7) isn't broken by HP alone, but train-mode HP sweep #960-966 hasn't yet exhausted the (lr \u00d7 pos_class_weight \u00d7 min_samples_leaf) corner \u2014 let it continue.",
-  "claude_iter_id": 967,
-  "designated_at": "2026-05-15T12:09:04"
+  "rationale": "Keep histgb_monotonic \u2014 still the only 4/7 family in registry history (iter #936) and recent train-mode sweep (#977 hit 3/7 ann+62.1%, #980 3/7 ann+49.2%) is still finding new corners in lr \u00d7 pos_class_weight space. tabm_classifier's brief-mandated rerun this iter only matched its prior 1/7 at iter #907 \u2014 not a viable HP-sweep base. Pivoting train mode to a 1/7 family would waste cycles vs. deepening on a 4/7 family with active improvement.",
+  "claude_iter_id": 983,
+  "designated_at": "2026-05-15T15:04:29"
 }
