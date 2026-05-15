@@ -165,6 +165,81 @@ def commit_iteration(iter_id: int, trainer_name: str, gate_passed: bool,
     return sha
 
 
+def detect_brief_deviation(report: dict) -> Optional[str]:
+    """Decide if claude's report deviates from the active research brief.
+
+    Returns a deviation reason string when the iteration should be rejected
+    (revert changes, no active_case update). Returns None when the report
+    is compliant — either matches the brief, legitimately marks it
+    exhausted, or no brief exists.
+
+    Compliance rules (mirroring §6.B.0 in the prompt):
+      - No brief on disk → compliant (full discretion).
+      - Brief present and trainer == registry_key → compliant.
+      - Brief present, trainer != registry_key, AND `exhausted_brief: true`
+        AND DB confirms ≥2 prior claude attempts of registry_key with
+        best wp < 3 → compliant.
+      - Anything else → deviation.
+
+    The exhaustion check is duplicated from prompt_builder._brief_directive
+    (intentional — keep the enforcement self-contained).
+    """
+    brief_path = BASE / 'data' / 'research_briefs' / 'latest.md'
+    if not brief_path.exists():
+        return None
+    text = brief_path.read_text(errors='replace')
+    m = re.search(
+        r'### Registry registration\s*\n```python\s*\n(.*?)\n\s*```',
+        text, re.DOTALL,
+    )
+    if not m:
+        return None  # unparseable brief — fail open
+    m2 = re.search(r"['\"](\w+)['\"]\s*:\s*\w+", m.group(1))
+    if not m2:
+        return None
+    registry_key = m2.group(1)
+
+    picked = report.get('trainer', '')
+    if picked == registry_key:
+        return None  # following the order
+
+    # Trainer differs — check if exhaustion claim is legitimate
+    claims_exhausted = bool(report.get('exhausted_brief'))
+    fb.init_db()
+    with fb.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT windows_passed FROM iterations "
+            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 5",
+            (registry_key,),
+        ).fetchall()
+    attempts = len(rows)
+    best_wp = max((r['windows_passed'] for r in rows), default=0)
+    db_exhausted = attempts >= 2 and best_wp < 3
+
+    if claims_exhausted and db_exhausted:
+        return None  # legitimate pivot — brief is dead
+
+    return (
+        f'trainer={picked!r} != brief.registry_key={registry_key!r}; '
+        f'exhausted_brief={claims_exhausted}, DB attempts={attempts}, '
+        f'best_wp={best_wp} (needs ≥2 attempts AND best wp<3)'
+    )
+
+
+def revert_claude_edits(paths: list[str]) -> bool:
+    """Discard claude's working-tree changes to allowlisted files via
+    `git checkout HEAD --`. Surgical — doesn't touch unrelated paths.
+    Returns True on success."""
+    r = subprocess.run(
+        ['git', '-C', str(BASE), 'checkout', 'HEAD', '--'] + paths,
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f'revert: git checkout failed: {r.stderr.strip()}', file=sys.stderr)
+        return False
+    return True
+
+
 def parse_claude_report(stdout: str) -> Optional[dict]:
     """Extract the last ```json``` block from Claude's output and parse it.
     Falls back to the last bare JSON object containing 'gate_result'."""
@@ -321,6 +396,15 @@ def main():
             gate_result['avg_annualized_return'] = avg_annualized_return(results)
             gate_result['prior_best_ann_return'] = prior_best_ann
 
+        # Detect deviation from the research-brief order BEFORE recording
+        # active_case or committing. If claude went off-script:
+        #  - record the iteration (truth-keeping; the gate result is still
+        #    useful evidence for tomorrow's research_mode)
+        #  - revert claude's code changes (don't pollute the registry)
+        #  - skip active_case update (train mode keeps sweeping prior case)
+        #  - Telegram alert (operator visibility)
+        deviation_reason = detect_brief_deviation(report)
+
         iter_id = fb.record_iteration(
             mode='claude',
             trainer=report.get('trainer', 'unknown'),
@@ -335,6 +419,33 @@ def main():
             backbone=report.get('backbone') or None,
             lessons=report.get('lessons'),
         )
+
+        if deviation_reason:
+            # Revert the working-tree changes claude made (same allowlist
+            # as commit_iteration) so the next 3-hourly run starts clean
+            # and the deviant trainer doesn't pollute the registry.
+            paths_to_revert = [
+                'models/trainers.py',
+                'models/search_spaces.py',
+                'models/feature_eng.py',
+                'models/labels.py',
+                'models/sequence_loader.py',
+                'models/active_case.json',
+                'scripts/return_gate.py',
+            ]
+            revert_ok = revert_claude_edits(paths_to_revert)
+            print(f'DEVIATION DETECTED: {deviation_reason}')
+            print(f'reverted={revert_ok}; active_case NOT updated; no commit')
+            telegram(
+                f'⛔ *Claude iter #{iter_id} DEVIATED*\n'
+                f'`{report.get("trainer", "?")}` (gate ignored)\n'
+                f'Reason: {deviation_reason}\n'
+                f'Reverted code changes={"yes" if revert_ok else "FAILED"}; '
+                f'active_case kept; brief still active for next run.\n'
+                f'See {log_path.name}'
+            )
+            # Skip active_case update and auto-commit for deviations.
+            return
 
         # Designate the next experimental case for train mode to sweep within.
         # Falls back to inferring from report['trainer'] + defaults when the

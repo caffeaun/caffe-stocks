@@ -70,6 +70,103 @@ def _open_data_requests() -> list[str]:
     return [f"{r['requested_at'][:10]} — {r['request_text']}" for r in rows]
 
 
+def _brief_directive() -> str:
+    """Compute the binding directive about which trainer claude must use.
+    Reads latest.md to extract the brief's registry_key, queries the
+    feedback DB to determine if the brief is exhausted (≥2 claude attempts
+    with best wp < 3), and emits one of three blocks for §5b: MUST-EXECUTE,
+    EXHAUSTED-MAY-PIVOT, or NO-BRIEF."""
+    path = BASE / 'data' / 'research_briefs' / 'latest.md'
+    if not path.exists():
+        return (
+            '==================================================================\n'
+            'BRIEF DIRECTIVE — NO BRIEF YET\n'
+            '==================================================================\n'
+            'No research brief on disk. The daily 03:00 research_mode has '
+            "not produced one yet. For THIS iteration you have full discretion "
+            'per §6.B.1–B.4. Set `exhausted_brief: false` in the JSON output.\n\n'
+        )
+
+    text = path.read_text(errors='replace')
+    # Pull registry_key from "### Registry registration" code block
+    import re as _re
+    m = _re.search(
+        r'### Registry registration\s*\n```python\s*\n(.*?)\n\s*```',
+        text, _re.DOTALL,
+    )
+    registry_key = None
+    if m:
+        m2 = _re.search(r"['\"](\w+)['\"]\s*:\s*\w+", m.group(1))
+        if m2:
+            registry_key = m2.group(1)
+    technique_m = _re.search(r'^## Recommended technique:\s*(.+?)$', text, _re.MULTILINE)
+    technique = technique_m.group(1).strip() if technique_m else 'UNKNOWN'
+
+    if not registry_key:
+        return (
+            '==================================================================\n'
+            'BRIEF DIRECTIVE — BRIEF UNPARSEABLE\n'
+            '==================================================================\n'
+            f'A brief exists at data/research_briefs/latest.md but its '
+            f'registry registration code block could not be parsed. Falling '
+            f'back to full discretion per §6.B.1–B.4. Set `exhausted_brief: '
+            f'false` in the JSON output.\n\n'
+        )
+
+    # Exhaustion check: count claude-mode iters using this registry_key
+    fb.init_db()
+    with fb.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, windows_passed FROM iterations "
+            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 5",
+            (registry_key,),
+        ).fetchall()
+    attempts = len(rows)
+    best_wp = max((r['windows_passed'] for r in rows), default=0)
+    EXHAUSTED_MIN_ATTEMPTS = 2
+    EXHAUSTED_WP_THRESHOLD = 3
+
+    if attempts >= EXHAUSTED_MIN_ATTEMPTS and best_wp < EXHAUSTED_WP_THRESHOLD:
+        return (
+            '==================================================================\n'
+            'BRIEF DIRECTIVE — EXHAUSTED, PIVOT ALLOWED\n'
+            '==================================================================\n'
+            f'The brief recommends `{registry_key}` ({technique}), but it has '
+            f'been attempted {attempts} times in claude-mode with best '
+            f'windows_passed={best_wp} (threshold: <{EXHAUSTED_WP_THRESHOLD}). '
+            f'You MAY pivot to a structurally different trainer per §6.B.0(b). '
+            f'In your JSON output:\n'
+            f'  - Set `exhausted_brief: true`\n'
+            f'  - Set `trainer` to a registry key from §3 that is NOT '
+            f'`{registry_key}` and NOT in the same engine family (see '
+            f'§6.B.2 family list)\n'
+            f'  - Hypothesis must explain why the new family addresses the '
+            f'failure mode that {registry_key} hit.\n\n'
+        )
+
+    return (
+        '==================================================================\n'
+        'BRIEF DIRECTIVE — MUST EXECUTE\n'
+        '==================================================================\n'
+        f'The brief recommends `{registry_key}` ({technique}). It has been '
+        f'attempted {attempts} times in claude-mode (best wp={best_wp}; '
+        f'threshold for exhaustion: ≥{EXHAUSTED_MIN_ATTEMPTS} attempts AND '
+        f'best wp <{EXHAUSTED_WP_THRESHOLD}). You MUST execute it this '
+        f'iteration. In your JSON output:\n'
+        f'  - Set `trainer: "{registry_key}"`\n'
+        f'  - Set `exhausted_brief: false`\n'
+        f'  - Run the gate via `--model-type {registry_key}` with default HPs '
+        f'(or minor nudges from search_spaces.py).\n'
+        f'  - Any deviation (custom variant, audit-driven pivot, etc.) will '
+        f'be rejected at parse time: your code changes are reverted via `git '
+        f'checkout HEAD --`, the iteration is logged as a deviation, '
+        f'active_case.json is NOT updated. If the trainer truly cannot be '
+        f'executed (e.g., import error), emit `exhausted_brief: true` with '
+        f'an explanation in `lessons` so research_mode picks a different '
+        f'family tomorrow.\n\n'
+    )
+
+
 def _research_brief(max_lines: int = 80) -> str:
     """Return the truncated body of data/research_briefs/latest.md.
 
@@ -200,19 +297,25 @@ Do NOT submit a "decompile the .pyc" data request — git history is the canonic
 {open_requests}
 
 ==================================================================
-5b. TODAY'S RESEARCH BRIEF
+5b. TODAY'S RESEARCH BRIEF (the order you execute)
 ==================================================================
-The daily research_mode (03:00 cron) produces a focused brief on a SOTA technique we haven't tried. The scaffold post-script auto-installs deps + writes the trainer code, so by the time you read this the trainer should be in the registry above. If the brief recommends a specific trainer, that is the highest-EV thing for you to try this iteration — your hypothesis must explicitly cite this brief, or explain why you're choosing not to follow it (e.g. it was already attempted in the last 3 iters).
+Research mode runs daily and decides what the loop tries next. You are the EXECUTOR of that decision, not a parallel decision-maker. The brief below was committed within the last 24 hours and is the authoritative answer to "what trainer should claude_mode run this iteration."
 
 {research_brief}
 
-{pivot_directive}==================================================================
-6. YOUR JOB — diagnose first, then change (evidence-backed)
+{pivot_directive}{brief_directive}==================================================================
+6. YOUR JOB — execute the brief, then diagnose what happened
 ==================================================================
 
-Reality check: the loop has 30+ trainers and hundreds of iterations, 0 gate-passing. Adding more trainers without evidence is no longer the highest-EV move — the marginal trainer adds noise to the registry and confusion to the panel. Every run MUST start with diagnosis. The structural change (if any) must cite that diagnosis.
+Order of operations is now FIXED:
 
-PART A — DIAGNOSE  (mandatory, must include all three in your JSON report)
+1. **EXECUTE** — run the gate with the trainer named in §6.B.0 below. No alternatives, no "improvements", no audit-driven pivots. If §6.B.0 forbids pivoting, the `trainer` field in your JSON output MUST equal the brief's registry_key.
+2. **DIAGNOSE** (Part A) — same audit as before (baselines + regime stats + failure pattern), but it runs AFTER your gate result is in. The diagnosis informs research_mode's NEXT brief, not your CURRENT pick.
+3. **REPORT** — emit the JSON block with gate_result, diagnosis, AND the new `exhausted_brief` field (true/false).
+
+Why this changed: the loop ran for 16 hours with research_mode active and claude_mode reverted to a tree variant (histgb_monotonic) at iter #951 after two scaffolded picks (torch_time_moe #892, tabm_classifier #907) failed. The audit-first protocol gave claude rhetorical cover to override the research order. That defeats the point of having a research stage. claude_mode's job is execution; research_mode's job is selection.
+
+PART A — DIAGNOSE  (audit AFTER execution — feeds research_mode tomorrow)
 
 A.1. **Baselines** — what does a non-model strategy score on this same gate?
    - `random_topk` baseline: for each test date, pick the top-K symbols by a uniformly random score; apply the gate. Run this once and report the 7-window result.
@@ -229,7 +332,13 @@ A.2. **Per-window regime stats** — for each of the 7 walk-forward TEST windows
 
 A.3. **Failure pattern across last 20 iterations** — query feedback DB. Cross-tab `trainer × window`: which windows consistently fail across trainers? If W1, W4, W5 fail in 18/20 recent runs regardless of trainer family, the bottleneck is in those regimes' data, not model architecture.
 
-PART B — PROPOSE ONE CHANGE  (must cite Part A evidence in `hypothesis`)
+PART B — EXECUTE THE BRIEF
+
+  B.0. **THE TRAINER YOU MUST USE THIS ITERATION** — read the §5b BRIEF DIRECTIVE block above. It tells you exactly one of:
+       (a) The registry_key of the brief's pick. You MUST set `trainer = <that_key>` in your gate run AND in the JSON output's `trainer` field. Set `exhausted_brief: false`. Pick the default HPs from the brief or the search_spaces.py entry for that key — minor HP nudges OK; structural changes NOT OK.
+       (b) "Brief exhausted, pivot allowed" — only when the brief's trainer has been attempted ≥2 times in claude-mode with best wp < 3. In this case set `exhausted_brief: true` and pick a STRUCTURALLY DIFFERENT trainer per B.1–B.4 below. The choice must be evidence-backed by Part A.
+       (c) "No brief present" — you have full discretion; choose per B.1–B.4 below.
+       Any other deviation (custom variant on the brief's trainer, audit-driven pivot to a tree family, etc.) is rejected at parse time by claude_mode.py: your changes are reverted via `git checkout HEAD --`, the iteration is recorded as a deviation, and active_case.json is NOT updated. Don't deviate — emit `exhausted_brief: true` if you genuinely believe the brief is dead.
 
   B.1. Add or modify a feature in models/feature_eng.py — cite a Part A finding that motivates it (e.g., "W1 has bearish foreign flow regime so I'm adding foreign_flow_5d_zscore").
   B.2. Add a new trainer in models/trainers.py — encouraged when the new family represents a **genuinely different inductive bias** not present in the registry. The current registry (see §3) is heavy on XGBoost / LightGBM loss variants. Under-represented families that the loop has barely explored or never tried (a sample, not a fixed list):
@@ -291,7 +400,8 @@ them this iteration.
 ==================================================================
 ```json
 {{
-  "trainer": "<registered trainer name used for the gate>",
+  "trainer": "<registered trainer name used for the gate — MUST equal the brief's registry_key unless exhausted_brief=true>",
+  "exhausted_brief": false,
   "hyperparams": {{ ... }},
   "code_changes": [
     "models/trainers.py: added LSTMTrainer (PyTorch, 2-layer, dropout 0.3)",
@@ -416,6 +526,7 @@ def build_prompt() -> str:
         active_case_summary=active_case_summary,
         pivot_directive=pivot_directive,
         research_brief=_research_brief(),
+        brief_directive=_brief_directive(),
     )
 
 
