@@ -10398,7 +10398,23 @@ class TorchITransformerTrainer(BaseTrainer):
         self.epochs = int(epochs)
         self.patience = int(patience)
         self.pos_weight = pos_weight
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        if device is None:
+            device = 'cpu'
+            try:
+                if torch.cuda.is_available():
+                    best_idx, best_free = -1, -1
+                    for i in range(torch.cuda.device_count()):
+                        try:
+                            free, _ = torch.cuda.mem_get_info(i)
+                        except Exception:
+                            free = 0
+                        if free > best_free:
+                            best_free, best_idx = free, i
+                    if best_free >= 1_500_000_000:
+                        device = f'cuda:{best_idx}'
+            except Exception:
+                pass
+        self.device = device
         self.model = None
         self.feature_mean_ = None
         self.feature_std_ = None
@@ -10447,8 +10463,8 @@ class TorchITransformerTrainer(BaseTrainer):
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
         ds_tr = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
         dl_tr = DataLoader(ds_tr, batch_size=self.batch_size, shuffle=True, drop_last=False)
-        X_val_t = torch.from_numpy(X_val).to(self.device)
-        y_val_t = torch.from_numpy(y_val).to(self.device)
+        X_val_t = torch.from_numpy(X_val)
+        y_val_t = torch.from_numpy(y_val)
         best_val = float('inf')
         best_state = None
         bad_epochs = 0
@@ -10465,8 +10481,13 @@ class TorchITransformerTrainer(BaseTrainer):
                 opt.step()
             self.model.eval()
             with torch.no_grad():
-                val_logits = self.model(X_val_t)
-                val_loss = float(loss_fn(val_logits, y_val_t).item())
+                val_losses = []
+                for i in range(0, X_val_t.shape[0], self.batch_size):
+                    xb = X_val_t[i:i + self.batch_size].to(self.device, non_blocking=True)
+                    yb = y_val_t[i:i + self.batch_size].to(self.device, non_blocking=True)
+                    vl = self.model(xb)
+                    val_losses.append(float(loss_fn(vl, yb).item()) * xb.shape[0])
+                val_loss = sum(val_losses) / max(X_val_t.shape[0], 1)
             if val_loss < best_val - 1e-5:
                 best_val = val_loss
                 best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}

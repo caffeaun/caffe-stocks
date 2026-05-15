@@ -1,12 +1,12 @@
 {
-  "trainer": "histgb_monotonic",
+  "trainer": "torch_itransformer",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "GP at #1015 confirmed kernel methods over the 96-d curated set can't break the 40% WR floor on any window (max 38.7%) even with tightened bounds \u2014 keep sweeping histgb_monotonic, the only family with a 5/7 candidate (iter #991: +67.9% ann, 43.1% WR, 9.7% DD, 194 trades). Train mode is finding ann between +30% and +75% reliably; one more good HP corner could land 5/7 or 6/7.",
-  "claude_iter_id": 1015,
-  "designated_at": "2026-05-15T21:13:01"
+  "rationale": "iTransformer default hit 0/7 wp but avg_ann +73% (median +47%); two windows (W1: 39.0% WR/+77% ann, W6: 36.9% WR/+500% ann) sit \u22643pp below the WR threshold. HP nudges (pos_weight, dropout, depth, longer epochs, larger dim) are the natural next lever before declaring the family dead.",
+  "claude_iter_id": 1061,
+  "designated_at": "2026-05-16T06:10:55"
 }
