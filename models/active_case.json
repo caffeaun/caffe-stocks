@@ -1,12 +1,12 @@
 {
-  "trainer": "tabm_lcb",
+  "trainer": "histgb_monotonic",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from tabm_classifier (saturated 1/7 across 14 iters #907-#920, W1-only pass) to tabm_lcb. Default-HP first-shot passed W1 cleanly (45% WR, ann +212%, DD 6.9%); probing lam=0.5 unlocked W2 (45% WR, ann +223%, the 5%-pass-rate window) \u2014 proves disagreement_penalty is window-selective. Train mode should sweep \u03bb \u2208 (0.1, 2.5) plus the inherited TabM dimensions; mid-range \u03bb (~0.5-1.0) may unlock W7 (currently 37% WR, 1pp short).",
-  "claude_iter_id": 921,
-  "designated_at": "2026-05-15T03:15:35"
+  "rationale": "iter #951 extended monotonic constraints to 12 features (8 regime + 4 stock-momentum). Gate result 3/7 with avg_ann +43.2% (vs +30.7% best prior). Three failing windows (W1, W3, W5) are within 1.5-2.5pp of the 40% WR bar \u2014 train mode should sweep pos_class_weight (1.0-5.0) and learning_rate (0.02-0.15) to push these near-misses over. W4 is 7pp short and may need min_samples_leaf and l2_regularization tuning. Ablation already established: dropping the 4 new constraints to 2 (price-only) regresses to 2/7 \u2014 the volume+price pair is load-bearing.",
+  "claude_iter_id": 951,
+  "designated_at": "2026-05-15T09:12:18"
 }

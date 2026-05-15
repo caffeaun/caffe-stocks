@@ -9980,6 +9980,252 @@ class TabMLCBClassifierTrainer(TabMClassifierTrainer):
         return np.concatenate(score_chunks, axis=0).astype(np.float32)
 
 
+# --------------------------------------------------------------------- #
+# HistGradientBoostingClassifier with monotonic constraints (iter #936)
+#
+# Diagnosis (Part A, this iteration):
+#   * Cross-tab over last 20 iters: W2/W4/W5/W6 fail in 19/20+ runs across
+#     all trainer families. Per-window WR averages 25.7-27.1% — BELOW the
+#     ~30% random-topk WR baseline. Models are anti-selecting in mild-bear
+#     and even bull-but-low-foreign-flow regimes.
+#   * The most striking finding: W6 (bull market, +4.9% SET return, 51.7%
+#     breadth, mid vol) has 0/20 pass rate with 26.5% WR. The model picks
+#     WORSE than random in a regime that "looks" like the passing W1 (+4.5%
+#     SET, 47.5% breadth) and W7 (+3.4%, 48.4% breadth). Hypothesis: as
+#     train window grows, bear-heavy 2024 data dominates and biases the
+#     model to learn spurious "high breadth → SHORT" type correlations
+#     that fire in W6.
+#   * TabM family (last 14 iters #922-#935) saturated at 2/7 max via
+#     lambda sweep. New inductive bias needed.
+#
+# Hypothesis: Monotonic constraints on regime features prevent the W6
+# anti-selection. Forcing the model to respect "more breadth → more
+# bullish" / "higher foreign-flow rank → more bullish" as economic priors
+# blocks the spurious negative correlations the bear-heavy training set
+# would otherwise teach. HistGradientBoostingClassifier supports per-
+# feature monotonic_cst natively (sklearn >= 0.23) and uses histogram-
+# based binning + level-wise tree growth — structurally distinct from
+# XGBoost's leaf-wise growth and the existing xgb_regime_blend (which is
+# a soft regime gate, not a hard monotonic constraint).
+#
+# Distinct inductive bias vs registry:
+#   vs XGBoost / LightGBM: histogram binning + level-wise growth + native
+#     per-feature monotonic constraints (XGB has them too but our XGB
+#     trainers don't use them; this is the first monotonic-constrained
+#     trainer in the registry).
+#   vs sklearn_extra_trees / random forest: gradient-boosted (sequential,
+#     residual-fitting) vs bagged.
+#   vs xgb_regime_blend: hard guarantee on monotonicity vs soft mixture
+#     weights — the model CAN'T learn "high breadth → short" no matter
+#     what the gradient says.
+#
+# Constrained features (monotonically increasing → P(y=1)):
+#   sector_breadth, foreign_net_monthly_pctrank, market_breadth_adv,
+#   market_breadth_above_sma20, up_days_5d, market_new_highs,
+#   market_sector_aligned, set_ret_5d_zscore_60d
+#
+# Constraints applied to the `last` and `mean` aggregations (the level
+# information). `std` and `dev` (last - mean) carry change information
+# and are left unconstrained — we don't want to force "higher std →
+# bullish" since vol regimes are not directionally signed.
+# --------------------------------------------------------------------- #
+class HistGBMonotonicTrainer(BaseTrainer):
+    """HistGradientBoostingClassifier with monotonic constraints on regime features."""
+
+    name = 'histgb_monotonic'
+
+    # Curated feature names that should be monotonically increasing in P(y=1).
+    # Names must match models.feature_eng.CURATED_FEATURES exactly.
+    #
+    # Regime/breadth features (8) — iter #936 set. Block W6-style
+    # "high breadth → SHORT" anti-selection from bear-heavy training data.
+    #
+    # Stock-level momentum features (4) — iter #951 extension. Same
+    # mechanism at the stock level. Best prior (iter #946) hit 5/7 with
+    # W1 (+4.5% SET bull) at 28% WR and W3 (-7.6% SET bear) at 32% WR —
+    # both anti-selection within the universe. With these four added the
+    # gate run produced 3/7 PASS but avg_ann +43.2% (vs +30.7% best prior)
+    # and three of the four failing windows are 1.5-2.5pp short of the WR
+    # bar — clear room for pos_class_weight HP tuning to close the gap.
+    # Volume-coupled features are PAIRED with price-momentum features:
+    # the 2-feature ablation (price-only) regressed to 2/7 WR 34.8%, so
+    # the volume terms balance the pure-momentum overcommitment.
+    _MONOTONIC_INCREASING = (
+        # Regime/breadth (8)
+        'sector_breadth',
+        'foreign_net_monthly_pctrank',
+        'market_breadth_adv',
+        'market_breadth_above_sma20',
+        'up_days_5d',
+        'market_new_highs',
+        'market_sector_aligned',
+        'set_ret_5d_zscore_60d',
+        # Stock-level momentum (4) — price + volume confirmation pair
+        'volume_ratio_xrank',
+        'ret_5d_xrank',
+        'macd_xrank',
+        'momentum_volume_cross',
+    )
+
+    def __init__(self,
+                 max_iter: int = 400,
+                 max_leaf_nodes: int = 31,
+                 max_depth: Optional[int] = None,
+                 learning_rate: float = 0.05,
+                 min_samples_leaf: int = 50,
+                 l2_regularization: float = 1.0,
+                 max_bins: int = 255,
+                 early_stopping: bool = True,
+                 validation_fraction: float = 0.15,
+                 n_iter_no_change: int = 20,
+                 tol: float = 1e-4,
+                 pos_class_weight: float = 2.5,
+                 use_monotonic: bool = True,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            max_iter=int(max_iter),
+            max_leaf_nodes=int(max_leaf_nodes),
+            max_depth=None if max_depth in (None, 0, -1) else int(max_depth),
+            learning_rate=float(learning_rate),
+            min_samples_leaf=int(min_samples_leaf),
+            l2_regularization=float(l2_regularization),
+            max_bins=int(max_bins),
+            early_stopping=bool(early_stopping),
+            validation_fraction=float(validation_fraction),
+            n_iter_no_change=int(n_iter_no_change),
+            tol=float(tol),
+            pos_class_weight=float(pos_class_weight),
+            use_monotonic=bool(use_monotonic),
+            random_state=int(random_state),
+        )
+        self.clf = None
+        self._n_features = None
+        self._monotonic_cst = None
+
+    def _build_monotonic_constraints(self, n_features: int) -> Optional[np.ndarray]:
+        """Map curated feature names → indices in the (4F,) aggregated vector.
+
+        The aggregator emits [last_*, mean_*, std_*, dev_*] in CURATED_FEATURES
+        order. We constrain only `last` and `mean` (level info) — std/dev are
+        change/dispersion info that isn't directionally signed.
+        """
+        if not self._params['use_monotonic']:
+            return None
+        try:
+            from models.feature_eng import CURATED_FEATURES
+        except Exception:
+            return None
+        F = len(CURATED_FEATURES)
+        if n_features != 4 * F:
+            # If the gate ever changes aggregation shape, silently fall back.
+            return None
+        cst = np.zeros(n_features, dtype=np.int8)
+        name_to_idx = {n: i for i, n in enumerate(CURATED_FEATURES)}
+        for name in self._MONOTONIC_INCREASING:
+            i = name_to_idx.get(name)
+            if i is None:
+                continue
+            cst[i] = 1            # last_<name>
+            cst[F + i] = 1        # mean_<name>
+        return cst
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.ensemble import HistGradientBoostingClassifier
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        # Concatenate train+val: HistGBM has its own internal validation split
+        # for early stopping (validation_fraction), so the gate's outer val is
+        # not needed for fit-time selection. Same convention as ExtraTrees.
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+        self._monotonic_cst = self._build_monotonic_constraints(self._n_features)
+
+        # Sample weights for class imbalance — sklearn HistGBM doesn't accept
+        # class_weight='balanced', so up-weight positives explicitly.
+        sw = np.where(y_full == 1, p['pos_class_weight'], 1.0).astype(np.float32)
+
+        self.clf = HistGradientBoostingClassifier(
+            max_iter=p['max_iter'],
+            max_leaf_nodes=p['max_leaf_nodes'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            min_samples_leaf=p['min_samples_leaf'],
+            l2_regularization=p['l2_regularization'],
+            max_bins=p['max_bins'],
+            early_stopping=p['early_stopping'],
+            validation_fraction=p['validation_fraction'] if p['early_stopping'] else None,
+            n_iter_no_change=p['n_iter_no_change'],
+            tol=p['tol'],
+            monotonic_cst=self._monotonic_cst,
+            random_state=p['random_state'],
+            verbose=0,
+        )
+        self.clf.fit(X_full, y_full, sample_weight=sw)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.clf is None:
+            raise RuntimeError('Model not fit')
+        return self.clf.predict_proba(X)[:, 1]
+
+    def feature_importance(self):
+        # sklearn HistGBM exposes no built-in feature_importances_ (binning
+        # makes that ambiguous); permutation importance is a separate call.
+        return None
+
+    @property
+    def best_iteration(self):
+        if self.clf is None:
+            return None
+        return int(getattr(self.clf, 'n_iter_', self._params['max_iter']))
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.clf, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+            'monotonic_cst': None if self._monotonic_cst is None
+                              else [int(v) for v in self._monotonic_cst.tolist()],
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        cst = meta.get('monotonic_cst')
+        inst._monotonic_cst = None if cst is None else np.array(cst, dtype=np.int8)
+        with open(model_path, 'rb') as f:
+            inst.clf = pickle.load(f)
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -10030,6 +10276,7 @@ TRAINERS = {
     'torch_time_moe': TorchTimeMoETrainer,
     'tabm_classifier': TabMClassifierTrainer,
     'tabm_lcb': TabMLCBClassifierTrainer,
+    'histgb_monotonic': HistGBMonotonicTrainer,
 }
 
 

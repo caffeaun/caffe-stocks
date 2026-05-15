@@ -1158,6 +1158,22 @@ SEARCH_SPACES: dict[str, dict] = {
     'disagreement_penalty':  (0.1, 2.5),
     'seed':                  [0, 1, 42, 2026],
 },
+# HistGradientBoostingClassifier with monotonic constraints (iter #936).
+# `use_monotonic` toggles the constraint vector — sweeping ON vs OFF lets
+# train mode quantify the constraint's contribution. pos_class_weight
+# spans the same range as sklearn_extra_trees / xgb_iso_calibrated.
+'histgb_monotonic': {
+    'max_iter':            [200, 400, 800],
+    'max_leaf_nodes':      [15, 31, 63, 127],
+    'learning_rate':       (0.01, 0.10),
+    'min_samples_leaf':    [20, 50, 100, 200],
+    'l2_regularization':   (0.0, 5.0),
+    'max_bins':            [127, 255],
+    'n_iter_no_change':    [10, 20, 30],
+    'pos_class_weight':    (1.0, 5.0),
+    'use_monotonic':       [True, False],
+    'random_state':        [42, 7, 1337],
+},
 }
 
 
