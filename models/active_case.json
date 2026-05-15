@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep histgb_monotonic \u2014 train-mode iter #991 just hit 5/7 ann +67.9% WR 43.1% DD 9.7% on 194 trades (best in registry history, one window from candidate). torch_attentive_mlp this iter only hit 2/7 ann -4.9% \u2014 strong enough to beat both baselines and crack the W1 95%-fail bottleneck, but not competitive as a sweep base versus a 5/7 family with active improvement. Train mode at lr\u00d7pos_class_weight=(0.08, 1.43) is the corner closing the gap.",
-  "claude_iter_id": 999,
-  "designated_at": "2026-05-15T18:11:07"
+  "rationale": "GP at #1015 confirmed kernel methods over the 96-d curated set can't break the 40% WR floor on any window (max 38.7%) even with tightened bounds \u2014 keep sweeping histgb_monotonic, the only family with a 5/7 candidate (iter #991: +67.9% ann, 43.1% WR, 9.7% DD, 194 trades). Train mode is finding ann between +30% and +75% reliably; one more good HP corner could land 5/7 or 6/7.",
+  "claude_iter_id": 1015,
+  "designated_at": "2026-05-15T21:13:01"
 }

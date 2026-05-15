@@ -8989,16 +8989,18 @@ class GaussianProcessClassifierTrainer(BaseTrainer):
     name = 'gaussian_process_classifier'
 
     def __init__(self,
-                 n_inducing: int = 600,
-                 # length_scale init bumped to 10.0 + upper bound 1e3 after the
-                 # iter-#835 baseline gate logged sklearn's ConvergenceWarning
-                 # ("optimal value close to upper bound 100.0") — marginal
-                 # likelihood wanted a smoother kernel than the default allowed.
-                 length_scale: float = 10.0,
-                 length_scale_bounds_lo: float = 1e-2,
-                 length_scale_bounds_hi: float = 1e3,
+                 n_inducing: int = 1000,
+                 # iter-#1015: previous run (#835) saturated — sklearn's optimizer
+                 # pushed length_scale to the upper bound (>1000) and the kernel
+                 # went flat, predict_proba scores under-discriminated, WR<40%
+                 # was unreachable on every window. Capping bounds_hi at 10.0
+                 # forces a sharper kernel; n_inducing bumped 600→1000 widens
+                 # the subsample so the posterior isn't bottlenecked there.
+                 length_scale: float = 2.0,
+                 length_scale_bounds_lo: float = 1e-1,
+                 length_scale_bounds_hi: float = 1e1,
                  constant_value: float = 1.0,
-                 n_restarts_optimizer: int = 1,
+                 n_restarts_optimizer: int = 3,
                  max_iter_predict: int = 100,
                  random_state: int = 42,
                  **_):
