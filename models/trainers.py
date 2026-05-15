@@ -9365,24 +9365,37 @@ class TabPFNV25Trainer(BaseTrainer):
     predict_proba call. Subsamples (stratified) to max_train_rows to
     stay inside the published 50k-row support of TabPFN-2.5 and to
     bound per-window wall-time.
+
+    Explicit kwargs (vs the prior **kwargs sink) so train_mode's HP sweep
+    can actually reach this trainer — get_trainer() filters kwargs by
+    __init__.co_varnames and was previously dropping every HP, locking
+    this trainer at defaults forever (zero rows in feedback DB across
+    994 iters).
     """
     name = 'tabpfn_v25'
     consumes_sequences = False
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self,
+                 n_estimators: int = 2,
+                 softmax_temperature: float = 0.9,
+                 balance_probabilities: bool = False,
+                 average_before_softmax: bool = False,
+                 ignore_pretraining_limits: bool = True,
+                 max_train_rows: int = 10000,
+                 random_state: int = 42,
+                 **_):
         if not _HAS_TABPFN:
             raise ImportError(
                 "tabpfn not installed. `pip install tabpfn` (Python 3.9+, "
                 "PyTorch>=2.1). CUDA strongly recommended."
             )
-        self.n_estimators = int(kwargs.get('n_estimators', 4))
-        self.softmax_temperature = float(kwargs.get('softmax_temperature', 0.9))
-        self.balance_probabilities = bool(kwargs.get('balance_probabilities', False))
-        self.average_before_softmax = bool(kwargs.get('average_before_softmax', False))
-        self.ignore_pretraining_limits = bool(kwargs.get('ignore_pretraining_limits', True))
-        self.random_state = int(kwargs.get('random_state', 42))
-        self.max_train_rows = int(kwargs.get('max_train_rows', 30000))
+        self.n_estimators = int(n_estimators)
+        self.softmax_temperature = float(softmax_temperature)
+        self.balance_probabilities = bool(balance_probabilities)
+        self.average_before_softmax = bool(average_before_softmax)
+        self.ignore_pretraining_limits = bool(ignore_pretraining_limits)
+        self.random_state = int(random_state)
+        self.max_train_rows = int(max_train_rows)
         self._model = None
         self._X_train = None
         self._y_train = None
