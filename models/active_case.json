@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "iter #951 extended monotonic constraints to 12 features (8 regime + 4 stock-momentum). Gate result 3/7 with avg_ann +43.2% (vs +30.7% best prior). Three failing windows (W1, W3, W5) are within 1.5-2.5pp of the 40% WR bar \u2014 train mode should sweep pos_class_weight (1.0-5.0) and learning_rate (0.02-0.15) to push these near-misses over. W4 is 7pp short and may need min_samples_leaf and l2_regularization tuning. Ablation already established: dropping the 4 new constraints to 2 (price-only) regresses to 2/7 \u2014 the volume+price pair is load-bearing.",
-  "claude_iter_id": 951,
-  "designated_at": "2026-05-15T09:12:18"
+  "rationale": "Keep histgb_monotonic 12-feature (iter #951) config as train-mode sweep target \u2014 it remains the only trainer family with W6 cracked and avg_ann +43% within reach via HP tuning. Iter #967 negative-monotonic test reverted; the family ceiling (4/7) isn't broken by HP alone, but train-mode HP sweep #960-966 hasn't yet exhausted the (lr \u00d7 pos_class_weight \u00d7 min_samples_leaf) corner \u2014 let it continue.",
+  "claude_iter_id": 967,
+  "designated_at": "2026-05-15T12:09:04"
 }
