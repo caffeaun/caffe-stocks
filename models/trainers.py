@@ -7726,6 +7726,39 @@ class TorchSeqGRUDayGateTrainer(BaseTrainer):
             y_day[i] = int(pnl_arr[mask].mean() > 0.0)
         return y_day, unique_dates
 
+    # Per-date regime/breadth features that should monotonically increase
+    # P(good day). Mirrors iter #936's HistGBMonotonicTrainer breakthrough —
+    # same prior knowledge applied to the day-gate sub-model so it can't
+    # learn "high breadth → bad day" from a bear-heavy train slice. These are
+    # the 8 features whose mean across symbols within a date is exact (they
+    # are already constant within the date) — per-symbol xranks (collapse to
+    # ~0.5 in the aggregate) are intentionally left unconstrained.
+    _DAY_GATE_MONOTONIC_INCREASING = (
+        'sector_breadth',
+        'foreign_net_monthly_pctrank',
+        'market_breadth_adv',
+        'market_breadth_above_sma20',
+        'up_days_5d',
+        'market_new_highs',
+        'market_sector_aligned',
+        'set_ret_5d_zscore_60d',
+    )
+
+    def _build_day_gate_monotonic(self, n_features: int) -> Optional[tuple]:
+        try:
+            from models.feature_eng import CURATED_FEATURES
+        except Exception:
+            return None
+        if n_features != len(CURATED_FEATURES):
+            return None
+        idx = {n: i for i, n in enumerate(CURATED_FEATURES)}
+        cst = [0] * n_features
+        for name in self._DAY_GATE_MONOTONIC_INCREASING:
+            i = idx.get(name)
+            if i is not None:
+                cst[i] = 1
+        return tuple(cst)
+
     def _fit_day_gate(self, X_train, X_val, pnl_train, pnl_val,
                       dates_train, dates_val, verbose=False):
         """Train XGBoost classifier on per-date aggregates → P(good day).
@@ -7765,6 +7798,8 @@ class TorchSeqGRUDayGateTrainer(BaseTrainer):
         n_neg = float(len(y_day) - y_day.sum())
         spw = max(0.25, min(4.0, n_neg / max(1.0, n_pos)))
 
+        mono_cst = self._build_day_gate_monotonic(X_day.shape[1])
+
         self.day_gate = xgb.XGBClassifier(
             max_depth=p['day_gate_max_depth'],
             n_estimators=p['day_gate_n_estimators'],
@@ -7774,6 +7809,7 @@ class TorchSeqGRUDayGateTrainer(BaseTrainer):
             reg_alpha=0.1, reg_lambda=0.5,
             scale_pos_weight=spw,
             tree_method='hist',
+            monotone_constraints=mono_cst,
             use_label_encoder=False,
             eval_metric='logloss',
             random_state=p['random_state'],
@@ -7829,9 +7865,24 @@ class TorchSeqGRUDayGateTrainer(BaseTrainer):
         device = next(self.net.parameters()).device
         X = np.clip(np.asarray(X, dtype=np.float32), -8.0, 8.0)
         self.net.eval()
+        # Chunked inference to survive shared-GPU contention (other processes
+        # may be holding most VRAM). Falls back to CPU automatically if a
+        # CUDA OOM is hit mid-stream.
+        chunk = 4096
+        preds = []
         with torch.no_grad():
-            logits = self.net(torch.from_numpy(X).to(device))
-            p_gru = torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+            for s in range(0, X.shape[0], chunk):
+                xb = torch.from_numpy(X[s:s+chunk]).to(device)
+                try:
+                    lb = self.net(xb)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    self.net.to('cpu')
+                    device = torch.device('cpu')
+                    xb = xb.to('cpu')
+                    lb = self.net(xb)
+                preds.append(torch.sigmoid(lb).cpu().numpy().astype(np.float64))
+            p_gru = np.concatenate(preds, axis=0)
 
         if self.day_gate is None:
             # No day gate (degenerate fit); return raw GRU prob.
@@ -10241,6 +10292,230 @@ class HistGBMonotonicTrainer(BaseTrainer):
         return inst
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class _ITransformerBlock(nn.Module):
+    """Pre-LayerNorm block: variate-axis multi-head self-attention + FFN."""
+
+    def __init__(self, dim, heads, dim_head, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        inner = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.ln_attn = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, inner * 3, bias=False)
+        self.attn_out = nn.Linear(inner, dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ln_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: (B, V, dim) — V is num_variates; attention runs across V.
+        b, v, d = x.shape
+        h = self.ln_attn(x)
+        qkv = self.to_qkv(h).chunk(3, dim=-1)
+        q, k, val = (t.reshape(b, v, self.heads, self.dim_head).transpose(1, 2) for t in qkv)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, val).transpose(1, 2).reshape(b, v, self.heads * self.dim_head)
+        x = x + self.attn_out(out)
+        x = x + self.ffn(self.ln_ffn(x))
+        return x
+
+
+class _ITransformerClassifier(nn.Module):
+    def __init__(self, num_variates, lookback_len=1, dim=128, depth=3,
+                 heads=4, dim_head=32, dropout=0.1):
+        super().__init__()
+        self.variate_embed = nn.Linear(lookback_len, dim)
+        self.input_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([
+            _ITransformerBlock(dim, heads, dim_head, dropout=dropout)
+            for _ in range(depth)
+        ])
+        self.ln_out = nn.LayerNorm(dim)
+        self.head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, 1),
+        )
+
+    def forward(self, x):
+        # Accept (B, F) for 2D tabular OR (B, T, F) for sequence input.
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)              # (B, F, 1) — variates with lookback 1
+        else:
+            x = x.permute(0, 2, 1).contiguous()  # (B, T, F) -> (B, F, T) — variates as tokens
+        tokens = self.variate_embed(x)       # (B, V, dim)
+        tokens = self.input_dropout(tokens)
+        for blk in self.blocks:
+            tokens = blk(tokens)
+        tokens = self.ln_out(tokens)
+        pooled = tokens.mean(dim=1)
+        return self.head(pooled).squeeze(-1)
+
+
+class TorchITransformerTrainer(BaseTrainer):
+    """iTransformer-style classifier (Liu et al., ICLR 2024).
+
+    Inverts the conventional transformer axis: each feature becomes a token and
+    self-attention runs across features (variate-axis), modelling feature-feature
+    correlations explicitly. Mean-pools variate tokens, then a 2-layer MLP head
+    produces a scalar logit. Pure PyTorch — no external dependency beyond torch.
+    """
+
+    name = 'torch_itransformer'
+    consumes_sequences = False
+
+    def __init__(self, dim=128, depth=3, heads=4, dim_head=32, dropout=0.1,
+                 learning_rate=1e-3, weight_decay=1e-4, batch_size=512,
+                 epochs=40, patience=8, pos_weight=None, device=None, **kwargs):
+        self.dim = int(dim)
+        self.depth = int(depth)
+        self.heads = int(heads)
+        self.dim_head = int(dim_head)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.patience = int(patience)
+        self.pos_weight = pos_weight
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.feature_mean_ = None
+        self.feature_std_ = None
+
+    def _make_model(self, num_variates, lookback_len):
+        return _ITransformerClassifier(
+            num_variates=num_variates,
+            lookback_len=lookback_len,
+            dim=self.dim, depth=self.depth,
+            heads=self.heads, dim_head=self.dim_head,
+            dropout=self.dropout,
+        ).to(self.device)
+
+    def _normalize(self, X, fit=False):
+        flat = X.reshape(-1, X.shape[-1])
+        if fit:
+            self.feature_mean_ = np.nanmean(flat, axis=0).astype(np.float32)
+            self.feature_std_ = (np.nanstd(flat, axis=0) + 1e-6).astype(np.float32)
+        Xn = (X - self.feature_mean_) / self.feature_std_
+        Xn = np.nan_to_num(Xn, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        return Xn
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        X_tr = np.asarray(X_tr, dtype=np.float32)
+        X_val = np.asarray(X_val, dtype=np.float32)
+        y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+        y_val = np.asarray(y_val, dtype=np.float32).ravel()
+        X_tr = self._normalize(X_tr, fit=True)
+        X_val = self._normalize(X_val, fit=False)
+        if X_tr.ndim == 2:
+            num_variates = X_tr.shape[1]
+            lookback_len = 1
+        else:
+            num_variates = X_tr.shape[2]
+            lookback_len = X_tr.shape[1]
+        torch.manual_seed(42)
+        self.model = self._make_model(num_variates, lookback_len)
+        opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        pos_w = None
+        if self.pos_weight is not None:
+            pos_w = torch.tensor(float(self.pos_weight), device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        ds_tr = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+        dl_tr = DataLoader(ds_tr, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        X_val_t = torch.from_numpy(X_val).to(self.device)
+        y_val_t = torch.from_numpy(y_val).to(self.device)
+        best_val = float('inf')
+        best_state = None
+        bad_epochs = 0
+        for _epoch in range(self.epochs):
+            self.model.train()
+            for xb, yb in dl_tr:
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = self.model(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+            self.model.eval()
+            with torch.no_grad():
+                val_logits = self.model(X_val_t)
+                val_loss = float(loss_fn(val_logits, y_val_t).item())
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.model.eval()
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        Xn = self._normalize(X, fit=False)
+        self.model.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, Xn.shape[0], self.batch_size):
+                xb = torch.from_numpy(Xn[i:i + self.batch_size]).to(self.device)
+                logits = self.model(xb)
+                probs = torch.sigmoid(logits).detach().cpu().numpy().ravel()
+                out.append(probs)
+        if not out:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(), os.path.join(model_dir, 'model.pt'))
+        cfg = {
+            'name': self.name,
+            'dim': self.dim, 'depth': self.depth, 'heads': self.heads,
+            'dim_head': self.dim_head, 'dropout': self.dropout,
+            'learning_rate': self.learning_rate, 'weight_decay': self.weight_decay,
+            'batch_size': self.batch_size, 'epochs': self.epochs,
+            'patience': self.patience, 'pos_weight': self.pos_weight,
+        }
+        if extra:
+            cfg.update(extra)
+        with open(os.path.join(model_dir, 'config.json'), 'w') as f:
+            json.dump(cfg, f, indent=2)
+        if self.feature_mean_ is not None:
+            np.save(os.path.join(model_dir, 'feature_mean.npy'), self.feature_mean_)
+            np.save(os.path.join(model_dir, 'feature_std.npy'), self.feature_std_)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -10292,6 +10567,7 @@ TRAINERS = {
     'tabm_classifier': TabMClassifierTrainer,
     'tabm_lcb': TabMLCBClassifierTrainer,
     'histgb_monotonic': HistGBMonotonicTrainer,
+    'torch_itransformer': TorchITransformerTrainer,
 }
 
 

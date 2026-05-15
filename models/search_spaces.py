@@ -1174,6 +1174,18 @@ SEARCH_SPACES: dict[str, dict] = {
     'use_monotonic':       [True, False],
     'random_state':        [42, 7, 1337],
 },
+    'torch_itransformer': {
+    'dim':           [64, 128, 192, 256],
+    'depth':         [2, 3, 4, 6],
+    'heads':         [2, 4, 8],
+    'dim_head':      [16, 32, 64],
+    'dropout':       (0.05, 0.4),
+    'learning_rate': (1e-4, 5e-3),
+    'weight_decay':  (1e-6, 1e-3),
+    'batch_size':    [256, 512, 1024],
+    'epochs':        [25, 40, 60],
+    'patience':      [6, 8, 12],
+},
 }
 
 
