@@ -1065,11 +1065,30 @@ SEARCH_SPACES: dict[str, dict] = {
     #   max_iter_predict ∈ {50, 100, 200} — Laplace approximation Newton
     #     iterations. 100 default is normally enough; raise if posterior
     #     looks under-converged.
+    # gaussian_process_classifier (iter #1099 structural rewrite):
+    #   n_components ∈ {10, 15, 20, 30} — PCA target dims. Lower = more
+    #     aggressive denoising; higher = retains more variance. 20 covers
+    #     ~70-85% of variance on the 96-d aggregate panel (empirically).
+    #   kernel_type ∈ {'matern', 'rbf'} — Matern(nu=2.5) is the new default
+    #     (finite-differentiability prior); 'rbf' kept for ablation only.
+    #   matern_nu ∈ {1.5, 2.5} — Matern smoothness. 1.5 = once-differentiable
+    #     (rougher), 2.5 = twice-differentiable (smoother, closer to RBF).
+    #   noise_level ∈ {0.1, 0.5, 1.0, 2.0} — WhiteKernel initial noise.
+    #     Higher decouples the length-scale from per-point fitting.
+    #   length_scale_bounds_hi ∈ {3.0, 10.0, 30.0} — Matern length scale cap.
+    #     With PCA(20) the optimal scale is empirically smaller than 96-d,
+    #     so we cap tighter to prevent the iter-1015 saturation.
     'gaussian_process_classifier': {
-        'n_inducing':              [300, 600, 1000],
+        'n_inducing':              [600, 1000, 1500],
+        'n_components':            [10, 15, 20, 30],
+        'kernel_type':             ['matern', 'rbf'],
+        'matern_nu':               [1.5, 2.5],
         'length_scale':            [0.5, 1.0, 2.0, 5.0],
-        'length_scale_bounds_lo':  [1e-3, 1e-2, 1e-1],
-        'length_scale_bounds_hi':  [1e1, 1e2, 1e3],
+        'length_scale_bounds_lo':  [1e-2, 1e-1, 3e-1],
+        'length_scale_bounds_hi':  [3.0, 1e1, 3e1],
+        'noise_level':             [0.1, 0.5, 1.0, 2.0],
+        'noise_level_bounds_lo':   [1e-4, 1e-3, 1e-2],
+        'noise_level_bounds_hi':   [1.0, 1e1, 1e2],
         'constant_value':          [0.5, 1.0, 2.0],
         'n_restarts_optimizer':    [0, 1, 3],
         'max_iter_predict':        [50, 100, 200],

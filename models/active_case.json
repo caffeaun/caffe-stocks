@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "torch_itransformer exhausted (2 claude-mode attempts, both 0/7 with sigmoid score collapse). Pivot to histgb_monotonic \u2014 the only trainer family that has ever hit 5/7 (iter #991: use_monotonic=False, max_iter=200, pos_class_weight=1.43, l2_reg=3.85, WR 46% / 46% / 52% on W1/W2/W3). Recent iter #1060 hit 4/7 with use_monotonic=False, max_iter=800, pos_class_weight=2.74. Train mode should sweep around use_monotonic=False (the dominant best-config lever \u2014 overriding the default True), max_iter [200,800], pos_class_weight [1.4,3.0], l2_regularization [0.5,4.0]; W4 and W7 are the chronic WR misses (1-7pp short of 40% floor).",
-  "claude_iter_id": 1083,
-  "designated_at": "2026-05-16T12:11:08"
+  "rationale": "GP family demonstrably saturates across three structural variants (iter #835/1015/1099); histgb_monotonic is the only family where train-mode is genuinely climbing (iter #1088 hit 4/7, #1090/1095/1096 each 3/7) \u2014 keep sweeping HPs there until train mode plateaus, then pivot.",
+  "claude_iter_id": 1099,
+  "designated_at": "2026-05-16T15:14:34"
 }

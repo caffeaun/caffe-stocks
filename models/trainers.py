@@ -9035,31 +9035,68 @@ class KernelLogRegTrainer(BaseTrainer):
 #     would force a single learned length-scale to be a bad compromise.
 # --------------------------------------------------------------------- #
 class GaussianProcessClassifierTrainer(BaseTrainer):
-    """Full-posterior Bayesian RBF Gaussian Process classifier (Laplace approx)."""
+    """Full-posterior Bayesian Matern GP classifier on PCA-projected features.
+
+    iter-#1099 structural change (claude_mode, brief-exhausted pivot):
+      * The iter-#1015 / #835 failure mode was documented: GP-RBF on the
+        96-d curated feature space saturates — sklearn's marginal-likelihood
+        optimizer pushes length_scale to whatever upper bound is set
+        (1000 → 10 both saturated), the kernel goes flat, predict_proba
+        under-discriminates, every window fails on WR < 40%.
+      * Root cause: curse-of-dimensionality on the aggregated curated panel
+        (24 features × 4 aggregations [last/mean/std/last-mean] = 96 dims).
+        In 96-d, RBF distances concentrate (all points look equidistant),
+        so the only way to maintain training accuracy is to lengthen the
+        kernel scale until it spans the full data cloud — losing all local
+        discrimination.
+      * Three coordinated fixes (one structural intervention, "make GP
+        robust to high-D noisy financial data"):
+          (1) PCA(n_components=20) preprocessing — projects to the 20 most-
+              variant components so RBF distances regain meaning.
+          (2) Matern(nu=2.5) replaces RBF — finite differentiability
+              (≈2 derivatives) is a better prior for noisy financial signals
+              than RBF's infinite analytic smoothness; less prone to the
+              flat-kernel saturation pattern.
+          (3) + WhiteKernel(noise_level) — explicit noise term lets the GP
+              attribute residual variance to label noise instead of stretching
+              the length-scale to fit every training point exactly.
+      * Hypothesis (cites Part A): iTransformer (iter #1072, the brief's pick)
+        failed by over-trading W2/W4/W5 (53/36/71 trades, WR 17-21%, DD 25-35%)
+        — a deterministic NN that fires too confidently on hostile bear-regime
+        days. A well-calibrated Bayesian classifier should naturally
+        under-fire on regime-shifted test slices (the GP's posterior variance
+        explodes OOD), trading less on W3/W4/W5 and preserving WR.
+    """
 
     name = 'gaussian_process_classifier'
 
     def __init__(self,
                  n_inducing: int = 1000,
-                 # iter-#1015: previous run (#835) saturated — sklearn's optimizer
-                 # pushed length_scale to the upper bound (>1000) and the kernel
-                 # went flat, predict_proba scores under-discriminated, WR<40%
-                 # was unreachable on every window. Capping bounds_hi at 10.0
-                 # forces a sharper kernel; n_inducing bumped 600→1000 widens
-                 # the subsample so the posterior isn't bottlenecked there.
+                 n_components: int = 20,
+                 kernel_type: str = 'matern',
                  length_scale: float = 2.0,
                  length_scale_bounds_lo: float = 1e-1,
                  length_scale_bounds_hi: float = 1e1,
+                 matern_nu: float = 2.5,
+                 noise_level: float = 0.5,
+                 noise_level_bounds_lo: float = 1e-3,
+                 noise_level_bounds_hi: float = 1e1,
                  constant_value: float = 1.0,
-                 n_restarts_optimizer: int = 3,
+                 n_restarts_optimizer: int = 1,
                  max_iter_predict: int = 100,
                  random_state: int = 42,
                  **_):
         self._params = dict(
             n_inducing=int(n_inducing),
+            n_components=int(n_components),
+            kernel_type=str(kernel_type),
             length_scale=float(length_scale),
             length_scale_bounds_lo=float(length_scale_bounds_lo),
             length_scale_bounds_hi=float(length_scale_bounds_hi),
+            matern_nu=float(matern_nu),
+            noise_level=float(noise_level),
+            noise_level_bounds_lo=float(noise_level_bounds_lo),
+            noise_level_bounds_hi=float(noise_level_bounds_hi),
             constant_value=float(constant_value),
             n_restarts_optimizer=int(n_restarts_optimizer),
             max_iter_predict=int(max_iter_predict),
@@ -9112,8 +9149,11 @@ class GaussianProcessClassifierTrainer(BaseTrainer):
     def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
             pnl_train=None, pnl_val=None,
             dates_train=None, dates_val=None):
+        from sklearn.decomposition import PCA
         from sklearn.gaussian_process import GaussianProcessClassifier
-        from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+        from sklearn.gaussian_process.kernels import (
+            RBF, ConstantKernel, Matern, WhiteKernel,
+        )
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
 
@@ -9134,14 +9174,28 @@ class GaussianProcessClassifierTrainer(BaseTrainer):
         X_sub = X_full[keep_idx]
         y_sub = y_full[keep_idx]
 
-        kernel = (
-            ConstantKernel(p['constant_value'], constant_value_bounds=(1e-3, 1e3))
-            * RBF(
+        ls_bounds = (p['length_scale_bounds_lo'], p['length_scale_bounds_hi'])
+        if p['kernel_type'] == 'matern':
+            base = Matern(
                 length_scale=p['length_scale'],
-                length_scale_bounds=(
-                    p['length_scale_bounds_lo'],
-                    p['length_scale_bounds_hi'],
-                ),
+                length_scale_bounds=ls_bounds,
+                nu=p['matern_nu'],
+            )
+        else:
+            base = RBF(
+                length_scale=p['length_scale'],
+                length_scale_bounds=ls_bounds,
+            )
+        noise_bounds = (
+            p['noise_level_bounds_lo'], p['noise_level_bounds_hi'],
+        )
+        kernel = (
+            ConstantKernel(
+                p['constant_value'], constant_value_bounds=(1e-3, 1e3))
+            * base
+            + WhiteKernel(
+                noise_level=p['noise_level'],
+                noise_level_bounds=noise_bounds,
             )
         )
         gpc = GaussianProcessClassifier(
@@ -9152,8 +9206,11 @@ class GaussianProcessClassifierTrainer(BaseTrainer):
             warm_start=False,
             copy_X_train=False,
         )
+        n_components = max(2, min(p['n_components'], X_sub.shape[1] - 1))
         self.pipe = Pipeline([
             ('scaler', StandardScaler()),
+            ('pca', PCA(n_components=n_components,
+                        random_state=p['random_state'])),
             ('gpc', gpc),
         ])
         self.pipe.fit(X_sub, y_sub)
