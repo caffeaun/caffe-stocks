@@ -1205,6 +1205,18 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':        [25, 40, 60],
     'patience':      [6, 8, 12],
 },
+'histgb_monotonic_bagged': {
+    'n_bags':            [3, 5],
+    'conf_lambda':       (0.3, 2.0),
+    'bag_frac':          (0.7, 0.95),
+    'max_iter':          [200, 400],
+    'max_leaf_nodes':    [15, 31, 63],
+    'learning_rate':     (0.015, 0.06),
+    'min_samples_leaf':  [50, 100],
+    'l2_regularization': (0.0, 3.0),
+    'pos_class_weight':  (1.5, 4.5),
+    'random_state':      [42, 7, 1337],
+},
 }
 
 

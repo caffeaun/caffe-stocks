@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Train mode is genuinely climbing histgb_monotonic (recent peaks: iter #1114 wp=3/7 ann +55.6%, #1105 wp=3/7 ann +77.5%); saved baseline report still shows wp=4/7 from iter #936; structurally different from torch_itransformer (failed brief, NN family); no other family is closer to the 6/7 bar \u2014 keep sweeping HPs (especially learning_rate, pos_class_weight, max_leaf_nodes) and rely on Claude pivots only when train-mode plateaus.",
-  "claude_iter_id": 1115,
-  "designated_at": "2026-05-16T18:11:45"
+  "rationale": "Bagged variant (this iter) regressed 5/7\u21921/7 at default LCB \u03bb=1.0; single histgb_monotonic still has the strongest train-mode peak (iter #1128 wp=5/7 ann +74.2% wr 40.0% trades 191) and remains 1 window from the 6/7 bar. Keep sweeping HPs there (learning_rate, pos_class_weight, max_leaf_nodes) \u2014 bagged variant available for future claude iter to sweep conf_lambda toward 0 if HistGBM saturates.",
+  "claude_iter_id": 1131,
+  "designated_at": "2026-05-16T21:11:24"
 }

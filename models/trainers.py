@@ -10349,6 +10349,252 @@ class HistGBMonotonicTrainer(BaseTrainer):
         return inst
 
 
+# --------------------------------------------------------------------- #
+# HistGBMonotonicBaggedTrainer (iter #1131, claude_mode, brief-exhausted pivot)
+#
+# Pivot context: brief #1131 picked torch_itransformer (variate-axis attention)
+# but it exhausted at 2 attempts wp=0. Per directive, pivoting to a trainer
+# family OUTSIDE the NN bucket. histgb_monotonic just hit wp=5/7 (iter #1128
+# ann +74.2% wr 40.0% trades 191) — the strongest base learner in the registry.
+# The remaining gap is the WR plateau: avg_wr lives in 33-40% range and 2-3
+# windows fail by <2pp. WR is a precision metric — to push it up, we either
+# (a) train a better discriminator, or (b) abstain more aggressively on
+# low-confidence picks.
+#
+# Structural change: date-bagged ensemble of K=3 HistGBMonotonic learners
+# with LCB-style score = mean(p) - lambda * std(p). Different from:
+#   * histgb_monotonic (single model) — adds inter-bag disagreement abstention
+#   * tabm_lcb (TabM/BatchEnsemble NN-based) — uses tree boosting base + date
+#     bagging (block bootstrap) rather than parameter-shared NN ensembling
+#   * bagged_xgb_regressor (XGB regression, row-bootstrap) — uses HistGBM
+#     classification + DATE-block bootstrap (whole-day blocks resampled with
+#     replacement, preserving within-day cross-sectional structure) +
+#     monotonic constraints retained from base learner
+#
+# Why date-block bootstrap (not row bootstrap): with cross-sectional features
+# (sector_breadth, market_breadth_adv) being identical for all symbols on the
+# same date, row bootstrap leaks the same date into multiple bags. Sampling
+# whole days with replacement preserves the cross-sectional context while
+# still varying the date set across bags — closer to the temporal block
+# bootstrap recommended for time-series ensembling.
+# --------------------------------------------------------------------- #
+class HistGBMonotonicBaggedTrainer(BaseTrainer):
+    """K=3 date-bagged ensemble of HistGBMonotonic with LCB scoring."""
+
+    name = 'histgb_monotonic_bagged'
+
+    def __init__(self,
+                 n_bags: int = 3,
+                 conf_lambda: float = 1.0,
+                 bag_frac: float = 0.85,
+                 max_iter: int = 400,
+                 max_leaf_nodes: int = 31,
+                 max_depth: Optional[int] = None,
+                 learning_rate: float = 0.03,
+                 min_samples_leaf: int = 50,
+                 l2_regularization: float = 1.0,
+                 max_bins: int = 255,
+                 n_iter_no_change: int = 20,
+                 pos_class_weight: float = 3.0,
+                 use_monotonic: bool = True,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_bags=int(n_bags),
+            conf_lambda=float(conf_lambda),
+            bag_frac=float(bag_frac),
+            max_iter=int(max_iter),
+            max_leaf_nodes=int(max_leaf_nodes),
+            max_depth=None if max_depth in (None, 0, -1) else int(max_depth),
+            learning_rate=float(learning_rate),
+            min_samples_leaf=int(min_samples_leaf),
+            l2_regularization=float(l2_regularization),
+            max_bins=int(max_bins),
+            n_iter_no_change=int(n_iter_no_change),
+            pos_class_weight=float(pos_class_weight),
+            use_monotonic=bool(use_monotonic),
+            random_state=int(random_state),
+        )
+        self.clfs = []
+        self._monotonic_cst = None
+        self._n_features = None
+
+    def _build_monotonic_constraints(self, n_features: int) -> Optional[np.ndarray]:
+        """Same constraint vector as HistGBMonotonicTrainer."""
+        if not self._params['use_monotonic']:
+            return None
+        try:
+            from models.feature_eng import CURATED_FEATURES
+        except Exception:
+            return None
+        F = len(CURATED_FEATURES)
+        if n_features != 4 * F:
+            return None
+        names = HistGBMonotonicTrainer._MONOTONIC_INCREASING
+        cst = np.zeros(n_features, dtype=np.int8)
+        name_to_idx = {n: i for i, n in enumerate(CURATED_FEATURES)}
+        for n in names:
+            i = name_to_idx.get(n)
+            if i is None:
+                continue
+            cst[i] = 1
+            cst[F + i] = 1
+        return cst
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.ensemble import HistGradientBoostingClassifier
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        if dates_train is not None and dates_val is not None:
+            dates_full = np.concatenate([np.asarray(dates_train),
+                                         np.asarray(dates_val)])
+        else:
+            dates_full = None
+        self._n_features = X_full.shape[1]
+        self._monotonic_cst = self._build_monotonic_constraints(self._n_features)
+
+        rng_master = np.random.default_rng(p['random_state'])
+        K = max(1, p['n_bags'])
+        self.clfs = []
+
+        for k in range(K):
+            seed_k = int(rng_master.integers(0, 2**31 - 1))
+            rng_k = np.random.default_rng(seed_k)
+
+            if dates_full is not None:
+                unique_dates = np.unique(dates_full)
+                n_sample = max(1, int(round(p['bag_frac'] * len(unique_dates))))
+                sampled_dates = rng_k.choice(
+                    unique_dates, size=n_sample, replace=True)
+                # Build a mapping for membership using a Counter — duplicates
+                # become row repetitions for that date.
+                from collections import Counter
+                cnt = Counter(sampled_dates.tolist())
+                pieces_X, pieces_y, pieces_w = [], [], []
+                for d, m in cnt.items():
+                    mask = dates_full == d
+                    if mask.sum() == 0:
+                        continue
+                    pieces_X.append(X_full[mask])
+                    pieces_y.append(y_full[mask])
+                    pieces_w.append(np.full(mask.sum(), m, dtype=np.float32))
+                if not pieces_X:
+                    Xb = X_full
+                    yb = y_full
+                    wb_base = np.ones(len(y_full), dtype=np.float32)
+                else:
+                    Xb = np.vstack(pieces_X)
+                    yb = np.concatenate(pieces_y)
+                    wb_base = np.concatenate(pieces_w)
+            else:
+                # Row bootstrap fallback (no dates available).
+                n = X_full.shape[0]
+                idx = rng_k.integers(0, n, size=n)
+                Xb = X_full[idx]
+                yb = y_full[idx]
+                wb_base = np.ones(n, dtype=np.float32)
+
+            if len(set(yb)) < 2:
+                # Degenerate bag — skip.
+                continue
+
+            sw = wb_base * np.where(
+                yb == 1, p['pos_class_weight'], 1.0).astype(np.float32)
+
+            clf = HistGradientBoostingClassifier(
+                max_iter=p['max_iter'],
+                max_leaf_nodes=p['max_leaf_nodes'],
+                max_depth=p['max_depth'],
+                learning_rate=p['learning_rate'],
+                min_samples_leaf=p['min_samples_leaf'],
+                l2_regularization=p['l2_regularization'],
+                max_bins=p['max_bins'],
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=p['n_iter_no_change'],
+                tol=1e-4,
+                monotonic_cst=self._monotonic_cst,
+                random_state=seed_k,
+                verbose=0,
+            )
+            clf.fit(Xb, yb, sample_weight=sw)
+            self.clfs.append(clf)
+
+        if not self.clfs:
+            raise RuntimeError('All bags collapsed — refusing to predict')
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if not self.clfs:
+            raise RuntimeError('Model not fit')
+        # Stack per-bag P(y=1) → shape (K, N)
+        probs = np.stack(
+            [clf.predict_proba(X)[:, 1] for clf in self.clfs], axis=0)
+        mean = probs.mean(axis=0)
+        std = probs.std(axis=0)
+        p = self._params
+        lcb = mean - p['conf_lambda'] * std
+        # Clip to [0, 1] so the downstream threshold sweep still has a
+        # comparable scale (the SCORE_THRESHOLDS list spans 0..0.7).
+        return np.clip(lcb, 0.0, 1.0)
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def best_iteration(self):
+        if not self.clfs:
+            return None
+        return int(np.mean([getattr(c, 'n_iter_', 0) for c in self.clfs]))
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.clfs, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+            'n_bags_fit': len(self.clfs),
+            'monotonic_cst': None if self._monotonic_cst is None
+                              else [int(v) for v in self._monotonic_cst.tolist()],
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        cst = meta.get('monotonic_cst')
+        inst._monotonic_cst = None if cst is None else np.array(cst, dtype=np.int8)
+        with open(model_path, 'rb') as f:
+            inst.clfs = pickle.load(f)
+        return inst
+
+
 # models/trainers.py — append at end (before TRAINERS dict)
 
 import os
@@ -10645,6 +10891,7 @@ TRAINERS = {
     'tabm_classifier': TabMClassifierTrainer,
     'tabm_lcb': TabMLCBClassifierTrainer,
     'histgb_monotonic': HistGBMonotonicTrainer,
+    'histgb_monotonic_bagged': HistGBMonotonicBaggedTrainer,
     'torch_itransformer': TorchITransformerTrainer,
 }
 
