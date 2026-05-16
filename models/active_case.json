@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "TabNet pivot 0/7 at default HPs (avg_ann -28%) \u2014 registered for future train-mode tuning of gamma/lambda_sparse/pos_weight. histgb_monotonic remains the strongest base (#1145 wp=5/7 ann +103.7% wr 44.5%); keep train mode sweeping its learning_rate \u00d7 pos_class_weight \u00d7 max_leaf_nodes space until it either crosses 6/7 or saturates with \u226510 more sweeps at wp \u22644.",
-  "claude_iter_id": 1147,
-  "designated_at": "2026-05-17T00:16:02"
+  "rationale": "torch_mamba 0/7 with collapsed-threshold pattern (all windows thr=0.0, 484 trades, WR 21.9%) \u2014 strictly worse than random_topk baseline; not a viable HP-sweep base. histgb_monotonic still owns the best-ever wp=5/7 (#1145, ann +103.7%) and recent train-mode sweeps (#1171-#1177) are clustering at wp=2-3 with ann +26..+81% \u2014 HP space is alive, not exhausted.",
+  "claude_iter_id": 1178,
+  "designated_at": "2026-05-17T06:19:37"
 }

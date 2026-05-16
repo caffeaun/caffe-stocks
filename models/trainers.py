@@ -11395,9 +11395,9 @@ class TorchMambaTrainer(BaseTrainer):
     name = 'torch_mamba'
     consumes_sequences = False
 
-    def __init__(self, d_model=48, n_layers=2, d_state=12, d_conv=4,
-                 expand=2, dropout=0.1, learning_rate=2e-3, weight_decay=1e-4,
-                 batch_size=256, epochs=25, patience=6, pos_weight=None,
+    def __init__(self, d_model=32, n_layers=2, d_state=8, d_conv=4,
+                 expand=1, dropout=0.1, learning_rate=2e-3, weight_decay=1e-4,
+                 batch_size=256, epochs=15, patience=4, pos_weight=None,
                  device=None, **kwargs):
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
