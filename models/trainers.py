@@ -10840,6 +10840,411 @@ class TorchITransformerTrainer(BaseTrainer):
             np.save(os.path.join(model_dir, 'feature_std.npy'), self.feature_std_)
 
 
+# --------------------------------------------------------------------- #
+# TorchTabNetTrainer (claude_mode iter #1147, brief-exhausted pivot)
+#
+# Brief #1147 picked torch_itransformer (variate-axis attention) but it
+# exhausted after 2 claude attempts (wp=0 each, iter #1061 and #1072) plus
+# 20+ train-mode HP sweeps (best wp=2). Pivoting to a structurally different
+# NN family per §6.B.0(b).
+#
+# TabNet (Arik & Pfister, AAAI 2021) is a tabular DL family with a
+# fundamentally different inductive bias from anything currently registered:
+#   - SEQUENTIAL decision steps (3-5), each step picks a small SPARSE subset
+#     of features via a sparsemax-attention mask
+#   - Per-step feature transformer (shared GLU blocks + step-specific GLU
+#     blocks, residual scaled 1/sqrt(2))
+#   - Mask-reuse prior (gamma > 1) discourages a step from re-selecting
+#     features used in earlier steps -> features get distributed across steps
+#   - Entropy penalty on the per-step mask encourages SPARSITY (few features
+#     per step) but the DIFFERENT features-across-steps means the model
+#     collectively uses many features
+#
+# Why this addresses W1/W4 stealth-bear failure pattern (Part A diagnosis):
+#   - W1 (set_ret=+5.2%, breadth 47%, foreign_flow -47.6B) and
+#     W4 (set_ret=-1.7%, breadth 43%, foreign_flow -23.2B) are "stealth bear"
+#     regimes: roughly flat SET but bearish flows; the pattern fails in
+#     18/20 recent iterations regardless of trainer family
+#   - Dense models (iTransformer attention, MLP, XGB w/ multi-feature splits)
+#     learn to predict UP for ANY pattern resembling a bullish-train day
+#   - TabNet's per-row SPARSE feature selection (sparsemax mask) means each
+#     row gets evaluated by a FEW features, not all of them — this is a
+#     strong inductive bias against the dense-overfitting failure mode
+#   - The mask-reuse penalty diversifies what features get selected, which
+#     means the model has multiple "lenses" through which it evaluates a row,
+#     similar in spirit to monotonic constraints but learned per-row
+#
+# Structurally different from registered families:
+#   * iTransformer (variate-axis attention)   — DENSE feature mixing
+#   * MLP / TorchAttentiveMLP                 — DENSE linear/attention mixing
+#   * XGB / LightGBM / HistGB(monotonic)      — greedy tree splits, no per-row
+#                                               feature selection
+#   * Kernel logreg                           — fixed kernel, dense
+#   * TabM / TabM_LCB                         — k-ensemble of dense MLPs
+#   * KNN / QDA / GaussianNB                  — distance/density methods, all
+#                                               features
+#   * TimeMoE / GRU / Transformer (time-axis) — sequence models
+# --------------------------------------------------------------------- #
+
+
+def _tabnet_sparsemax(z: 'torch.Tensor', dim: int = -1) -> 'torch.Tensor':
+    """Sparsemax (Martins & Astudillo, ICML 2016).
+
+    Projection onto the probability simplex with sparsity — output is a
+    non-negative distribution that sums to 1 along ``dim``, with many EXACT
+    zeros. PyTorch autograd handles the backward via sort/cumsum/gather/clamp;
+    the clamp's subgradient at 0 plus the sort indices being detached
+    reproduce the analytic Jacobian from the paper.
+    """
+    z_sorted, _ = torch.sort(z, dim=dim, descending=True)
+    z_cumsum = z_sorted.cumsum(dim=dim)
+    n = z.size(dim)
+    range_idx = torch.arange(1, n + 1, device=z.device, dtype=z.dtype)
+    shape = [1] * z.ndim
+    shape[dim] = n
+    range_idx = range_idx.view(*shape)
+    is_above = (1.0 + range_idx * z_sorted > z_cumsum).to(z.dtype)
+    k = is_above.sum(dim=dim, keepdim=True).clamp(min=1.0)
+    tau = (z_cumsum.gather(dim, k.long() - 1) - 1.0) / k
+    return torch.clamp(z - tau, min=0.0)
+
+
+class _TabNetGLU(nn.Module):
+    """Gated linear unit: y = a · sigmoid(b), where [a; b] = BN(W x)."""
+
+    def __init__(self, dim_in: int, dim_out: int, momentum: float = 0.02):
+        super().__init__()
+        self.fc = nn.Linear(dim_in, 2 * dim_out, bias=False)
+        self.bn = nn.BatchNorm1d(2 * dim_out, momentum=momentum)
+
+    def forward(self, x):
+        h = self.bn(self.fc(x))
+        a, b = h.chunk(2, dim=-1)
+        return a * torch.sigmoid(b)
+
+
+class _TabNetFeatureTransformer(nn.Module):
+    """Per-step feature transformer: 2 shared GLU blocks + 2 step-specific
+    GLU blocks, residual connections scaled by 1/sqrt(2) (TabNet appendix).
+    """
+
+    def __init__(self, shared_first: '_TabNetGLU',
+                 shared_rest: 'nn.ModuleList',
+                 dim_out: int, momentum: float = 0.02):
+        super().__init__()
+        # shared blocks are passed BY REFERENCE so they're truly shared
+        # across all per-step feature transformers (param sharing).
+        self.shared_first = shared_first
+        self.shared_rest = shared_rest
+        self.step = nn.ModuleList([
+            _TabNetGLU(dim_out, dim_out, momentum=momentum) for _ in range(2)
+        ])
+        self.scale = 0.5 ** 0.5
+
+    def forward(self, x):
+        h = self.shared_first(x)
+        for layer in self.shared_rest:
+            h = (h + layer(h)) * self.scale
+        for layer in self.step:
+            h = (h + layer(h)) * self.scale
+        return h
+
+
+class _TabNetAttentiveTransformer(nn.Module):
+    """Computes the sparsemax mask over input features for one decision step.
+
+    Input ``a`` is the "attention" half of the previous step's output; ``prior``
+    accumulates (gamma - mask) factors to discourage feature reuse across steps.
+    """
+
+    def __init__(self, dim_a: int, n_features: int, momentum: float = 0.02):
+        super().__init__()
+        self.fc = nn.Linear(dim_a, n_features, bias=False)
+        self.bn = nn.BatchNorm1d(n_features, momentum=momentum)
+
+    def forward(self, a, prior):
+        h = self.bn(self.fc(a))
+        return _tabnet_sparsemax(h * prior, dim=-1)
+
+
+class _TabNetClassifier(nn.Module):
+    """TabNet binary classifier (Arik & Pfister, AAAI 2021).
+
+    Returns (logits, sparse_loss). sparse_loss is the per-step mask entropy
+    averaged over steps — caller adds lambda_sparse * sparse_loss to BCE.
+    """
+
+    def __init__(self, n_features: int, n_d: int = 16, n_a: int = 16,
+                 n_steps: int = 3, gamma: float = 1.3,
+                 dropout: float = 0.0, momentum: float = 0.02):
+        super().__init__()
+        self.n_d = n_d
+        self.n_a = n_a
+        self.n_steps = n_steps
+        self.gamma = gamma
+        dim_out = n_d + n_a
+        # Input batchnorm.
+        self.input_bn = nn.BatchNorm1d(n_features, momentum=momentum)
+        # 2 shared GLU blocks. The first projects n_features -> dim_out;
+        # the rest are dim_out -> dim_out.
+        shared_first = _TabNetGLU(n_features, dim_out, momentum=momentum)
+        shared_rest = nn.ModuleList([
+            _TabNetGLU(dim_out, dim_out, momentum=momentum),
+        ])
+        # The initial feature transformer (no mask yet — uses ALL features).
+        # Produces 'a' that seeds the first attention step. Its 'd' part is
+        # discarded (decision sum starts at 0).
+        self.initial_ft = _TabNetFeatureTransformer(
+            shared_first, shared_rest, dim_out, momentum=momentum)
+        # Per-step attentive + feature transformers (param-sharing across
+        # steps via shared_first/shared_rest references).
+        self.attn_transformers = nn.ModuleList([
+            _TabNetAttentiveTransformer(n_a, n_features, momentum=momentum)
+            for _ in range(n_steps)
+        ])
+        self.feature_transformers = nn.ModuleList([
+            _TabNetFeatureTransformer(shared_first, shared_rest, dim_out,
+                                      momentum=momentum)
+            for _ in range(n_steps)
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(n_d, 1)
+
+    def forward(self, x):
+        x = self.input_bn(x)
+        # Initial step: get 'a' for the first attention without using a mask.
+        h_init = self.initial_ft(x)
+        a = h_init[:, self.n_d:]
+        prior = torch.ones_like(x)
+        decision_sum = x.new_zeros(x.size(0), self.n_d)
+        sparse_loss = x.new_zeros(())
+        for step in range(self.n_steps):
+            mask = self.attn_transformers[step](a, prior)
+            # Mask entropy penalty: encourages high entropy within a step
+            # would push toward UNIFORM, which is the WRONG direction for
+            # sparsity. The TabNet paper uses NEGATIVE entropy as the loss
+            # contribution so minimizing it encourages LOW entropy (sparse).
+            # We compute -sum(M log M) and ADD it -> minimizing increases it
+            # (encourages uniform). To encourage SPARSITY we want to MINIMIZE
+            # -(-mask*log(mask)) i.e. ADD +mask*log(mask). But mask is sparse
+            # (from sparsemax) so log(mask) is undefined at 0. Standard
+            # TabNet uses the entropy form below WITH the SIGN FLIPPED in
+            # the paper's loss formula L_sparse = sum (-M log M / Nsteps)
+            # added to the cross-entropy. Looking at the official Google
+            # research codebase, the sparsity loss IS positive-entropy added,
+            # making the loss higher when mask is uniform -> minimizer
+            # pushes toward sparse mask. Keep the standard form.
+            sparse_loss = sparse_loss + (
+                -mask * torch.log(mask + 1e-15)
+            ).sum(dim=-1).mean()
+            prior = prior * (self.gamma - mask)
+            masked_x = x * mask
+            h = self.feature_transformers[step](masked_x)
+            d_step = torch.relu(h[:, :self.n_d])
+            a = h[:, self.n_d:]
+            decision_sum = decision_sum + d_step
+        logits = self.head(self.dropout(decision_sum)).squeeze(-1)
+        return logits, sparse_loss / max(1, self.n_steps)
+
+
+class TorchTabNetTrainer(BaseTrainer):
+    """TabNet binary classifier with sparsemax per-row feature selection.
+
+    Pure PyTorch (no external pytorch_tabnet dep). Default HPs follow the
+    paper's "small dataset" recommendations (n_d=n_a=16, n_steps=3, gamma=1.3,
+    lambda_sparse=1e-3). Operates on the 2D aggregated tabular features
+    (consumes_sequences=False) -> same input shape as iTransformer, but with
+    sparse per-row feature selection instead of dense variate attention.
+    """
+
+    name = 'torch_tabnet'
+    consumes_sequences = False
+
+    def __init__(self,
+                 n_d: int = 16, n_a: int = 16, n_steps: int = 3,
+                 gamma: float = 1.3, dropout: float = 0.1,
+                 lambda_sparse: float = 1e-3,
+                 lr: float = 2e-2, weight_decay: float = 1e-4,
+                 batch_size: int = 256, epochs: int = 60, patience: int = 10,
+                 momentum: float = 0.02,
+                 pos_weight: 'float | None' = None,
+                 device: 'str | None' = None,
+                 seed: int = 42,
+                 **kwargs):
+        self.n_d = int(n_d)
+        self.n_a = int(n_a)
+        self.n_steps = int(n_steps)
+        self.gamma = float(gamma)
+        self.dropout = float(dropout)
+        self.lambda_sparse = float(lambda_sparse)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.patience = int(patience)
+        self.momentum = float(momentum)
+        self.pos_weight = pos_weight
+        self.seed = int(seed)
+        if device is None:
+            device = 'cpu'
+            try:
+                if torch.cuda.is_available():
+                    best_idx, best_free = -1, -1
+                    for i in range(torch.cuda.device_count()):
+                        try:
+                            free, _ = torch.cuda.mem_get_info(i)
+                        except Exception:
+                            free = 0
+                        if free > best_free:
+                            best_free, best_idx = free, i
+                    if best_free >= 1_000_000_000:
+                        device = f'cuda:{best_idx}'
+            except Exception:
+                pass
+        self.device = device
+        self.model = None
+        self.feature_mean_ = None
+        self.feature_std_ = None
+        self._n_features = None
+
+    def _normalize(self, X, fit: bool = False):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 3:
+            X = X[:, -1, :]
+        if fit:
+            self.feature_mean_ = np.nanmean(X, axis=0).astype(np.float32)
+            self.feature_std_ = (np.nanstd(X, axis=0) + 1e-6).astype(np.float32)
+            self._n_features = X.shape[1]
+        Xn = (X - self.feature_mean_) / self.feature_std_
+        Xn = np.nan_to_num(Xn, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.clip(Xn, -10.0, 10.0).astype(np.float32)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        X_tr_p = self._normalize(X_tr, fit=True)
+        X_val_p = self._normalize(X_val, fit=False)
+        y_tr_a = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        y_val_a = np.asarray(y_val, dtype=np.float32).reshape(-1)
+
+        if len(set(y_tr_a.astype(int))) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        self.model = _TabNetClassifier(
+            n_features=self._n_features,
+            n_d=self.n_d, n_a=self.n_a, n_steps=self.n_steps,
+            gamma=self.gamma, dropout=self.dropout, momentum=self.momentum,
+        ).to(self.device)
+        opt = torch.optim.AdamW(
+            self.model.parameters(), lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        # LR decay matching original TabNet schedule (0.9 every 20 epochs).
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=20, gamma=0.9)
+        pos_w = None
+        if self.pos_weight is not None:
+            pos_w = torch.tensor(float(self.pos_weight), device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        X_tr_t = torch.from_numpy(X_tr_p)
+        y_tr_t = torch.from_numpy(y_tr_a)
+        X_val_t = torch.from_numpy(X_val_p).to(self.device)
+        y_val_t = torch.from_numpy(y_val_a).to(self.device)
+        ds = TensorDataset(X_tr_t, y_tr_t)
+        bs = min(self.batch_size, len(ds))
+        if bs < 2:
+            bs = max(2, len(ds))
+        # drop_last=True so BatchNorm always has >1 sample in a batch.
+        dl = DataLoader(ds, batch_size=bs, shuffle=True,
+                        drop_last=(len(ds) > bs))
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        for epoch in range(self.epochs):
+            self.model.train()
+            for xb, yb in dl:
+                if xb.size(0) < 2:
+                    continue  # BatchNorm requires batch > 1 in train mode
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits, sparse_loss = self.model(xb)
+                loss = loss_fn(logits, yb) + self.lambda_sparse * sparse_loss
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+            scheduler.step()
+            self.model.eval()
+            with torch.no_grad():
+                val_logits, _ = self.model(X_val_t)
+                val_loss = float(loss_fn(val_logits, y_val_t).item())
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone()
+                              for k, v in self.model.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+                if bad >= self.patience:
+                    break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.model.eval()
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError('Model not fit')
+        X = self._normalize(X, fit=False)
+        self.model.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, X.shape[0], self.batch_size):
+                xb = torch.from_numpy(X[i:i + self.batch_size]).to(self.device)
+                logits, _ = self.model(xb)
+                p = torch.sigmoid(logits).detach().cpu().numpy()
+                out.append(p)
+        if not out:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    @property
+    def hyperparams(self):
+        return dict(
+            n_d=self.n_d, n_a=self.n_a, n_steps=self.n_steps,
+            gamma=self.gamma, dropout=self.dropout,
+            lambda_sparse=self.lambda_sparse,
+            lr=self.lr, weight_decay=self.weight_decay,
+            batch_size=self.batch_size, epochs=self.epochs,
+            patience=self.patience, momentum=self.momentum,
+            pos_weight=self.pos_weight, seed=self.seed,
+        )
+
+    def feature_importance(self):
+        return None
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(),
+                       os.path.join(output_dir, 'model.pt'))
+        cfg = dict(self.hyperparams)
+        cfg['n_features'] = self._n_features
+        cfg['name'] = self.name
+        if extra:
+            cfg.update(extra)
+        with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+            json.dump(cfg, f, indent=2)
+        if self.feature_mean_ is not None:
+            np.save(os.path.join(output_dir, 'feature_mean.npy'),
+                    self.feature_mean_)
+            np.save(os.path.join(output_dir, 'feature_std.npy'),
+                    self.feature_std_)
+        return {'model': os.path.join(output_dir, 'model.pt'),
+                'config': os.path.join(output_dir, 'config.json')}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -10893,6 +11298,7 @@ TRAINERS = {
     'histgb_monotonic': HistGBMonotonicTrainer,
     'histgb_monotonic_bagged': HistGBMonotonicBaggedTrainer,
     'torch_itransformer': TorchITransformerTrainer,
+    'torch_tabnet': TorchTabNetTrainer,
 }
 
 

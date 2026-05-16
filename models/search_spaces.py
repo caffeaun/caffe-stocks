@@ -1217,6 +1217,29 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_class_weight':  (1.5, 4.5),
     'random_state':      [42, 7, 1337],
 },
+# TabNet (Arik & Pfister, AAAI 2021) — sparse per-row feature selection via
+# sparsemax-attention mask, sequential decision steps. Different inductive
+# bias from anything else registered: every row gets evaluated by a SMALL
+# subset of features per decision step, with mask-reuse penalty diversifying
+# which features get selected across steps. HP sweep ranges follow the
+# paper's recommendations for small datasets (~10-100k rows): n_d ≈ n_a,
+# n_steps in 3-5, gamma slightly > 1, lambda_sparse in [1e-4, 1e-2].
+'torch_tabnet': {
+    'n_d':            [8, 16, 24, 32],
+    'n_a':            [8, 16, 24, 32],
+    'n_steps':        [3, 4, 5],
+    'gamma':          (1.0, 2.0),
+    'dropout':        (0.0, 0.3),
+    'lambda_sparse':  (1e-5, 1e-2),
+    'lr':             (5e-3, 5e-2),
+    'weight_decay':   (1e-6, 1e-3),
+    'batch_size':     [128, 256, 512],
+    'epochs':         [40, 60, 100],
+    'patience':       [8, 12, 20],
+    'momentum':       (0.01, 0.1),
+    'pos_weight':     [None, 1.0, 1.5, 2.0, 3.0],
+    'seed':           [42, 7, 1337, 2026],
+},
 }
 
 
