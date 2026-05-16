@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "iTransformer default hit 0/7 wp but avg_ann +73% (median +47%); two windows (W1: 39.0% WR/+77% ann, W6: 36.9% WR/+500% ann) sit \u22643pp below the WR threshold. HP nudges (pos_weight, dropout, depth, longer epochs, larger dim) are the natural next lever before declaring the family dead.",
-  "claude_iter_id": 1061,
-  "designated_at": "2026-05-16T06:10:55"
+  "rationale": "iter #1061 (default HPs, lr=1e-3, dropout=0.1, wd=1e-4, epochs=40) remains the iTransformer high-water mark (W1 39%/+77% ann, W6 37%/+500% ann \u2014 both within 1-3pp of WR floor, avg_ann +73%). This iter #1072 confirmed that the OPPOSITE direction (more regularization: dropout=0.2, wd=5e-4, epochs=60) regresses badly (0/7, avg_wr 25.2%, ~2\u00d7 trade count). Train mode should sweep the UNDERFITTING direction next: smaller dim (64), shallower depth (2), shorter epochs (25), lower dropout (0.05) \u2014 keep lr in the 5e-4 to 2e-3 band where #1061's defaults sit. pos_weight in [0.3, 0.8] is also unexplored and could lift WR by under-predicting positives.",
+  "claude_iter_id": 1072,
+  "designated_at": "2026-05-16T09:10:27"
 }
