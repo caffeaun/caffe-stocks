@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_itransformer",
+  "trainer": "histgb_monotonic",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "iter #1061 (default HPs, lr=1e-3, dropout=0.1, wd=1e-4, epochs=40) remains the iTransformer high-water mark (W1 39%/+77% ann, W6 37%/+500% ann \u2014 both within 1-3pp of WR floor, avg_ann +73%). This iter #1072 confirmed that the OPPOSITE direction (more regularization: dropout=0.2, wd=5e-4, epochs=60) regresses badly (0/7, avg_wr 25.2%, ~2\u00d7 trade count). Train mode should sweep the UNDERFITTING direction next: smaller dim (64), shallower depth (2), shorter epochs (25), lower dropout (0.05) \u2014 keep lr in the 5e-4 to 2e-3 band where #1061's defaults sit. pos_weight in [0.3, 0.8] is also unexplored and could lift WR by under-predicting positives.",
-  "claude_iter_id": 1072,
-  "designated_at": "2026-05-16T09:10:27"
+  "rationale": "torch_itransformer exhausted (2 claude-mode attempts, both 0/7 with sigmoid score collapse). Pivot to histgb_monotonic \u2014 the only trainer family that has ever hit 5/7 (iter #991: use_monotonic=False, max_iter=200, pos_class_weight=1.43, l2_reg=3.85, WR 46% / 46% / 52% on W1/W2/W3). Recent iter #1060 hit 4/7 with use_monotonic=False, max_iter=800, pos_class_weight=2.74. Train mode should sweep around use_monotonic=False (the dominant best-config lever \u2014 overriding the default True), max_iter [200,800], pos_class_weight [1.4,3.0], l2_regularization [0.5,4.0]; W4 and W7 are the chronic WR misses (1-7pp short of 40% floor).",
+  "claude_iter_id": 1083,
+  "designated_at": "2026-05-16T12:11:08"
 }
