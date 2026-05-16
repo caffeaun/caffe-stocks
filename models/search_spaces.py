@@ -1240,6 +1240,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_weight':     [None, 1.0, 1.5, 2.0, 3.0],
     'seed':           [42, 7, 1337, 2026],
 },
+    'torch_mamba': {
+    'd_model':       [32, 48, 64, 96],
+    'n_layers':      [2, 3, 4],
+    'd_state':       [8, 12, 16, 24],
+    'd_conv':        [3, 4],
+    'expand':        [1, 2],
+    'dropout':       (0.05, 0.4),
+    'learning_rate': (5e-4, 5e-3),
+    'weight_decay':  (1e-6, 1e-3),
+    'batch_size':    [128, 256, 512],
+    'epochs':        [15, 25, 40],
+    'patience':      [5, 8, 12],
+    'pos_weight':    [None, 1.2, 1.5, 2.0],
+},
 }
 
 

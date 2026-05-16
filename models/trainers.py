@@ -11245,6 +11245,294 @@ class TorchTabNetTrainer(BaseTrainer):
                 'config': os.path.join(output_dir, 'config.json')}
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class _MambaRMSNorm(nn.Module):
+    """RMSNorm — version-agnostic implementation (PyTorch <2.4 lacks nn.RMSNorm)."""
+
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * self.weight
+
+
+class _SelectiveSSM(nn.Module):
+    """Mamba-1 selective state-space (S6) mixer.
+
+    Discretized linear recurrence h_t = exp(Δ_t·A)·h_{t-1} + Δ_t·B_t·x_t with
+    input-dependent (Δ_t, B_t, C_t). Sequential scan along the L axis in pure
+    PyTorch — no CUDA kernel or external triton dependency.
+    """
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.d_state = int(d_state)
+        self.d_conv = int(d_conv)
+        self.d_inner = int(expand) * int(d_model)
+        self.dt_rank = max(1, math.ceil(self.d_model / 16))
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            self.d_inner, self.d_inner, self.d_conv,
+            groups=self.d_inner, padding=self.d_conv - 1, bias=True,
+        )
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        dt_init_std = self.dt_rank ** -0.5
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        with torch.no_grad():
+            dt = torch.exp(
+                torch.rand(self.d_inner) * (math.log(0.1) - math.log(0.001))
+                + math.log(0.001)
+            )
+            inv_dt = dt + torch.log(-torch.expm1(-dt) + 1e-8)
+            self.dt_proj.bias.copy_(inv_dt)
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+
+    def forward(self, x):
+        b, l, _ = x.shape
+        xz = self.in_proj(x)
+        x_, z = xz.chunk(2, dim=-1)
+        x_ = x_.transpose(1, 2)
+        x_ = self.conv1d(x_)[:, :, :l]
+        x_ = x_.transpose(1, 2)
+        x_ = F.silu(x_)
+        x_dbl = self.x_proj(x_)
+        dt_in, Bp, Cp = x_dbl.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt_in))
+        A = -torch.exp(self.A_log)
+        deltaA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
+        deltaB_u = dt.unsqueeze(-1) * Bp.unsqueeze(2) * x_.unsqueeze(-1)
+        h = x.new_zeros(b, self.d_inner, self.d_state)
+        ys = []
+        for t in range(l):
+            h = deltaA[:, t] * h + deltaB_u[:, t]
+            y_t = (h * Cp[:, t].unsqueeze(1)).sum(dim=-1)
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1)
+        y = y + x_ * self.D
+        y = y * F.silu(z)
+        return self.out_proj(y)
+
+
+class _MambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
+        super().__init__()
+        self.norm = _MambaRMSNorm(d_model)
+        self.mixer = _SelectiveSSM(d_model, d_state, d_conv, expand)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return x + self.drop(self.mixer(self.norm(x)))
+
+
+class _MambaTabularClassifier(nn.Module):
+    """Tabular Mamba — each input feature is a token in a length-F pseudo-sequence.
+    Selective SSM blocks scan along the variate axis with content-dependent
+    (Δ, B, C); mean-pool over tokens, MLP head to a scalar logit.
+    """
+
+    def __init__(self, num_features, d_model=48, n_layers=2, d_state=12,
+                 d_conv=4, expand=2, dropout=0.1):
+        super().__init__()
+        self.num_features = int(num_features)
+        self.tok_embed = nn.Linear(1, d_model)
+        self.pos = nn.Parameter(torch.zeros(1, num_features, d_model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.input_dropout = nn.Dropout(dropout)
+        self.layers = nn.ModuleList([
+            _MambaBlock(d_model, d_state, d_conv, expand, dropout)
+            for _ in range(n_layers)
+        ])
+        self.norm = _MambaRMSNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+        x = x.unsqueeze(-1)
+        h = self.tok_embed(x) + self.pos
+        h = self.input_dropout(h)
+        for layer in self.layers:
+            h = layer(h)
+        h = self.norm(h)
+        h = h.mean(dim=1)
+        return self.head(h).squeeze(-1)
+
+
+class TorchMambaTrainer(BaseTrainer):
+    """Mamba (selective state-space, S6) tabular classifier.
+
+    Treats each of the ~96 input features as a token in a length-F pseudo-
+    sequence and runs a stack of Mamba blocks across that axis. Attention-free,
+    O(L) per layer, with input-dependent (Δ, B, C). Pure PyTorch — no CUDA
+    kernel or triton dependency. Defaults are sized for CPU feasibility
+    (d_model=48, n_layers=2, d_state=12); GPU users can scale up.
+    """
+
+    name = 'torch_mamba'
+    consumes_sequences = False
+
+    def __init__(self, d_model=48, n_layers=2, d_state=12, d_conv=4,
+                 expand=2, dropout=0.1, learning_rate=2e-3, weight_decay=1e-4,
+                 batch_size=256, epochs=25, patience=6, pos_weight=None,
+                 device=None, **kwargs):
+        self.d_model = int(d_model)
+        self.n_layers = int(n_layers)
+        self.d_state = int(d_state)
+        self.d_conv = int(d_conv)
+        self.expand = int(expand)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.patience = int(patience)
+        self.pos_weight = pos_weight
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.feature_mean_ = None
+        self.feature_std_ = None
+        self.num_features_ = None
+
+    def _normalize(self, X, fit=False):
+        flat = X.reshape(-1, X.shape[-1])
+        if fit:
+            self.feature_mean_ = np.nanmean(flat, axis=0).astype(np.float32)
+            self.feature_std_ = (np.nanstd(flat, axis=0) + 1e-6).astype(np.float32)
+        Xn = (X - self.feature_mean_) / self.feature_std_
+        Xn = np.nan_to_num(Xn, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        return Xn
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        X_tr = np.asarray(X_tr, dtype=np.float32)
+        X_val = np.asarray(X_val, dtype=np.float32)
+        y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+        y_val = np.asarray(y_val, dtype=np.float32).ravel()
+        if X_tr.ndim != 2:
+            X_tr = X_tr.reshape(X_tr.shape[0], -1)
+            X_val = X_val.reshape(X_val.shape[0], -1)
+        X_tr = self._normalize(X_tr, fit=True)
+        X_val = self._normalize(X_val, fit=False)
+        self.num_features_ = int(X_tr.shape[1])
+        torch.manual_seed(42)
+        self.model = _MambaTabularClassifier(
+            num_features=self.num_features_,
+            d_model=self.d_model, n_layers=self.n_layers,
+            d_state=self.d_state, d_conv=self.d_conv,
+            expand=self.expand, dropout=self.dropout,
+        ).to(self.device)
+        opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate, weight_decay=self.weight_decay,
+        )
+        pos_w = None
+        if self.pos_weight is not None:
+            pos_w = torch.tensor(float(self.pos_weight), device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        ds_tr = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+        dl_tr = DataLoader(ds_tr, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        X_val_t = torch.from_numpy(X_val).to(self.device)
+        y_val_t = torch.from_numpy(y_val).to(self.device)
+        best_val = float('inf')
+        best_state = None
+        bad_epochs = 0
+        for _epoch in range(self.epochs):
+            self.model.train()
+            for xb, yb in dl_tr:
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = self.model(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+            self.model.eval()
+            with torch.no_grad():
+                val_loss_sum = 0.0
+                val_count = 0
+                for i in range(0, X_val_t.shape[0], self.batch_size):
+                    xb = X_val_t[i:i + self.batch_size]
+                    yb = y_val_t[i:i + self.batch_size]
+                    val_loss_sum += float(loss_fn(self.model(xb), yb).item()) * int(xb.shape[0])
+                    val_count += int(xb.shape[0])
+                val_loss = val_loss_sum / max(val_count, 1)
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.model.eval()
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim != 2:
+            X = X.reshape(X.shape[0], -1)
+        Xn = self._normalize(X, fit=False)
+        self.model.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, Xn.shape[0], self.batch_size):
+                xb = torch.from_numpy(Xn[i:i + self.batch_size]).to(self.device)
+                logits = self.model(xb)
+                probs = torch.sigmoid(logits).detach().cpu().numpy().ravel()
+                out.append(probs)
+        if not out:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(), os.path.join(model_dir, 'model.pt'))
+        cfg = {
+            'name': self.name,
+            'd_model': self.d_model, 'n_layers': self.n_layers,
+            'd_state': self.d_state, 'd_conv': self.d_conv,
+            'expand': self.expand, 'dropout': self.dropout,
+            'learning_rate': self.learning_rate, 'weight_decay': self.weight_decay,
+            'batch_size': self.batch_size, 'epochs': self.epochs,
+            'patience': self.patience, 'pos_weight': self.pos_weight,
+            'num_features': self.num_features_,
+        }
+        if extra:
+            cfg.update(extra)
+        with open(os.path.join(model_dir, 'config.json'), 'w') as f:
+            json.dump(cfg, f, indent=2)
+        if self.feature_mean_ is not None:
+            np.save(os.path.join(model_dir, 'feature_mean.npy'), self.feature_mean_)
+            np.save(os.path.join(model_dir, 'feature_std.npy'), self.feature_std_)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -11299,6 +11587,7 @@ TRAINERS = {
     'histgb_monotonic_bagged': HistGBMonotonicBaggedTrainer,
     'torch_itransformer': TorchITransformerTrainer,
     'torch_tabnet': TorchTabNetTrainer,
+    'torch_mamba': TorchMambaTrainer,
 }
 
 
