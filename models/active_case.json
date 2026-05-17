@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "torch_mamba 0/7 with collapsed-threshold pattern (all windows thr=0.0, 484 trades, WR 21.9%) \u2014 strictly worse than random_topk baseline; not a viable HP-sweep base. histgb_monotonic still owns the best-ever wp=5/7 (#1145, ann +103.7%) and recent train-mode sweeps (#1171-#1177) are clustering at wp=2-3 with ann +26..+81% \u2014 HP space is alive, not exhausted.",
-  "claude_iter_id": 1178,
-  "designated_at": "2026-05-17T06:19:37"
+  "rationale": "torch_mamba 1/7 with W6 PASS is data, not a candidate base \u2014 threshold collapses to 0.0 in all 7 windows, and the W6 +392% ann is a single-regime bullish artifact (SET +8.3%, breadth 51%) not a learned signal. histgb_monotonic remains the strongest sweep base: iter #1218 reached wp=6/7 ann=+93% just 36 iters ago, and 3 of the top-5 historical wp>=5 results used `use_monotonic=False` (alive axis) \u2014 the HP space is not yet exhausted.",
+  "claude_iter_id": 1254,
+  "designated_at": "2026-05-17T21:20:02"
 }
