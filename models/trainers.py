@@ -11533,6 +11533,297 @@ class TorchMambaTrainer(BaseTrainer):
             np.save(os.path.join(model_dir, 'feature_std.npy'), self.feature_std_)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class TorchPatchTSTTrainer(BaseTrainer):
+    """PatchTST classifier — channel-independent patch transformer over the
+    L=20 day axis (consumes_sequences=True path).
+
+    Tokenization: each of the F per-day features is treated as an independent
+    univariate series of length L. Each series is sliced into patches of
+    length P with stride S, projected to d_model, and run through a shared
+    Transformer encoder. A CLS token is prepended (use_cls_token=True) and
+    the resulting CLS embedding is concatenated across channels and fed to
+    a linear head with `num_targets` outputs. Forward returns
+    `prediction_logits` of shape (batch, num_targets); we softmax over the
+    class axis to produce predict_proba.
+
+    Optional SSL masked pretraining stage: if ssl_pretrain_epochs > 0, a
+    PatchTSTForPretraining model is trained first on the concatenation of
+    train + val sequences with `random_mask_ratio` of patches masked out
+    and reconstructed; the matched-shape backbone weights are then
+    transferred to the classification head before fine-tuning.
+    """
+
+    name = 'torch_patchtst'
+    consumes_sequences = True
+
+    def __init__(self,
+                 d_model=128,
+                 num_hidden_layers=3,
+                 num_attention_heads=4,
+                 patch_length=4,
+                 patch_stride=4,
+                 ffn_dim=256,
+                 channel_attention=True,
+                 use_cls_token=True,
+                 pooling_type='mean',
+                 share_embedding=True,
+                 dropout=0.1,
+                 attention_dropout=0.1,
+                 path_dropout=0.0,
+                 learning_rate=1e-3,
+                 weight_decay=1e-5,
+                 batch_size=256,
+                 epochs=20,
+                 patience=5,
+                 pos_weight=None,
+                 ssl_pretrain_epochs=0,
+                 random_mask_ratio=0.4,
+                 device=None,
+                 **kwargs):
+        self.d_model = int(d_model)
+        self.num_hidden_layers = int(num_hidden_layers)
+        self.num_attention_heads = int(num_attention_heads)
+        self.patch_length = int(patch_length)
+        self.patch_stride = int(patch_stride)
+        self.ffn_dim = int(ffn_dim)
+        self.channel_attention = bool(channel_attention)
+        self.use_cls_token = bool(use_cls_token)
+        self.pooling_type = str(pooling_type)
+        self.share_embedding = bool(share_embedding)
+        self.dropout = float(dropout)
+        self.attention_dropout = float(attention_dropout)
+        self.path_dropout = float(path_dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.patience = int(patience)
+        self.pos_weight = pos_weight
+        self.ssl_pretrain_epochs = int(ssl_pretrain_epochs)
+        self.random_mask_ratio = float(random_mask_ratio)
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = str(device)
+        self.model = None
+        self.num_channels_ = None
+        self.context_length_ = None
+
+    def _ensure_3d(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 2:
+            X = X[:, :, None]
+        if X.ndim != 3:
+            raise ValueError(f'TorchPatchTSTTrainer expects 3D (N, L, F); got {X.shape}')
+        return X
+
+    def _build_config(self, num_channels, context_length, num_classes,
+                      for_pretrain=False):
+        from transformers import PatchTSTConfig
+        p_len = max(1, min(self.patch_length, context_length))
+        p_str = max(1, min(self.patch_stride, context_length))
+        return PatchTSTConfig(
+            num_input_channels=int(num_channels),
+            context_length=int(context_length),
+            patch_length=int(p_len),
+            patch_stride=int(p_str),
+            d_model=int(self.d_model),
+            num_hidden_layers=int(self.num_hidden_layers),
+            num_attention_heads=int(self.num_attention_heads),
+            ffn_dim=int(self.ffn_dim),
+            channel_attention=bool(self.channel_attention),
+            use_cls_token=bool(self.use_cls_token),
+            pooling_type=str(self.pooling_type),
+            share_embedding=bool(self.share_embedding),
+            attention_dropout=float(self.attention_dropout),
+            ff_dropout=float(self.dropout),
+            path_dropout=float(self.path_dropout),
+            head_dropout=float(self.dropout),
+            num_targets=int(num_classes),
+            scaling=None,
+            do_mask_input=bool(for_pretrain),
+            mask_type='random',
+            random_mask_ratio=float(self.random_mask_ratio),
+        )
+
+    def _pretrain_backbone(self, X_all):
+        from transformers import PatchTSTForPretraining
+        N, L, Fc = X_all.shape
+        cfg = self._build_config(Fc, L, num_classes=2, for_pretrain=True)
+        pre = PatchTSTForPretraining(cfg).to(self.device)
+        opt = torch.optim.AdamW(
+            pre.parameters(),
+            lr=self.learning_rate, weight_decay=self.weight_decay,
+        )
+        ds = TensorDataset(torch.from_numpy(X_all))
+        dl = DataLoader(ds, batch_size=self.batch_size,
+                        shuffle=True, drop_last=False)
+        pre.train()
+        for _ep in range(self.ssl_pretrain_epochs):
+            for (xb,) in dl:
+                xb = xb.to(self.device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                out = pre(past_values=xb)
+                loss = out.loss
+                if loss is None:
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(pre.parameters(), 1.0)
+                opt.step()
+        return pre.state_dict()
+
+    def _transfer_backbone(self, src_state):
+        dst_state = self.model.state_dict()
+        n_copied = 0
+        for k, v in src_state.items():
+            if k in dst_state and dst_state[k].shape == v.shape:
+                dst_state[k].copy_(v)
+                n_copied += 1
+        self.model.load_state_dict(dst_state)
+        return n_copied
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        from transformers import PatchTSTForClassification
+        X_tr = self._ensure_3d(X_tr)
+        X_val = self._ensure_3d(X_val)
+        N, L, Fc = X_tr.shape
+        self.num_channels_ = int(Fc)
+        self.context_length_ = int(L)
+        y_tr = np.asarray(y_tr).astype(np.int64).ravel()
+        y_val = np.asarray(y_val).astype(np.int64).ravel()
+
+        if self.ssl_pretrain_epochs > 0:
+            X_all = np.concatenate([X_tr, X_val], axis=0)
+            src_state = self._pretrain_backbone(X_all)
+        else:
+            src_state = None
+
+        cfg = self._build_config(Fc, L, num_classes=2, for_pretrain=False)
+        self.model = PatchTSTForClassification(cfg).to(self.device)
+        if src_state is not None:
+            self._transfer_backbone(src_state)
+
+        if self.pos_weight is not None:
+            pw = float(self.pos_weight)
+        else:
+            n_pos = int((y_tr == 1).sum())
+            n_neg = int((y_tr == 0).sum())
+            pw = max(n_neg / max(n_pos, 1), 0.5)
+        class_w = torch.tensor([1.0, pw], dtype=torch.float32, device=self.device)
+        loss_fn = nn.CrossEntropyLoss(weight=class_w)
+
+        opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate, weight_decay=self.weight_decay,
+        )
+        ds_tr = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+        dl_tr = DataLoader(ds_tr, batch_size=self.batch_size,
+                           shuffle=True, drop_last=False)
+        X_val_t = torch.from_numpy(X_val).to(self.device)
+        y_val_t = torch.from_numpy(y_val).to(self.device)
+
+        best_val = float('inf')
+        best_state = None
+        bad_epochs = 0
+        for _epoch in range(self.epochs):
+            self.model.train()
+            for xb, yb in dl_tr:
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                out = self.model(past_values=xb)
+                loss = loss_fn(out.prediction_logits, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+            self.model.eval()
+            with torch.no_grad():
+                val_loss_sum = 0.0
+                val_count = 0
+                for i in range(0, X_val_t.shape[0], self.batch_size):
+                    xb = X_val_t[i:i + self.batch_size]
+                    yb = y_val_t[i:i + self.batch_size]
+                    out = self.model(past_values=xb)
+                    val_loss_sum += float(
+                        loss_fn(out.prediction_logits, yb).item()
+                    ) * int(xb.shape[0])
+                    val_count += int(xb.shape[0])
+                val_loss = val_loss_sum / max(val_count, 1)
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.detach().clone()
+                              for k, v in self.model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.model.eval()
+        return self
+
+    def predict_proba(self, X):
+        X = self._ensure_3d(X)
+        self.model.eval()
+        out_chunks = []
+        with torch.no_grad():
+            for i in range(0, X.shape[0], self.batch_size):
+                xb = torch.from_numpy(X[i:i + self.batch_size]).to(self.device)
+                out = self.model(past_values=xb)
+                probs = torch.softmax(out.prediction_logits, dim=-1)[:, 1]
+                out_chunks.append(probs.detach().cpu().numpy())
+        if not out_chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(out_chunks, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(),
+                       os.path.join(model_dir, 'model.pt'))
+        cfg = {
+            'name': self.name,
+            'd_model': self.d_model,
+            'num_hidden_layers': self.num_hidden_layers,
+            'num_attention_heads': self.num_attention_heads,
+            'patch_length': self.patch_length,
+            'patch_stride': self.patch_stride,
+            'ffn_dim': self.ffn_dim,
+            'channel_attention': self.channel_attention,
+            'use_cls_token': self.use_cls_token,
+            'pooling_type': self.pooling_type,
+            'share_embedding': self.share_embedding,
+            'dropout': self.dropout,
+            'attention_dropout': self.attention_dropout,
+            'path_dropout': self.path_dropout,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'batch_size': self.batch_size,
+            'epochs': self.epochs,
+            'patience': self.patience,
+            'pos_weight': self.pos_weight,
+            'ssl_pretrain_epochs': self.ssl_pretrain_epochs,
+            'random_mask_ratio': self.random_mask_ratio,
+            'num_channels_': self.num_channels_,
+            'context_length_': self.context_length_,
+        }
+        if extra:
+            cfg.update(extra)
+        with open(os.path.join(model_dir, 'config.json'), 'w') as f:
+            json.dump(cfg, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -11588,6 +11879,7 @@ TRAINERS = {
     'torch_itransformer': TorchITransformerTrainer,
     'torch_tabnet': TorchTabNetTrainer,
     'torch_mamba': TorchMambaTrainer,
+    'torch_patchtst': TorchPatchTSTTrainer,
 }
 
 

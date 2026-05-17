@@ -1254,6 +1254,29 @@ SEARCH_SPACES: dict[str, dict] = {
     'patience':      [5, 8, 12],
     'pos_weight':    [None, 1.2, 1.5, 2.0],
 },
+    # models/search_spaces.py — entry to add to SEARCH_SPACES dict
+'torch_patchtst': {
+    'd_model':              [64, 96, 128, 192],
+    'num_hidden_layers':    [2, 3, 4],
+    'num_attention_heads':  [2, 4, 8],
+    'patch_length':         [2, 4, 5],
+    'patch_stride':         [2, 4, 5],
+    'ffn_dim':              [128, 256, 512],
+    'channel_attention':    [False, True],
+    'use_cls_token':        [True, False],
+    'pooling_type':         ['mean', 'max'],
+    'share_embedding':      [True, False],
+    'dropout':              (0.0, 0.4),
+    'attention_dropout':    (0.0, 0.3),
+    'learning_rate':        (1e-4, 5e-3),
+    'weight_decay':         (1e-6, 1e-3),
+    'batch_size':           [128, 256, 512],
+    'epochs':               [15, 25, 40],
+    'patience':             [5, 8, 12],
+    'pos_weight':           [None, 1.2, 1.5, 2.0],
+    'ssl_pretrain_epochs':  [0, 3, 5, 10],
+    'random_mask_ratio':    [0.3, 0.4, 0.5],
+},
 }
 
 
