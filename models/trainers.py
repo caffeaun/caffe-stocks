@@ -11604,7 +11604,13 @@ class TorchPatchTSTTrainer(BaseTrainer):
         self.dropout = float(dropout)
         self.attention_dropout = float(attention_dropout)
         self.path_dropout = float(path_dropout)
-        self.learning_rate = float(learning_rate)
+        lr = float(learning_rate)
+        # Defensive clamp: return_gate hard-codes learning_rate=0.05 (LightGBM-shaped);
+        # an AdamW transformer at lr=5e-2 diverges. Treat anything > 1e-2 as a passthrough
+        # artifact and use the AdamW-appropriate default instead.
+        if lr > 1e-2:
+            lr = 1e-3
+        self.learning_rate = lr
         self.weight_decay = float(weight_decay)
         self.batch_size = int(batch_size)
         self.epochs = int(epochs)
@@ -11613,7 +11619,21 @@ class TorchPatchTSTTrainer(BaseTrainer):
         self.ssl_pretrain_epochs = int(ssl_pretrain_epochs)
         self.random_mask_ratio = float(random_mask_ratio)
         if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            device = 'cpu'
+            try:
+                if torch.cuda.is_available():
+                    best_idx, best_free = -1, -1
+                    for i in range(torch.cuda.device_count()):
+                        try:
+                            free, _ = torch.cuda.mem_get_info(i)
+                        except Exception:
+                            free = 0
+                        if free > best_free:
+                            best_free, best_idx = free, i
+                    if best_free >= 1_500_000_000:
+                        device = f'cuda:{best_idx}'
+            except Exception:
+                pass
         self.device = str(device)
         self.model = None
         self.num_channels_ = None

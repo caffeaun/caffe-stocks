@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_adv_val",
+  "trainer": "torch_patchtst",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First trainer in 20+ claude iters to crack W3+W4+W5 simultaneously (the bear-regime 0/20 wall) \u2014 4/7 on default HP with +21.6% avg_ann. Fails are trade-count (W2 17 trades at WR 70.6%, W7 14 trades at WR 64.3%) suggesting threshold/pos-weight tuning can convert 2-3 more windows. The adversarial-validation HP axes (adv_alpha, adv_test_frac, adv_max_depth, weight_clip) are unswept from this angle \u2014 historical xgb_adv_val sweep peaked at 5/7 (#610) before the recent feature/data improvements (24-feature curated set, foreign-flow regime stats). Train mode should sweep adv_alpha in [0.3, 1.5] and adv_test_frac in [0.3, 0.4].",
-  "claude_iter_id": 1270,
-  "designated_at": "2026-05-18T00:11:43"
+  "rationale": "First patch-transformer in 1298 iters; W6 hit +114% ann (29% WR just below 40% gate) \u2014 patch tokens find real signal but auto pos_weight\u22488.2 floods low-quality positives (319 trades vs random 177, WR 20% < random 32%). Sweep pos_weight \u2208 [1.2, 1.5, 2.0] and threshold; also d_model/num_layers to control over-prediction.",
+  "claude_iter_id": 1298,
+  "designated_at": "2026-05-18T06:19:49"
 }
