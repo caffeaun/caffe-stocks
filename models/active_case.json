@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_meta_label_regime",
+  "trainer": "histgb_monotonic_bagged",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Hit 4/7 at default HPs (ties histgb_monotonic all-time record), broke through W4 +48% ann the historically-15/20-fail bull\u2192bear transition window; train mode should sweep stage1_train_frac plus stage2_max_depth/min_child_weight to harden W1 WR (38.1% vs 40% floor) and crack a 5th window.",
-  "claude_iter_id": 1300,
-  "designated_at": "2026-05-18T15:25:13"
+  "rationale": "Just added aggregation HP with 4 modes (median/mean/lcb/trimmed_lcb) and widened bag_frac/conf_lambda/n_bags ranges; the prior active_case xgb_meta_label_regime has produced 8 consecutive train-mode iterations with identical 4/7 +6.1% result (HP space saturated, see #1320-#1327). Hand the new aggregation \u00d7 bag_frac \u00d7 pos_class_weight \u00d7 n_bags hypercube to train mode to find the median/trimmed_lcb sweet spot that today's manual default could not.",
+  "claude_iter_id": 1328,
+  "designated_at": "2026-05-18T21:10:42"
 }

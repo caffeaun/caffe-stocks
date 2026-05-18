@@ -10621,14 +10621,27 @@ class HistGBMonotonicTrainer(BaseTrainer):
 # bootstrap recommended for time-series ensembling.
 # --------------------------------------------------------------------- #
 class HistGBMonotonicBaggedTrainer(BaseTrainer):
-    """K=3 date-bagged ensemble of HistGBMonotonic with LCB scoring."""
+    """K-bag ensemble of HistGBMonotonic with pluggable aggregation.
+
+    iter #1131 (LCB at lam=1.0, bag_frac=0.85) hit only wp=1/7 (avg_wr 31.3%
+    vs base histgb_monotonic 38.5%). Failure was structural: LCB demotion
+    (mean - λ·std) and bag_frac<1.0 stack the same demotion vector, leaving
+    a thin top-of-day score band that the gate threshold cannot exploit.
+    Defaults below pivot to MEDIAN aggregation with bag_frac=1.0 (standard
+    bootstrap, all unique dates eligible) so the bagging contributes
+    robustness-to-outlier-bag without an extra confidence penalty stacked
+    on top. LCB is retained as a sweep-time option.
+    """
 
     name = 'histgb_monotonic_bagged'
 
+    _AGGREGATIONS = ('median', 'lcb', 'trimmed_lcb', 'mean')
+
     def __init__(self,
                  n_bags: int = 3,
-                 conf_lambda: float = 1.0,
-                 bag_frac: float = 0.85,
+                 aggregation: str = 'median',
+                 conf_lambda: float = 0.0,
+                 bag_frac: float = 1.0,
                  max_iter: int = 400,
                  max_leaf_nodes: int = 31,
                  max_depth: Optional[int] = None,
@@ -10641,8 +10654,13 @@ class HistGBMonotonicBaggedTrainer(BaseTrainer):
                  use_monotonic: bool = True,
                  random_state: int = 42,
                  **_):
+        agg = str(aggregation).lower()
+        if agg not in self._AGGREGATIONS:
+            raise ValueError(
+                f'aggregation={aggregation!r} not in {self._AGGREGATIONS}')
         self._params = dict(
             n_bags=int(n_bags),
+            aggregation=agg,
             conf_lambda=float(conf_lambda),
             bag_frac=float(bag_frac),
             max_iter=int(max_iter),
@@ -10779,13 +10797,30 @@ class HistGBMonotonicBaggedTrainer(BaseTrainer):
         # Stack per-bag P(y=1) → shape (K, N)
         probs = np.stack(
             [clf.predict_proba(X)[:, 1] for clf in self.clfs], axis=0)
-        mean = probs.mean(axis=0)
-        std = probs.std(axis=0)
         p = self._params
-        lcb = mean - p['conf_lambda'] * std
+        agg = p['aggregation']
+        if agg == 'median':
+            score = np.median(probs, axis=0)
+        elif agg == 'mean':
+            score = probs.mean(axis=0)
+        elif agg == 'lcb':
+            score = probs.mean(axis=0) - p['conf_lambda'] * probs.std(axis=0)
+        elif agg == 'trimmed_lcb':
+            # Drop max and min bag probability per row, then mean - λ·std on
+            # the middle K-2 bags. Needs n_bags >= 3 to leave a non-empty
+            # middle; with K=3 reduces to "median - 0 (std degenerate)".
+            K = probs.shape[0]
+            if K < 3:
+                score = probs.mean(axis=0) - p['conf_lambda'] * probs.std(axis=0)
+            else:
+                srt = np.sort(probs, axis=0)
+                mid = srt[1:-1]  # drop extremes
+                score = mid.mean(axis=0) - p['conf_lambda'] * mid.std(axis=0)
+        else:
+            score = probs.mean(axis=0)
         # Clip to [0, 1] so the downstream threshold sweep still has a
         # comparable scale (the SCORE_THRESHOLDS list spans 0..0.7).
-        return np.clip(lcb, 0.0, 1.0)
+        return np.clip(score, 0.0, 1.0)
 
     def feature_importance(self):
         return None

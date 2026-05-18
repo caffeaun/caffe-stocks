@@ -428,6 +428,10 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output', help='Path to write JSON results')
     parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--extra-kwargs', type=str, default='{}',
+                        help='JSON dict of additional trainer kwargs merged on top '
+                             'of the CLI defaults (trainer __init__ silently drops '
+                             'unknown keys via **_).')
     args = parser.parse_args()
 
     print('=== return_gate v1 (LightGBM, return-based walk-forward) ===\n')
@@ -459,6 +463,13 @@ def main():
         calibrate=args.calibrate,
         random_state=args.seed,
     )
+    try:
+        extra = json.loads(args.extra_kwargs) if args.extra_kwargs else {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'bad --extra-kwargs JSON: {e}')
+    if not isinstance(extra, dict):
+        raise SystemExit('--extra-kwargs must be a JSON object')
+    trainer_kwargs.update(extra)
     print(f'Trainer: {args.model_type}\n')
 
     results = []

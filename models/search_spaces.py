@@ -1234,9 +1234,10 @@ SEARCH_SPACES: dict[str, dict] = {
     'patience':      [6, 8, 12],
 },
 'histgb_monotonic_bagged': {
-    'n_bags':            [3, 5],
-    'conf_lambda':       (0.3, 2.0),
-    'bag_frac':          (0.7, 0.95),
+    'n_bags':            [3, 5, 7],
+    'aggregation':       ['median', 'mean', 'lcb', 'trimmed_lcb'],
+    'conf_lambda':       (0.0, 1.5),
+    'bag_frac':          (0.85, 1.0),
     'max_iter':          [200, 400],
     'max_leaf_nodes':    [15, 31, 63],
     'learning_rate':     (0.015, 0.06),
