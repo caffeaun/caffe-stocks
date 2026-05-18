@@ -1306,6 +1306,16 @@ SEARCH_SPACES: dict[str, dict] = {
     'ssl_pretrain_epochs':  [0, 3, 5, 10],
     'random_mask_ratio':    [0.3, 0.4, 0.5],
 },
+    # models/search_spaces.py — entry to add to SEARCH_SPACES dict
+'tabicl_v2': {
+    'n_estimators':         [1, 2, 4],
+    'softmax_temperature':  (0.5, 1.5),
+    'average_logits':       [True, False],
+    'norm_methods':         ['none', 'standard', 'robust'],
+    'outlier_threshold':    (2.0, 6.0),
+    'batch_size':           [4, 8, 16],
+    'max_train_rows':       [20000, 40000, 60000, 100000],
+},
 }
 
 

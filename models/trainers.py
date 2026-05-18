@@ -12121,6 +12121,199 @@ class TorchPatchTSTTrainer(BaseTrainer):
             json.dump(cfg, f, indent=2)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import pickle
+import numpy as np
+
+try:
+    import torch
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
+
+try:
+    from tabicl import TabICLClassifier
+    _HAS_TABICL = True
+except Exception:
+    _HAS_TABICL = False
+
+
+class TabICLv2Trainer(BaseTrainer):
+    """In-context tabular foundation model (Inria Soda TabICLv2, Apr 2026).
+
+    A second-generation ICL foundation model that supersedes TabPFN-2.5 on
+    TabArena/TALENT by 5-10% relative error at 5-10x lower inference cost.
+    The crucial structural change vs `tabpfn_v25` is the Query-Aware
+    Scalable Softmax (QASSMax) attention: element-wise temperature scaling
+    that depends on context length n, so the softmax does not collapse as
+    in-context training rows grow into the hundreds of thousands. That
+    lifts the practical training-row ceiling from ~10k (TabPFN-2.5) toward
+    1M, which means we can finally show the model the *full* per-window
+    train slice (~150k rows) instead of stratified-subsampling it.
+
+    No gradient updates at fit-time: stores the (optionally subsampled)
+    training rows; the pretrained backbone performs in-context inference
+    on each predict_proba call. Fit-time and predict-time wall-clock are
+    both dominated by the single forward pass through the backbone.
+    """
+    name = 'tabicl_v2'
+    consumes_sequences = False
+
+    def __init__(self,
+                 n_estimators: int = 1,
+                 softmax_temperature: float = 0.9,
+                 average_logits: bool = True,
+                 norm_methods: str = 'none',
+                 feat_shuffle_method: str = 'shuffle',
+                 class_shuffle_method: str = 'shuffle',
+                 outlier_threshold: float = 4.0,
+                 batch_size: int = 8,
+                 use_amp: bool = True,
+                 kv_cache: bool = True,
+                 max_train_rows: int = 60000,
+                 checkpoint_version: str = 'tabicl-classifier-v2-20260212.ckpt',
+                 random_state: int = 42,
+                 **_):
+        if not _HAS_TABICL:
+            raise ImportError(
+                "tabicl not installed. `pip install tabicl` (Python >=3.10, "
+                "PyTorch>=2.1). CUDA strongly recommended; CPU works with n_jobs."
+            )
+        self.n_estimators = int(n_estimators)
+        self.softmax_temperature = float(softmax_temperature)
+        self.average_logits = bool(average_logits)
+        self.norm_methods = str(norm_methods)
+        self.feat_shuffle_method = str(feat_shuffle_method)
+        self.class_shuffle_method = str(class_shuffle_method)
+        self.outlier_threshold = float(outlier_threshold)
+        self.batch_size = int(batch_size)
+        self.use_amp = bool(use_amp)
+        self.kv_cache = bool(kv_cache)
+        self.max_train_rows = int(max_train_rows)
+        self.checkpoint_version = str(checkpoint_version)
+        self.random_state = int(random_state)
+        self._model = None
+        self._X_train = None
+        self._y_train = None
+        self._device = None
+
+    def _sanitize(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _stratified_subsample(self, X, y):
+        n = len(X)
+        if n <= self.max_train_rows:
+            return X, y
+        rng = np.random.default_rng(self.random_state)
+        pos_idx = np.where(y == 1)[0]
+        neg_idx = np.where(y == 0)[0]
+        frac = self.max_train_rows / float(n)
+        n_pos = max(1, int(round(len(pos_idx) * frac)))
+        n_neg = max(1, min(self.max_train_rows - n_pos, len(neg_idx)))
+        sel_pos = rng.choice(pos_idx, size=n_pos, replace=False)
+        sel_neg = rng.choice(neg_idx, size=n_neg, replace=False)
+        idx = np.concatenate([sel_pos, sel_neg])
+        rng.shuffle(idx)
+        return X[idx], y[idx]
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        X_tr = self._sanitize(X_tr)
+        y_tr = np.asarray(y_tr).astype(np.int64).ravel()
+        X_tr, y_tr = self._stratified_subsample(X_tr, y_tr)
+        self._device = 'cuda' if (_HAS_TORCH and torch.cuda.is_available()) else 'cpu'
+        self._model = TabICLClassifier(
+            n_estimators=self.n_estimators,
+            softmax_temperature=self.softmax_temperature,
+            average_logits=self.average_logits,
+            norm_methods=self.norm_methods,
+            feat_shuffle_method=self.feat_shuffle_method,
+            class_shuffle_method=self.class_shuffle_method,
+            outlier_threshold=self.outlier_threshold,
+            batch_size=self.batch_size,
+            use_amp=self.use_amp,
+            kv_cache=self.kv_cache,
+            checkpoint_version=self.checkpoint_version,
+            device=self._device,
+            random_state=self.random_state,
+            allow_auto_download=True,
+        )
+        self._model.fit(X_tr, y_tr)
+        self._X_train = X_tr
+        self._y_train = y_tr
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("TabICLv2Trainer: predict_proba called before fit()")
+        X = self._sanitize(X)
+        if hasattr(self._model, 'predict_proba'):
+            proba = self._model.predict_proba(X)
+        else:
+            # fallback: derive proba via sklearn-compatible decision path
+            from sklearn.utils.validation import check_is_fitted
+            check_is_fitted(self._model)
+            proba = self._model.predict_proba(X)
+        proba = np.asarray(proba, dtype=np.float32)
+        if proba.ndim == 2 and proba.shape[1] >= 2:
+            return proba[:, 1].astype(np.float32)
+        return proba.ravel().astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        with open(os.path.join(model_dir, 'tabicl_state.pkl'), 'wb') as f:
+            pickle.dump({
+                'X_train': self._X_train,
+                'y_train': self._y_train,
+                'hp': {
+                    'n_estimators': self.n_estimators,
+                    'softmax_temperature': self.softmax_temperature,
+                    'average_logits': self.average_logits,
+                    'norm_methods': self.norm_methods,
+                    'feat_shuffle_method': self.feat_shuffle_method,
+                    'class_shuffle_method': self.class_shuffle_method,
+                    'outlier_threshold': self.outlier_threshold,
+                    'batch_size': self.batch_size,
+                    'use_amp': self.use_amp,
+                    'kv_cache': self.kv_cache,
+                    'max_train_rows': self.max_train_rows,
+                    'checkpoint_version': self.checkpoint_version,
+                    'random_state': self.random_state,
+                },
+                'device': self._device,
+            }, f)
+        meta = {'trainer': self.name, 'device': self._device,
+                'checkpoint_version': self.checkpoint_version}
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+        return {
+            'state': os.path.join(model_dir, 'tabicl_state.pkl'),
+            'meta': os.path.join(model_dir, 'meta.json'),
+        }
+
+    @property
+    def hyperparams(self) -> dict:
+        return {
+            'n_estimators': self.n_estimators,
+            'softmax_temperature': self.softmax_temperature,
+            'average_logits': self.average_logits,
+            'norm_methods': self.norm_methods,
+            'feat_shuffle_method': self.feat_shuffle_method,
+            'class_shuffle_method': self.class_shuffle_method,
+            'outlier_threshold': self.outlier_threshold,
+            'batch_size': self.batch_size,
+            'use_amp': self.use_amp,
+            'kv_cache': self.kv_cache,
+            'max_train_rows': self.max_train_rows,
+            'checkpoint_version': self.checkpoint_version,
+        }
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -12178,6 +12371,7 @@ TRAINERS = {
     'torch_tabnet': TorchTabNetTrainer,
     'torch_mamba': TorchMambaTrainer,
     'torch_patchtst': TorchPatchTSTTrainer,
+    'tabicl_v2': TabICLv2Trainer,
 }
 
 
