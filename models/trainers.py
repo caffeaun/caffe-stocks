@@ -11586,7 +11586,7 @@ class TorchPatchTSTTrainer(BaseTrainer):
                  batch_size=256,
                  epochs=20,
                  patience=5,
-                 pos_weight=None,
+                 pos_weight=1.5,
                  ssl_pretrain_epochs=0,
                  random_mask_ratio=0.4,
                  device=None,

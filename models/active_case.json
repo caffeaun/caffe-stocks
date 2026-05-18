@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First patch-transformer in 1298 iters; W6 hit +114% ann (29% WR just below 40% gate) \u2014 patch tokens find real signal but auto pos_weight\u22488.2 floods low-quality positives (319 trades vs random 177, WR 20% < random 32%). Sweep pos_weight \u2208 [1.2, 1.5, 2.0] and threshold; also d_model/num_layers to control over-prediction.",
-  "claude_iter_id": 1298,
-  "designated_at": "2026-05-18T06:19:49"
+  "rationale": "pos_weight=1.5 lifted PatchTST from 0/7 to 1/7 with W6 +45% clean and W1 near-pass at +30% ann; train mode should now sweep d_model/num_hidden_layers/dropout to constrain over-confidence on W2-W4 transition windows while preserving W6 signal.",
+  "claude_iter_id": 1299,
+  "designated_at": "2026-05-18T09:14:25"
 }
