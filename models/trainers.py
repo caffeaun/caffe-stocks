@@ -5187,6 +5187,207 @@ class XGBoostMetaLabelingTrainer(BaseTrainer):
 
 
 # --------------------------------------------------------------------- #
+# Regime-Aware Meta-Labeling (xgb_meta_label_regime) — extends López de
+# Prado meta-labeling by feeding stage 2 three per-date aggregates of
+# stage 1's predictions (mean, std, within-date rank-pct). Stage 2 thus
+# sees model-implied regime context that no per-row feature directly
+# encodes: "is the whole cohort bullish today?" and "where does this row
+# rank within today's cohort?". The hypothesis is that the W2-W4 false-
+# positive floods in transformer trainers (torch_patchtst #1298-#1299:
+# WR 14-19% on bull-train→bear-test) come from over-confident per-row
+# scoring with no cross-sectional confidence prior; stage 2 with regime
+# features can learn to demote bullish stage-1 calls when stage 1 is
+# uniformly bullish on what looks like a low-breadth day, mirroring the
+# day_gate_monotonic #1031 lesson ("need hard p_day<0.3 suppression").
+# --------------------------------------------------------------------- #
+class XGBoostMetaLabelingRegimeTrainer(XGBoostMetaLabelingTrainer):
+    """Meta-labeling with regime-aware stage 2.
+
+    Stage 2 input = [features | stage1_oof_pred | day_mean(stage1_pred) |
+    day_std(stage1_pred) | day_rank_pct(stage1_pred)].
+    At predict time, ``set_predict_context(dates)`` must be called by the
+    gate so per-date aggregates can be computed from the test cross-
+    section; if dates are unavailable the entire batch is treated as one
+    cohort (degraded mode).
+    """
+    name = 'xgb_meta_label_regime'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._predict_dates = None
+        self._n_regime_extra = 3
+
+    def set_predict_context(self, dates):
+        self._predict_dates = (
+            np.asarray(dates) if dates is not None else None)
+
+    @staticmethod
+    def _compute_day_regime_features(preds, dates):
+        preds = np.asarray(preds, dtype=np.float64)
+        n = len(preds)
+        out = np.empty((n, 3), dtype=np.float32)
+        if dates is None:
+            day_mean = float(np.mean(preds)) if n > 0 else 0.5
+            day_std = float(np.std(preds)) if n > 1 else 0.0
+            denom = max(n - 1, 1)
+            order = np.argsort(np.argsort(preds))
+            out[:, 0] = day_mean
+            out[:, 1] = day_std
+            out[:, 2] = (order.astype(np.float64) / denom).astype(np.float32)
+            return out
+        dates = np.asarray(dates)
+        for d in np.unique(dates):
+            mask = dates == d
+            sl = preds[mask]
+            if len(sl) <= 1:
+                out[mask, 0] = float(sl[0]) if len(sl) == 1 else 0.5
+                out[mask, 1] = 0.0
+                out[mask, 2] = 0.5
+                continue
+            out[mask, 0] = float(np.mean(sl))
+            out[mask, 1] = float(np.std(sl))
+            order = np.argsort(np.argsort(sl))
+            denom = max(len(sl) - 1, 1)
+            out[mask, 2] = (order.astype(np.float64) / denom).astype(np.float32)
+        return out
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import xgboost as xgb
+
+        if pnl_train is None or pnl_val is None:
+            raise ValueError(
+                f'{self.name} requires pnl_train and pnl_val.')
+        if dates_train is None or dates_val is None:
+            raise ValueError(
+                f'{self.name} requires dates_train and dates_val for '
+                'regime aggregates.')
+
+        y_tr = (np.asarray(pnl_train, dtype=np.float64) > 0.0).astype(np.int32)
+        y_va = (np.asarray(pnl_val, dtype=np.float64) > 0.0).astype(np.int32)
+        if len(set(y_tr)) < 2 or len(set(y_va)) < 2:
+            raise ValueError('Train or val set has only one class — fit aborted')
+
+        Xt = np.asarray(X_train, dtype=np.float32)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        self._n_features = Xt.shape[1]
+        p = self._params
+
+        dates_arr = np.asarray(dates_train)
+        unique_dates = np.sort(np.unique(dates_arr))
+        cutoff_idx = int(float(p['stage1_train_frac']) * len(unique_dates))
+        cutoff_idx = max(1, min(cutoff_idx, len(unique_dates) - 1))
+        late_cutoff = unique_dates[cutoff_idx]
+        early_mask = dates_arr < late_cutoff
+        late_mask = ~early_mask
+
+        if early_mask.sum() < 50 or late_mask.sum() < 50:
+            rng = np.random.RandomState(int(p['random_state']))
+            shuffle = rng.permutation(len(Xt))
+            half = len(Xt) // 2
+            early_mask = np.zeros(len(Xt), dtype=bool)
+            late_mask = np.zeros(len(Xt), dtype=bool)
+            early_mask[shuffle[:half]] = True
+            late_mask[shuffle[half:]] = True
+
+        if len(set(y_tr[early_mask].tolist())) < 2 or \
+           len(set(y_tr[late_mask].tolist())) < 2:
+            raise ValueError(
+                f'{self.name}: degenerate class distribution after time-split.')
+
+        stage1_first_dtrain = xgb.DMatrix(
+            Xt[early_mask], label=y_tr[early_mask].astype(np.float32))
+        stage1_first_dval = xgb.DMatrix(
+            Xt[late_mask], label=y_tr[late_mask].astype(np.float32))
+        stage1_first_booster = xgb.train(
+            params=self._xgb_params('stage1'),
+            dtrain=stage1_first_dtrain,
+            num_boost_round=int(p['stage1_n_estimators']),
+            evals=[(stage1_first_dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._stage1_first_iter = int(
+            getattr(stage1_first_booster, 'best_iteration', 0))
+
+        stage1_oof_late = stage1_first_booster.predict(stage1_first_dval)
+        stage1_pred_val = stage1_first_booster.predict(xgb.DMatrix(Xv))
+
+        try:
+            from sklearn.metrics import roc_auc_score
+            self._stage1_oof_auc = float(
+                roc_auc_score(y_tr[late_mask], stage1_oof_late))
+        except Exception:
+            self._stage1_oof_auc = None
+
+        # NEW: per-date regime aggregates of stage 1 predictions.
+        late_dates = dates_arr[late_mask]
+        regime_tr = self._compute_day_regime_features(
+            stage1_oof_late, late_dates)
+        regime_val = self._compute_day_regime_features(
+            stage1_pred_val, np.asarray(dates_val))
+
+        X_stage2_tr = np.column_stack([
+            Xt[late_mask],
+            stage1_oof_late.astype(np.float32).reshape(-1, 1),
+            regime_tr,
+        ]).astype(np.float32)
+        X_stage2_val = np.column_stack([
+            Xv,
+            stage1_pred_val.astype(np.float32).reshape(-1, 1),
+            regime_val,
+        ]).astype(np.float32)
+
+        stage2_dtrain = xgb.DMatrix(
+            X_stage2_tr, label=y_tr[late_mask].astype(np.float32))
+        stage2_dval = xgb.DMatrix(
+            X_stage2_val, label=y_va.astype(np.float32))
+        self.stage2 = xgb.train(
+            params=self._xgb_params('stage2'),
+            dtrain=stage2_dtrain,
+            num_boost_round=int(p['stage2_n_estimators']),
+            evals=[(stage2_dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        self._best_iteration = int(getattr(self.stage2, 'best_iteration', 0))
+        try:
+            from sklearn.metrics import roc_auc_score
+            self._stage2_val_auc = float(roc_auc_score(
+                y_va, self.stage2.predict(stage2_dval)))
+        except Exception:
+            self._stage2_val_auc = None
+
+        stage1_final_dtrain = xgb.DMatrix(Xt, label=y_tr.astype(np.float32))
+        stage1_final_dval = xgb.DMatrix(Xv, label=y_va.astype(np.float32))
+        self.stage1_final = xgb.train(
+            params=self._xgb_params('stage1'),
+            dtrain=stage1_final_dtrain,
+            num_boost_round=int(p['stage1_n_estimators']),
+            evals=[(stage1_final_dval, 'val')],
+            early_stopping_rounds=int(p['early_stopping_rounds']),
+            verbose_eval=verbose,
+        )
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import xgboost as xgb
+        if self.stage1_final is None or self.stage2 is None:
+            raise RuntimeError('Model not fit')
+        X_arr = np.asarray(X, dtype=np.float32)
+        stage1_pred = self.stage1_final.predict(xgb.DMatrix(X_arr))
+        regime = self._compute_day_regime_features(
+            stage1_pred, self._predict_dates)
+        X_meta = np.column_stack([
+            X_arr,
+            stage1_pred.astype(np.float32).reshape(-1, 1),
+            regime,
+        ]).astype(np.float32)
+        return self.stage2.predict(xgb.DMatrix(X_meta))
+
+
+# --------------------------------------------------------------------- #
 # MC-Dropout Feature Mask Classifier — predict-time uncertainty via random
 # feature masking. Inherits strict-win training (y = pnl > 0); overrides
 # predict_proba to run K stochastic passes, masking drop_rate fraction of
@@ -8869,7 +9070,25 @@ class XGBoostIsotonicCalibratedTrainer(BaseTrainer):
 #         calibrated proba (no saturation pathology).
 # --------------------------------------------------------------------- #
 class KernelLogRegTrainer(BaseTrainer):
-    """RBF-kernel logistic regression via Nyström approximation."""
+    """RBF-kernel logistic regression via Nyström approximation.
+
+    iter-#1300 (claude_mode, brief-exhausted pivot from torch_patchtst):
+    optional cross-validated isotonic / sigmoid calibration on top of the
+    Nyström+LR pipeline. PatchTST iter #1298/#1299 failed structurally on
+    transition windows W2-W4 (WR 14-19%, FP flood) because the patch
+    transformer assigned high probabilities to mixed-regime samples that
+    turned out to be losers — i.e., it was *over-confident* in unfamiliar
+    regimes. Isotonic calibration via CalibratedClassifierCV is the textbook
+    fix: it learns a monotone, piecewise-constant remap from raw
+    probabilities to empirical positive rates on held-out folds, which
+    pulls extreme high-confidence predictions back toward the base rate
+    in regions where the raw model was systematically overconfident. This
+    directly attacks the transition-window FP problem without touching
+    features or labels, and is structurally novel for the registry
+    (`kernel_logreg` uses raw LR; `xgb_iso_calibrated` calibrates an XGB,
+    not a kernel map; none combine kernel features with isotonic
+    calibration).
+    """
 
     name = 'kernel_logreg'
 
@@ -8880,6 +9099,8 @@ class KernelLogRegTrainer(BaseTrainer):
                  max_iter: int = 200,
                  pca_components: int = 0,
                  class_weight: str = 'balanced',
+                 calibrate: str = 'none',   # 'none' | 'isotonic' | 'sigmoid'
+                 calibrate_cv: int = 3,
                  random_state: int = 42,
                  **_):
         self._params = dict(
@@ -8889,6 +9110,8 @@ class KernelLogRegTrainer(BaseTrainer):
             max_iter=int(max_iter),
             pca_components=int(pca_components),
             class_weight=str(class_weight),
+            calibrate=str(calibrate),
+            calibrate_cv=int(calibrate_cv),
             random_state=int(random_state),
         )
         self.pipe = None
@@ -8897,6 +9120,7 @@ class KernelLogRegTrainer(BaseTrainer):
     def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
             pnl_train=None, pnl_val=None,
             dates_train=None, dates_val=None):
+        from sklearn.calibration import CalibratedClassifierCV
         from sklearn.decomposition import PCA
         from sklearn.kernel_approximation import Nystroem
         from sklearn.linear_model import LogisticRegression
@@ -8932,13 +9156,31 @@ class KernelLogRegTrainer(BaseTrainer):
             n_components=ncomp,
             random_state=p['random_state'],
         )))
-        steps.append(('clf', LogisticRegression(
+
+        base_clf = LogisticRegression(
             C=p['C'],
             solver='lbfgs',
             max_iter=p['max_iter'],
             class_weight=cw,
             random_state=p['random_state'],
-        )))
+        )
+
+        if p['calibrate'] in ('isotonic', 'sigmoid'):
+            # Wrap the LR head in CalibratedClassifierCV. cv folds re-fit
+            # the LR on each train fold and learn the isotonic/sigmoid
+            # remap on the held-out fold; final predict_proba averages
+            # the cv calibrated estimators. The Nyström features must be
+            # computed BEFORE the cv split so all folds share the same
+            # landmarks — hence we wrap only the LR head, not the whole
+            # pipeline.
+            clf = CalibratedClassifierCV(
+                base_clf,
+                method=p['calibrate'],
+                cv=max(2, p['calibrate_cv']),
+            )
+        else:
+            clf = base_clf
+        steps.append(('clf', clf))
         self.pipe = Pipeline(steps)
         self.pipe.fit(X_full, y_full)
         return self
@@ -11870,6 +12112,7 @@ TRAINERS = {
     'xgb_topk_classifier': XGBoostTopKClassifierTrainer,
     'xgb_adv_val': XGBoostAdversarialValidationTrainer,
     'xgb_meta_label': XGBoostMetaLabelingTrainer,
+    'xgb_meta_label_regime': XGBoostMetaLabelingRegimeTrainer,
     'xgb_mcdropout_classifier': XGBoostMCDropoutClassifierTrainer,
     'xgb_rank_fusion': XGBoostRankFusionTrainer,
     'xgb_regime_blend': XGBoostRegimeBlendTrainer,

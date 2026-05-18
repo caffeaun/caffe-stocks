@@ -338,9 +338,11 @@ def evaluate_window(X_tab, y, dates, symbols, pnl, hold_days, agg_features,
     trainer.fit(X_tr, y_tr, X_val, y_val, verbose=verbose,
                 pnl_train=pnl_tr, pnl_val=pnl_val,
                 dates_train=dates_tr, dates_val=dates_va)
+    test_dates = dates[test_mask]
+    if hasattr(trainer, 'set_predict_context'):
+        trainer.set_predict_context(test_dates)
     test_scores = trainer.predict_proba(X_test_scaled)
 
-    test_dates = dates[test_mask]
     test_symbols = symbols[test_mask]
     test_pnl = pnl[test_mask]
     test_hold = hold_days[test_mask]
@@ -419,6 +421,10 @@ def main():
     parser.add_argument('--huber-slope', type=float, default=1.0,
                         help='Pseudo-Huber slope for huber regressors (ignored otherwise).')
     parser.add_argument('--early-stopping-rounds', type=int, default=30)
+    parser.add_argument('--calibrate', type=str, default='none',
+                        choices=['none', 'isotonic', 'sigmoid'],
+                        help='Optional probability calibration via CalibratedClassifierCV. '
+                             'Currently honored by kernel_logreg trainer; ignored otherwise.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output', help='Path to write JSON results')
     parser.add_argument('--verbose', action='store_true')
@@ -450,6 +456,7 @@ def main():
         recency_decay=args.recency_decay,
         huber_slope=args.huber_slope,
         early_stopping_rounds=args.early_stopping_rounds,
+        calibrate=args.calibrate,
         random_state=args.seed,
     )
     print(f'Trainer: {args.model_type}\n')

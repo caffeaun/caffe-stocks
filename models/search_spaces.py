@@ -635,6 +635,27 @@ SEARCH_SPACES: dict[str, dict] = {
         'stage2_reg_lambda':        (0.5, 2.0),
         'stage1_train_frac':        (0.40, 0.70),
     },
+    'xgb_meta_label_regime': {
+        'stage1_max_depth':         [3, 4, 6, 8],
+        'stage1_learning_rate':     (0.01, 0.10),
+        'stage1_n_estimators':      [200, 400, 800],
+        'stage1_min_child_weight':  [1, 5, 10, 20],
+        'stage1_gamma':             (0.0, 0.5),
+        'stage1_subsample':         (0.6, 1.0),
+        'stage1_colsample_bytree':  (0.5, 0.9),
+        'stage1_reg_alpha':         (0.0, 0.5),
+        'stage1_reg_lambda':        (0.5, 2.0),
+        'stage2_max_depth':         [2, 3, 4, 6],
+        'stage2_learning_rate':     (0.01, 0.10),
+        'stage2_n_estimators':      [200, 400, 800],
+        'stage2_min_child_weight':  [5, 10, 20, 40],
+        'stage2_gamma':             (0.0, 0.5),
+        'stage2_subsample':         (0.6, 1.0),
+        'stage2_colsample_bytree':  (0.5, 0.9),
+        'stage2_reg_alpha':         (0.0, 0.5),
+        'stage2_reg_lambda':        (0.5, 2.0),
+        'stage1_train_frac':        (0.40, 0.70),
+    },
     # MC-Dropout feature-mask classifier (xgb_mcdropout_classifier) — XGB tree
     # HP space mirrors xgb_strict_win (the parent class providing the y=pnl>0
     # alignment and per-row magnitude weighting). Three dropout-specific knobs:
@@ -1051,6 +1072,13 @@ SEARCH_SPACES: dict[str, dict] = {
         'C':                  [0.1, 0.5, 1.0, 3.0, 10.0],
         'pca_components':     [0, 16, 32, 64],
         'class_weight':       ['balanced', 'none'],
+        # iter #1300 — CV calibration. 'isotonic' = non-parametric monotone
+        # remap; 'sigmoid' = Platt scaling. iter #1300 default sweep showed
+        # isotonic boosts bear-regime W6 (ann +43% → +358%) and lifts W1/W5/
+        # W7 WR by 3-13pp, but regresses W3/W4 (calibration smooths
+        # discriminative signal in bull regimes). Keep 'none' in the grid so
+        # the historical 4/7 sweep peak (gamma=0.5, pca=32) remains reachable.
+        'calibrate':          ['none', 'isotonic', 'sigmoid'],
     },
     # Full-Bayesian Gaussian Process Classifier (iter #835). Knobs:
     #   n_inducing ∈ {300, 600, 1000} — subsample size for the exact kernel
