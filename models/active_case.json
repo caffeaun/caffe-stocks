@@ -1,12 +1,12 @@
 {
-  "trainer": "histgb_monotonic_bagged",
+  "trainer": "kernel_logreg",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Just added aggregation HP with 4 modes (median/mean/lcb/trimmed_lcb) and widened bag_frac/conf_lambda/n_bags ranges; the prior active_case xgb_meta_label_regime has produced 8 consecutive train-mode iterations with identical 4/7 +6.1% result (HP space saturated, see #1320-#1327). Hand the new aggregation \u00d7 bag_frac \u00d7 pos_class_weight \u00d7 n_bags hypercube to train mode to find the median/trimmed_lcb sweet spot that today's manual default could not.",
-  "claude_iter_id": 1328,
-  "designated_at": "2026-05-18T21:10:42"
+  "rationale": "kernel_logreg matched its 4/7 ceiling at iter #850's HPs in this claude run, beating the brief's torch_patchtst (1/7) and the recently-swept histgb_monotonic_bagged (best 2/7 across 15 train iters). The `calibrate` HP added in iter #1300 ('none'/'isotonic'/'sigmoid') has never been swept \u2014 train mode should sweep calibrate \u00d7 {gamma, C} around the (300, 0.5, 3.0, 32, 'none') sweet spot to see if isotonic remap spreads the score distribution enough to make higher thresholds viable (currently all trades land at threshold=0.0).",
+  "claude_iter_id": 1344,
+  "designated_at": "2026-05-19T00:09:34"
 }
