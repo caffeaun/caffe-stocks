@@ -24,7 +24,7 @@ set -uo pipefail
 unset CLAUDECODE 2>/dev/null || true
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 {train|claude|research|panel|status} [args...]" >&2
+    echo "Usage: $0 {train|claude|research|panel|status|leaderboard} [args...]" >&2
     exit 1
 fi
 MODE="$1"
@@ -75,8 +75,12 @@ case "$MODE" in
         "$PY" scripts/feedback.py
         ;;
 
+    leaderboard)
+        "$PY" scripts/leaderboard.py "$@"
+        ;;
+
     *)
-        echo "Usage: $0 {train|claude|research|panel|status} [args...]" >&2
+        echo "Usage: $0 {train|claude|research|panel|status|leaderboard} [args...]" >&2
         exit 1
         ;;
 esac
