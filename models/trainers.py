@@ -12427,17 +12427,20 @@ class TorchChronos2EmbedTrainer(BaseTrainer):
             batch = univariate[i:i + self.batch_size]
             tensors = [torch.from_numpy(row) for row in batch]
             with torch.no_grad():
-                emb = self.pipeline_.embed(tensors)
-            # embed() returns either a tensor (N, T, D) or list — normalize.
-            if isinstance(emb, (list, tuple)):
-                arr = np.stack([self._pool(e) for e in emb], axis=0)
+                result = self.pipeline_.embed(tensors, batch_size=self.batch_size)
+            # Chronos-2 v2.2.x: returns (list[Tensor(1,T,D)], list[aux]).
+            if isinstance(result, tuple) and len(result) == 2:
+                embs_list = result[0]
             else:
-                arr = np.stack([self._pool(emb[k]) for k in range(emb.shape[0])], axis=0)
+                embs_list = result
+            arr = np.stack([self._pool(e) for e in embs_list], axis=0)
             outs.append(arr)
         return np.concatenate(outs, axis=0).astype(np.float32)
 
     def _pool(self, e):
         e = e.detach().cpu().numpy() if hasattr(e, 'detach') else np.asarray(e)
+        if e.ndim == 3 and e.shape[0] == 1:
+            e = e[0]
         if e.ndim == 1:
             return e
         if self.embedding_pool == 'mean':
@@ -12448,35 +12451,43 @@ class TorchChronos2EmbedTrainer(BaseTrainer):
             return e.max(axis=0)
         return e.mean(axis=0)
 
-    def _build_features(self, X, seq):
+    def _build_features(self, seq):
+        # seq: (N, L, F). Embed channel-0 univariate, optionally concat
+        # aggregated tabular (last/mean/std/dev across the L window) of all F.
+        seq = np.asarray(seq, dtype=np.float32)
         uni = self._extract_channel(seq)
         emb = self._embed(uni)
-        if self.concat_tabular and X is not None:
-            X = np.asarray(X, dtype=np.float32)
-            return np.concatenate([emb, X], axis=1)
+        if self.concat_tabular:
+            last = seq[:, -1, :]
+            mean = seq.mean(axis=1)
+            std = seq.std(axis=1)
+            tab = np.concatenate([last, mean, std, last - mean], axis=1)
+            tab = np.nan_to_num(tab, nan=0.0, posinf=0.0, neginf=0.0)
+            return np.concatenate([emb, tab], axis=1)
         return emb
 
-    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
-        seq_tr = kwargs.get('seq_tr')
-        seq_val = kwargs.get('seq_val')
-        if seq_tr is None:
-            raise ValueError("torch_chronos2 requires kwargs['seq_tr']; "
-                             "ensure consumes_sequences=True is wired in the runner")
-        Z_tr = self._build_features(X_tr, seq_tr)
+    def fit(self, X_train, y_train, X_val, y_val, **kwargs):
+        if not hasattr(X_train, 'ndim') or X_train.ndim != 3:
+            raise ValueError(
+                f'torch_chronos2 expects 3D sequence input (N, L, F); got '
+                f'shape {getattr(X_train, "shape", None)}. '
+                f'consumes_sequences=True must thread X_seq.')
+        Z_tr = self._build_features(X_train)
         self.scaler_ = StandardScaler().fit(Z_tr)
         Z_tr_s = self.scaler_.transform(Z_tr)
         self.emb_dim_ = Z_tr_s.shape[1]
         self.head_ = LogisticRegression(
             C=self.head_C, max_iter=self.head_max_iter, solver='lbfgs', n_jobs=1,
         )
-        self.head_.fit(Z_tr_s, np.asarray(y_tr).astype(int))
+        self.head_.fit(Z_tr_s, np.asarray(y_train).astype(int))
         return self
 
     def predict_proba(self, X, **kwargs) -> np.ndarray:
-        seq = kwargs.get('seq')
-        if seq is None:
-            raise ValueError("torch_chronos2.predict_proba requires kwargs['seq']")
-        Z = self._build_features(X, seq)
+        if not hasattr(X, 'ndim') or X.ndim != 3:
+            raise ValueError(
+                f'torch_chronos2.predict_proba expects 3D sequence input; got '
+                f'shape {getattr(X, "shape", None)}.')
+        Z = self._build_features(X)
         Z_s = self.scaler_.transform(Z)
         return self.head_.predict_proba(Z_s)[:, 1].astype(np.float32)
 

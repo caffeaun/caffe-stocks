@@ -1,12 +1,12 @@
 {
-  "trainer": "kernel_logreg",
+  "trainer": "torch_chronos2",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "kernel_logreg's 4/7 ceiling at iter #1344 (n_components=300, gamma=0.5, C=3.0, pca=32) remains the live frontier; per memory the `calibrate` HP is unswept \u2014 train mode should sample calibrate \u2208 [None, 'sigmoid', 'isotonic'] to attack the W7 1.5pp-WR-shy gap and probe whether platt/isotonic calibration helps W3/W5",
-  "claude_iter_id": 1466,
-  "designated_at": "2026-05-20T00:23:49"
+  "rationale": "First TSFM-embedding trainer; default HPs already hit avg_ann +15.5% with W2 +100% and W6 +115% ann \u2014 signal is real but the LR head over-trades W1/W3. Train-mode should sweep head_C (regularization tightness) and embedding_pool to lift WR above 40% on W4/W5/W7 which are sub-margin misses.",
+  "claude_iter_id": 1497,
+  "designated_at": "2026-05-20T06:16:50"
 }
