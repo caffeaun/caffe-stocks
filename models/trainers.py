@@ -12170,11 +12170,13 @@ class TabICLv2Trainer(BaseTrainer):
                  feat_shuffle_method: str = 'latin',
                  class_shuffle_method: str = 'shift',
                  outlier_threshold: float = 4.0,
-                 batch_size: int = 4,
+                 batch_size: int = 1,
                  use_amp: bool = True,
-                 kv_cache: bool = False,
-                 max_train_rows: int = 20000,
-                 offload_mode: str = 'auto',
+                 use_fa3: bool = False,
+                 kv_cache=False,
+                 max_train_rows: int = 15000,
+                 test_chunk_size: int = 2000,
+                 offload_mode: str = 'cpu',
                  device: str = 'auto',
                  checkpoint_version: str = 'tabicl-classifier-v2-20260212.ckpt',
                  random_state: int = 42,
@@ -12193,8 +12195,12 @@ class TabICLv2Trainer(BaseTrainer):
         self.outlier_threshold = float(outlier_threshold)
         self.batch_size = int(batch_size)
         self.use_amp = bool(use_amp)
-        self.kv_cache = bool(kv_cache)
+        self.use_fa3 = bool(use_fa3)
+        # kv_cache accepts bool or str ('repr' = memory-efficient cache, True/'kv' = full).
+        # 'repr' uses ~24x less GPU memory than 'kv' so it fits beside ollama on a 12 GB card.
+        self.kv_cache = kv_cache
         self.max_train_rows = int(max_train_rows)
+        self.test_chunk_size = int(test_chunk_size)
         self.offload_mode = str(offload_mode)
         self.requested_device = str(device)
         self.checkpoint_version = str(checkpoint_version)
@@ -12203,7 +12209,6 @@ class TabICLv2Trainer(BaseTrainer):
         self._X_train = None
         self._y_train = None
         self._device = None
-        # Reduce GPU fragmentation when sharing the device with other tenants.
         os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
     def _sanitize(self, X):
@@ -12251,6 +12256,7 @@ class TabICLv2Trainer(BaseTrainer):
             outlier_threshold=self.outlier_threshold,
             batch_size=self.batch_size,
             use_amp=self.use_amp,
+            use_fa3=self.use_fa3,
             kv_cache=self.kv_cache,
             offload_mode=self.offload_mode,
             checkpoint_version=self.checkpoint_version,
@@ -12269,7 +12275,21 @@ class TabICLv2Trainer(BaseTrainer):
         X = self._sanitize(X)
         if _HAS_TORCH and self._device == 'cuda':
             torch.cuda.empty_cache()
-        proba = self._model.predict_proba(X)
+        n = X.shape[0]
+        chunk = self.test_chunk_size
+        # Chunked test-set inference: reuses the KV cache built in fit() across
+        # mini-batches so wall-time scales linearly with test size and peak VRAM
+        # stays bounded by chunk × cache-size. test_chunk_size=0 disables chunking.
+        if chunk > 0 and n > chunk:
+            parts = []
+            for i in range(0, n, chunk):
+                part = self._model.predict_proba(X[i:i + chunk])
+                parts.append(np.asarray(part, dtype=np.float32))
+                if _HAS_TORCH and self._device == 'cuda':
+                    torch.cuda.empty_cache()
+            proba = np.concatenate(parts, axis=0)
+        else:
+            proba = self._model.predict_proba(X)
         if _HAS_TORCH and self._device == 'cuda':
             torch.cuda.empty_cache()
         proba = np.asarray(proba, dtype=np.float32)
@@ -12323,8 +12343,11 @@ class TabICLv2Trainer(BaseTrainer):
             'outlier_threshold': self.outlier_threshold,
             'batch_size': self.batch_size,
             'use_amp': self.use_amp,
+            'use_fa3': self.use_fa3,
             'kv_cache': self.kv_cache,
             'max_train_rows': self.max_train_rows,
+            'test_chunk_size': self.test_chunk_size,
+            'offload_mode': self.offload_mode,
             'checkpoint_version': self.checkpoint_version,
         }
 

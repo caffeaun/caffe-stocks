@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "tabicl_v2 inference throughput on the 12-GB RTX 5070 cannot complete a single walk-forward window inside the 5-10 min train-mode budget, let alone the 7-window gate; keeping it as the active case would starve train mode. Revert to kernel_logreg (iter #1344's 4/7 ceiling at n_components=300, gamma=0.5, C=3.0, pca=32) so train mode can continue sweeping the unswept `calibrate` HP and softmax-temperature grid around that operating point.",
-  "claude_iter_id": 1435,
-  "designated_at": "2026-05-19T18:17:22"
+  "rationale": "kernel_logreg's 4/7 ceiling at iter #1344 (n_components=300, gamma=0.5, C=3.0, pca=32) remains the live frontier; per memory the `calibrate` HP is unswept \u2014 train mode should sample calibrate \u2208 [None, 'sigmoid', 'isotonic'] to attack the W7 1.5pp-WR-shy gap and probe whether platt/isotonic calibration helps W3/W5",
+  "claude_iter_id": 1466,
+  "designated_at": "2026-05-20T00:23:49"
 }

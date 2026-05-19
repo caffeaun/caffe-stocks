@@ -1308,13 +1308,15 @@ SEARCH_SPACES: dict[str, dict] = {
 },
     # models/search_spaces.py — entry to add to SEARCH_SPACES dict
 'tabicl_v2': {
-    'n_estimators':         [1, 2, 4],
+    'n_estimators':         [1, 2],
     'softmax_temperature':  (0.5, 1.5),
     'average_logits':       [True, False],
     'norm_methods':         ['none', 'standard', 'robust'],
     'outlier_threshold':    (2.0, 6.0),
-    'batch_size':           [4, 8, 16],
-    'max_train_rows':       [20000, 40000, 60000, 100000],
+    'batch_size':           [1, 2],
+    'max_train_rows':       [8000, 12000, 15000],
+    'test_chunk_size':      [1000, 2000, 4000],
+    'offload_mode':         ['cpu', 'auto'],
 },
 }
 
