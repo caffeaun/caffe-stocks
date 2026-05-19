@@ -12167,13 +12167,15 @@ class TabICLv2Trainer(BaseTrainer):
                  softmax_temperature: float = 0.9,
                  average_logits: bool = True,
                  norm_methods: str = 'none',
-                 feat_shuffle_method: str = 'shuffle',
-                 class_shuffle_method: str = 'shuffle',
+                 feat_shuffle_method: str = 'latin',
+                 class_shuffle_method: str = 'shift',
                  outlier_threshold: float = 4.0,
-                 batch_size: int = 8,
+                 batch_size: int = 4,
                  use_amp: bool = True,
-                 kv_cache: bool = True,
-                 max_train_rows: int = 60000,
+                 kv_cache: bool = False,
+                 max_train_rows: int = 20000,
+                 offload_mode: str = 'auto',
+                 device: str = 'auto',
                  checkpoint_version: str = 'tabicl-classifier-v2-20260212.ckpt',
                  random_state: int = 42,
                  **_):
@@ -12193,12 +12195,16 @@ class TabICLv2Trainer(BaseTrainer):
         self.use_amp = bool(use_amp)
         self.kv_cache = bool(kv_cache)
         self.max_train_rows = int(max_train_rows)
+        self.offload_mode = str(offload_mode)
+        self.requested_device = str(device)
         self.checkpoint_version = str(checkpoint_version)
         self.random_state = int(random_state)
         self._model = None
         self._X_train = None
         self._y_train = None
         self._device = None
+        # Reduce GPU fragmentation when sharing the device with other tenants.
+        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
     def _sanitize(self, X):
         X = np.asarray(X, dtype=np.float32)
@@ -12221,10 +12227,20 @@ class TabICLv2Trainer(BaseTrainer):
         return X[idx], y[idx]
 
     def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        import gc
         X_tr = self._sanitize(X_tr)
         y_tr = np.asarray(y_tr).astype(np.int64).ravel()
         X_tr, y_tr = self._stratified_subsample(X_tr, y_tr)
-        self._device = 'cuda' if (_HAS_TORCH and torch.cuda.is_available()) else 'cpu'
+        if self.requested_device == 'cpu':
+            self._device = 'cpu'
+        elif self.requested_device == 'cuda':
+            self._device = 'cuda'
+        else:
+            self._device = 'cuda' if (_HAS_TORCH and torch.cuda.is_available()) else 'cpu'
+        gc.collect()
+        if _HAS_TORCH and self._device == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         self._model = TabICLClassifier(
             n_estimators=self.n_estimators,
             softmax_temperature=self.softmax_temperature,
@@ -12236,6 +12252,7 @@ class TabICLv2Trainer(BaseTrainer):
             batch_size=self.batch_size,
             use_amp=self.use_amp,
             kv_cache=self.kv_cache,
+            offload_mode=self.offload_mode,
             checkpoint_version=self.checkpoint_version,
             device=self._device,
             random_state=self.random_state,
@@ -12250,13 +12267,11 @@ class TabICLv2Trainer(BaseTrainer):
         if self._model is None:
             raise RuntimeError("TabICLv2Trainer: predict_proba called before fit()")
         X = self._sanitize(X)
-        if hasattr(self._model, 'predict_proba'):
-            proba = self._model.predict_proba(X)
-        else:
-            # fallback: derive proba via sklearn-compatible decision path
-            from sklearn.utils.validation import check_is_fitted
-            check_is_fitted(self._model)
-            proba = self._model.predict_proba(X)
+        if _HAS_TORCH and self._device == 'cuda':
+            torch.cuda.empty_cache()
+        proba = self._model.predict_proba(X)
+        if _HAS_TORCH and self._device == 'cuda':
+            torch.cuda.empty_cache()
         proba = np.asarray(proba, dtype=np.float32)
         if proba.ndim == 2 and proba.shape[1] >= 2:
             return proba[:, 1].astype(np.float32)
