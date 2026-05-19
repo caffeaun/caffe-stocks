@@ -12352,6 +12352,155 @@ class TabICLv2Trainer(BaseTrainer):
         }
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+
+class TorchChronos2EmbedTrainer(BaseTrainer):
+    """Frozen Chronos-2 encoder → mean-pooled embedding → linear head.
+
+    Consumes the existing L=20 close-price sequence (univariate).
+    Embeddings are computed once per fit() call in batches, optionally
+    concatenated with the tabular X, then a LogisticRegression head is
+    fit on (embedding [+ X]) -> y. Encoder is never updated.
+    """
+
+    name = 'torch_chronos2'
+    consumes_sequences = True
+
+    def __init__(
+        self,
+        chronos_model: str = 'amazon/chronos-2',
+        seq_channel: str = 'close',
+        embedding_pool: str = 'mean',
+        concat_tabular: bool = True,
+        head_C: float = 1.0,
+        head_max_iter: int = 2000,
+        batch_size: int = 256,
+        device: str = None,
+        local_weights_dir: str = 'models/checkpoints/chronos2',
+        **kwargs,
+    ):
+        self.chronos_model = chronos_model
+        self.seq_channel = seq_channel
+        self.embedding_pool = embedding_pool
+        self.concat_tabular = concat_tabular
+        self.head_C = head_C
+        self.head_max_iter = head_max_iter
+        self.batch_size = batch_size
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.local_weights_dir = local_weights_dir
+        self.pipeline_ = None
+        self.scaler_ = None
+        self.head_ = None
+        self.emb_dim_ = None
+
+    def _load_pipeline(self):
+        if self.pipeline_ is not None:
+            return
+        from chronos import Chronos2Pipeline
+        src = self.local_weights_dir if os.path.isdir(self.local_weights_dir) else self.chronos_model
+        self.pipeline_ = Chronos2Pipeline.from_pretrained(src, device_map=self.device)
+
+    def _extract_channel(self, seq: np.ndarray) -> np.ndarray:
+        # seq: (N, L, F) — pick the channel matching self.seq_channel.
+        # Convention: channel 0 = close (claude_mode wires the actual mapping
+        # via sequence_loader.SEQUENCE_FEATURE_COLUMNS). Fallback: column 0.
+        if seq.ndim == 3:
+            return seq[:, :, 0].astype(np.float32)
+        if seq.ndim == 2:
+            return seq.astype(np.float32)
+        raise ValueError(f"sequence ndim must be 2 or 3, got {seq.ndim}")
+
+    def _embed(self, univariate: np.ndarray) -> np.ndarray:
+        # univariate: (N, L) — returns (N, D).
+        self._load_pipeline()
+        outs = []
+        N = univariate.shape[0]
+        for i in range(0, N, self.batch_size):
+            batch = univariate[i:i + self.batch_size]
+            tensors = [torch.from_numpy(row) for row in batch]
+            with torch.no_grad():
+                emb = self.pipeline_.embed(tensors)
+            # embed() returns either a tensor (N, T, D) or list — normalize.
+            if isinstance(emb, (list, tuple)):
+                arr = np.stack([self._pool(e) for e in emb], axis=0)
+            else:
+                arr = np.stack([self._pool(emb[k]) for k in range(emb.shape[0])], axis=0)
+            outs.append(arr)
+        return np.concatenate(outs, axis=0).astype(np.float32)
+
+    def _pool(self, e):
+        e = e.detach().cpu().numpy() if hasattr(e, 'detach') else np.asarray(e)
+        if e.ndim == 1:
+            return e
+        if self.embedding_pool == 'mean':
+            return e.mean(axis=0)
+        if self.embedding_pool == 'last':
+            return e[-1]
+        if self.embedding_pool == 'max':
+            return e.max(axis=0)
+        return e.mean(axis=0)
+
+    def _build_features(self, X, seq):
+        uni = self._extract_channel(seq)
+        emb = self._embed(uni)
+        if self.concat_tabular and X is not None:
+            X = np.asarray(X, dtype=np.float32)
+            return np.concatenate([emb, X], axis=1)
+        return emb
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        seq_tr = kwargs.get('seq_tr')
+        seq_val = kwargs.get('seq_val')
+        if seq_tr is None:
+            raise ValueError("torch_chronos2 requires kwargs['seq_tr']; "
+                             "ensure consumes_sequences=True is wired in the runner")
+        Z_tr = self._build_features(X_tr, seq_tr)
+        self.scaler_ = StandardScaler().fit(Z_tr)
+        Z_tr_s = self.scaler_.transform(Z_tr)
+        self.emb_dim_ = Z_tr_s.shape[1]
+        self.head_ = LogisticRegression(
+            C=self.head_C, max_iter=self.head_max_iter, solver='lbfgs', n_jobs=1,
+        )
+        self.head_.fit(Z_tr_s, np.asarray(y_tr).astype(int))
+        return self
+
+    def predict_proba(self, X, **kwargs) -> np.ndarray:
+        seq = kwargs.get('seq')
+        if seq is None:
+            raise ValueError("torch_chronos2.predict_proba requires kwargs['seq']")
+        Z = self._build_features(X, seq)
+        Z_s = self.scaler_.transform(Z)
+        return self.head_.predict_proba(Z_s)[:, 1].astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        import joblib
+        joblib.dump(self.head_, os.path.join(model_dir, 'head.joblib'))
+        joblib.dump(self.scaler_, os.path.join(model_dir, 'scaler.joblib'))
+        meta = {
+            'name': self.name,
+            'chronos_model': self.chronos_model,
+            'seq_channel': self.seq_channel,
+            'embedding_pool': self.embedding_pool,
+            'concat_tabular': self.concat_tabular,
+            'head_C': self.head_C,
+            'batch_size': self.batch_size,
+            'emb_dim': self.emb_dim_,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -12410,6 +12559,7 @@ TRAINERS = {
     'torch_mamba': TorchMambaTrainer,
     'torch_patchtst': TorchPatchTSTTrainer,
     'tabicl_v2': TabICLv2Trainer,
+    'torch_chronos2': TorchChronos2EmbedTrainer,
 }
 
 

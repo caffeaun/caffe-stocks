@@ -1318,6 +1318,14 @@ SEARCH_SPACES: dict[str, dict] = {
     'test_chunk_size':      [1000, 2000, 4000],
     'offload_mode':         ['cpu', 'auto'],
 },
+    'torch_chronos2': {
+    'seq_channel':     ['close', 'log_ret', 'zscore_close'],
+    'embedding_pool':  ['mean', 'last', 'max'],
+    'concat_tabular':  [True, False],
+    'head_C':          (0.01, 10.0),
+    'head_max_iter':   [1000, 2000],
+    'batch_size':      [128, 256, 512],
+},
 }
 
 
