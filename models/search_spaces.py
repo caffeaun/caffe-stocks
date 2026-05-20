@@ -716,6 +716,13 @@ SEARCH_SPACES: dict[str, dict] = {
         'dro_strength':           (0.5, 2.0),
         'pass1_estimators_frac':  (0.3, 0.7),
         'weight_smoothing':       (0.05, 0.30),
+        # Hard abstention floor on per-base rank quantile (iter #1499).
+        # 0.0 = legacy fusion (matches the historical 6/7 config at iter 661).
+        # 0.3 = the new bear-regime breakthrough setting — unlocked W5
+        # (0/20 across the prior 20 iters → +35.6% ann, 40.9% WR) at the cost
+        # of trade-count in benign W7 windows. Sweep should explore whether
+        # 0.15–0.25 retains the W5 unlock without starving W1/W7.
+        'abstain_min_q':          (0.0, 0.35),
     },
     # Regime-blend classifier (xgb_regime_blend). Two parallel strict-win
     # XGB heads — generalist on FULL train + bear-specialist on the lower-
@@ -1325,6 +1332,27 @@ SEARCH_SPACES: dict[str, dict] = {
     'head_C':          (0.01, 10.0),
     'head_max_iter':   [1000, 2000],
     'batch_size':      [128, 256, 512],
+},
+# IsolationForest-gated HistGB. New family: anomaly-gated supervised
+# classification. IF knobs control OOD detection sensitivity;
+# gate_threshold / gating_alpha control how aggressively OOD rows are
+# damped before the threshold sweep. HistGB knobs inherit the iter #936
+# winning ranges to keep the base classifier identical to the proven
+# config — we want to isolate the gating mechanism's lift.
+'anomaly_gated_histgb': {
+    'if_n_estimators':    [100, 200, 400],
+    'if_max_samples':     (0.3, 0.9),
+    'if_contamination':   (0.02, 0.20),
+    'gate_threshold':     (0.05, 0.40),
+    'gating_alpha':       (0.5, 3.0),
+    'max_iter':           [200, 400, 800],
+    'max_leaf_nodes':     [15, 31, 63],
+    'learning_rate':      (0.01, 0.10),
+    'min_samples_leaf':   [20, 50, 100],
+    'l2_regularization':  (0.0, 3.0),
+    'pos_class_weight':   (1.5, 4.0),
+    'use_monotonic':      [True, False],
+    'random_state':       [42, 7, 1337],
 },
 }
 

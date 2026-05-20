@@ -5577,6 +5577,11 @@ class XGBoostRankFusionTrainer(BaseTrainer):
                  weight_smoothing: float = 0.1,
                  # Common
                  early_stopping_rounds: int = 30,
+                 # Hard abstention floor: rows where any base's within-batch
+                 # rank quantile < abstain_min_q have fused score zeroed (so
+                 # the threshold sweep excludes them). Default 0.0 = no
+                 # abstention (backward-compatible with iter 661's 6/7 config).
+                 abstain_min_q: float = 0.0,
                  random_state: int = 42):
         self._params = dict(
             max_depth=int(max_depth),
@@ -5596,6 +5601,7 @@ class XGBoostRankFusionTrainer(BaseTrainer):
             pass1_estimators_frac=float(pass1_estimators_frac),
             weight_smoothing=float(weight_smoothing),
             early_stopping_rounds=int(early_stopping_rounds),
+            abstain_min_q=float(abstain_min_q),
             random_state=int(random_state),
         )
         self.classifier = None  # XGBoostStrictWinClassifierTrainer
@@ -5711,7 +5717,16 @@ class XGBoostRankFusionTrainer(BaseTrainer):
         q3 = self._quantile_rank(p3)
         # Geometric mean in log-space (numerically stable for n large).
         log_geo = (np.log(q1) + np.log(q2) + np.log(q3)) / 3.0
-        return np.exp(log_geo)
+        fused = np.exp(log_geo)
+        # Hard abstention: any base ranking the row below abstain_min_q
+        # collapses the fused score to zero so the threshold sweep skips it.
+        # This is stricter than the soft penalty geometric-mean already applies
+        # — it forbids trades where one base actively dissents.
+        amq = float(self._params.get('abstain_min_q', 0.0))
+        if amq > 0.0:
+            min_q = np.minimum(np.minimum(q1, q2), q3)
+            fused = np.where(min_q >= amq, fused, 0.0)
+        return fused
 
     @property
     def best_iteration(self):
@@ -12512,6 +12527,241 @@ class TorchChronos2EmbedTrainer(BaseTrainer):
             json.dump(meta, f, indent=2)
 
 
+# --------------------------------------------------------------------- #
+# AnomalyGatedHistGBTrainer (iter #1499 claude_mode, brief-exhausted pivot)
+#
+# Brief said torch_chronos2 is exhausted (2 attempts, best wp=1/7). Part A
+# of this iter confirms W5 is a 0/21 wall across the last 21 iterations and
+# W3/W4 fail in 20/21 and 16/21 respectively; W5 is the deep-bear regime
+# (SET -15.1% / 19% vol / 31% breadth). Every model family — XGB-loss
+# variants, transformer-from-scratch, foundation-model encoders — converges
+# on the same failure mode: ~30 trades in W5 at ~25% WR with ~25% DD. The
+# structural shared cause is distribution shift: bull-heavy training data
+# does not contain enough W5-like deep-bear feature patterns, so all
+# trainers learn over-confident classifiers that fire too often on test
+# data that looks unlike training.
+#
+# Family in scope: anomaly-gated supervised classification — not present in
+# the current registry. IsolationForest fit on training X learns the typical
+# training-feature regime. At inference, samples that fall in the low
+# quantile of IF score (relative to training) are flagged as OOD and have
+# their classifier proba damped toward 0. This produces a natural,
+# data-driven abstention behaviour without changing the underlying label
+# definition (preserves the gate's contract).
+#
+# Base classifier reuses HistGBMonotonicTrainer's monotonic constraint set
+# (iter #936's 4/7 winning architecture). This concentrates the novelty on
+# the gating mechanism rather than the supervised loss surface.
+# --------------------------------------------------------------------- #
+class AnomalyGatedHistGBTrainer(BaseTrainer):
+    """IsolationForest-gated HistGB classifier for OOD abstention on bear windows."""
+
+    name = 'anomaly_gated_histgb'
+
+    def __init__(self,
+                 # IsolationForest knobs
+                 if_n_estimators: int = 200,
+                 if_max_samples: float = 0.5,
+                 if_contamination: float = 0.1,
+                 if_random_state: int = 42,
+                 # Gating: rows below `gate_threshold` quantile of training IF
+                 # scores get partial damping (linear ramp to 0 at the most-
+                 # anomalous training point). alpha controls damp aggression.
+                 gate_threshold: float = 0.2,
+                 gating_alpha: float = 1.0,
+                 # HistGB knobs (inherits iter #936 winning HPs)
+                 max_iter: int = 400,
+                 max_leaf_nodes: int = 31,
+                 max_depth: Optional[int] = None,
+                 learning_rate: float = 0.05,
+                 min_samples_leaf: int = 50,
+                 l2_regularization: float = 1.0,
+                 max_bins: int = 255,
+                 early_stopping: bool = True,
+                 validation_fraction: float = 0.15,
+                 n_iter_no_change: int = 20,
+                 tol: float = 1e-4,
+                 pos_class_weight: float = 2.5,
+                 use_monotonic: bool = True,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            if_n_estimators=int(if_n_estimators),
+            if_max_samples=float(if_max_samples),
+            if_contamination=float(if_contamination),
+            if_random_state=int(if_random_state),
+            gate_threshold=float(gate_threshold),
+            gating_alpha=float(gating_alpha),
+            max_iter=int(max_iter),
+            max_leaf_nodes=int(max_leaf_nodes),
+            max_depth=None if max_depth in (None, 0, -1) else int(max_depth),
+            learning_rate=float(learning_rate),
+            min_samples_leaf=int(min_samples_leaf),
+            l2_regularization=float(l2_regularization),
+            max_bins=int(max_bins),
+            early_stopping=bool(early_stopping),
+            validation_fraction=float(validation_fraction),
+            n_iter_no_change=int(n_iter_no_change),
+            tol=float(tol),
+            pos_class_weight=float(pos_class_weight),
+            use_monotonic=bool(use_monotonic),
+            random_state=int(random_state),
+        )
+        self.iso_ = None
+        self.histgb_ = None
+        self._train_anom_sorted = None
+        self._n_features = None
+        self._monotonic_cst = None
+
+    def _build_monotonic_constraints(self, n_features: int) -> Optional[np.ndarray]:
+        if not self._params['use_monotonic']:
+            return None
+        try:
+            from models.feature_eng import CURATED_FEATURES
+        except Exception:
+            return None
+        F = len(CURATED_FEATURES)
+        if n_features != 4 * F:
+            return None
+        cst = np.zeros(n_features, dtype=np.int8)
+        name_to_idx = {n: i for i, n in enumerate(CURATED_FEATURES)}
+        for name in HistGBMonotonicTrainer._MONOTONIC_INCREASING:
+            i = name_to_idx.get(name)
+            if i is None:
+                continue
+            cst[i] = 1
+            cst[F + i] = 1
+        return cst
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.ensemble import IsolationForest, HistGradientBoostingClassifier
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X_full = np.vstack([X_train, X_val])
+        y_full = np.concatenate([y_train, y_val])
+        self._n_features = X_full.shape[1]
+        self._monotonic_cst = self._build_monotonic_constraints(self._n_features)
+
+        # Fit IsolationForest on training distribution. Lower max_samples
+        # increases tree diversity and produces a smoother quantile rank.
+        self.iso_ = IsolationForest(
+            n_estimators=p['if_n_estimators'],
+            max_samples=p['if_max_samples'],
+            contamination=p['if_contamination'],
+            random_state=p['if_random_state'],
+            n_jobs=-1,
+        )
+        self.iso_.fit(X_full)
+        # Sorted training anomaly scores → used for quantile-rank lookup at
+        # inference. score_samples returns higher = more normal.
+        train_anom = self.iso_.score_samples(X_full).astype(np.float32)
+        self._train_anom_sorted = np.sort(train_anom)
+
+        sw = np.where(y_full == 1, p['pos_class_weight'], 1.0).astype(np.float32)
+        self.histgb_ = HistGradientBoostingClassifier(
+            max_iter=p['max_iter'],
+            max_leaf_nodes=p['max_leaf_nodes'],
+            max_depth=p['max_depth'],
+            learning_rate=p['learning_rate'],
+            min_samples_leaf=p['min_samples_leaf'],
+            l2_regularization=p['l2_regularization'],
+            max_bins=p['max_bins'],
+            early_stopping=p['early_stopping'],
+            validation_fraction=p['validation_fraction'] if p['early_stopping'] else None,
+            n_iter_no_change=p['n_iter_no_change'],
+            tol=p['tol'],
+            monotonic_cst=self._monotonic_cst,
+            random_state=p['random_state'],
+            verbose=0,
+        )
+        self.histgb_.fit(X_full, y_full, sample_weight=sw)
+        return self
+
+    def _gate(self, X) -> np.ndarray:
+        anom = self.iso_.score_samples(X).astype(np.float32)
+        n = len(self._train_anom_sorted)
+        # Quantile rank vs training distribution: 0 = more anomalous than
+        # any training row, 1 = more normal than any training row.
+        ranks = np.searchsorted(self._train_anom_sorted, anom, side='right').astype(np.float32) / max(n, 1)
+        thr = self._params['gate_threshold']
+        # Linear ramp: rank>=thr → gate=1.0, rank=0 → gate=0.0.
+        if thr > 0:
+            gate = np.clip(ranks / thr, 0.0, 1.0)
+        else:
+            gate = np.ones_like(ranks)
+        alpha = self._params['gating_alpha']
+        if alpha != 1.0:
+            gate = gate ** alpha
+        return gate
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.histgb_ is None:
+            raise RuntimeError('Model not fit')
+        p_clf = self.histgb_.predict_proba(X)[:, 1].astype(np.float32)
+        gate = self._gate(X)
+        return (p_clf * gate).astype(np.float32)
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def best_iteration(self):
+        if self.histgb_ is None:
+            return None
+        return int(getattr(self.histgb_, 'n_iter_', self._params['max_iter']))
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump({
+                'iso': self.iso_,
+                'histgb': self.histgb_,
+                'train_anom_sorted': self._train_anom_sorted,
+            }, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'n_features': self._n_features,
+            'monotonic_cst': None if self._monotonic_cst is None
+                              else [int(v) for v in self._monotonic_cst.tolist()],
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        cst = meta.get('monotonic_cst')
+        inst._monotonic_cst = None if cst is None else np.array(cst, dtype=np.int8)
+        with open(model_path, 'rb') as f:
+            blob = pickle.load(f)
+        inst.iso_ = blob['iso']
+        inst.histgb_ = blob['histgb']
+        inst._train_anom_sorted = blob['train_anom_sorted']
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -12571,6 +12821,7 @@ TRAINERS = {
     'torch_patchtst': TorchPatchTSTTrainer,
     'tabicl_v2': TabICLv2Trainer,
     'torch_chronos2': TorchChronos2EmbedTrainer,
+    'anomaly_gated_histgb': AnomalyGatedHistGBTrainer,
 }
 
 
