@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First TSFM-embedding trainer; default HPs already hit avg_ann +15.5% with W2 +100% and W6 +115% ann \u2014 signal is real but the LR head over-trades W1/W3. Train-mode should sweep head_C (regularization tightness) and embedding_pool to lift WR above 40% on W4/W5/W7 which are sub-margin misses.",
-  "claude_iter_id": 1497,
-  "designated_at": "2026-05-20T06:16:50"
+  "rationale": "Keep on torch_chronos2 for train-mode HP sweep: this iter (head_C=3.0, embedding_pool='last') lifted avg_ann to +27.6% (vs -7.5% default, ~-3% headC30+mean) and unlocked W3 ann to +96.7% \u2014 best W3 signal in 20+ iters. Threshold sweep is now meaningful per-window (different thr selected per window vs default's flat thr=0.0). Train mode should sweep concat_tabular \u2208 {True,False}, head_C \u2208 [3, 10], embedding_pool \u2208 {mean,last,max}, seq_channel \u2208 {close,log_ret,zscore_close} \u2014 W3 and W7 are sub-margin misses (32.1% and 38.1% WR vs 40% floor) where a slightly tighter calibration could flip both.",
+  "claude_iter_id": 1498,
+  "designated_at": "2026-05-20T12:09:54"
 }
