@@ -13068,6 +13068,179 @@ class DAELogRegTrainer(BaseTrainer):
         return inst
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+def _frets_complex_linear(z, W_r, W_i, b_r, b_i):
+    """Complex-valued linear: y = (W_r + jW_i) @ z + (b_r + jb_i),
+    with ReLU applied to real and imaginary parts separately."""
+    z_r, z_i = z.real, z.imag
+    y_r = F.relu(z_r @ W_r - z_i @ W_i + b_r)
+    y_i = F.relu(z_r @ W_i + z_i @ W_r + b_i)
+    return torch.complex(y_r, y_i)
+
+
+class _FreTSNet(nn.Module):
+    """Frequency-domain MLP classifier inspired by FreTS (NeurIPS 2023).
+    Input: (B, L, C) sequences. Architecture:
+      embed scalar -> E-dim
+      FFT along channel axis -> complex MLP -> iFFT  (Frequency Channel Learner)
+      FFT along time axis    -> complex MLP -> iFFT  (Frequency Temporal Learner)
+      mean-pool over (L, C) -> head -> logit
+    """
+    def __init__(self, seq_len, channels, embed_size=64, hidden_size=128, dropout=0.1):
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.channels = int(channels)
+        self.embed_size = int(embed_size)
+        self.embed = nn.Linear(1, self.embed_size)
+        scale = 1.0 / float(np.sqrt(self.embed_size))
+        E = self.embed_size
+        self.Wc_r = nn.Parameter(torch.randn(E, E) * scale)
+        self.Wc_i = nn.Parameter(torch.randn(E, E) * scale)
+        self.bc_r = nn.Parameter(torch.zeros(E))
+        self.bc_i = nn.Parameter(torch.zeros(E))
+        self.Wt_r = nn.Parameter(torch.randn(E, E) * scale)
+        self.Wt_i = nn.Parameter(torch.randn(E, E) * scale)
+        self.bt_r = nn.Parameter(torch.zeros(E))
+        self.bt_i = nn.Parameter(torch.zeros(E))
+        self.head = nn.Sequential(
+            nn.LayerNorm(E),
+            nn.Linear(E, int(hidden_size)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_size), 1),
+        )
+
+    def forward(self, x):
+        B, L, C = x.shape
+        x = x.unsqueeze(-1)
+        x = self.embed(x)
+        z = torch.fft.rfft(x, dim=2)
+        z = _frets_complex_linear(z, self.Wc_r, self.Wc_i, self.bc_r, self.bc_i)
+        x = torch.fft.irfft(z, n=C, dim=2)
+        z = torch.fft.rfft(x, dim=1)
+        z = _frets_complex_linear(z, self.Wt_r, self.Wt_i, self.bt_r, self.bt_i)
+        x = torch.fft.irfft(z, n=L, dim=1)
+        pooled = x.mean(dim=(1, 2))
+        logit = self.head(pooled).squeeze(-1)
+        return logit
+
+
+class TorchFreTSTrainer(BaseTrainer):
+    name = 'torch_frets'
+    consumes_sequences = True
+
+    def __init__(self, embed_size=64, hidden_size=128, dropout=0.1,
+                 learning_rate=1e-3, weight_decay=1e-4, pos_weight=1.5,
+                 epochs=20, batch_size=256, device=None, seed=42, **kwargs):
+        self.embed_size = int(embed_size)
+        self.hidden_size = int(hidden_size)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.pos_weight = float(pos_weight)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.seed = int(seed)
+        self.model = None
+        self.seq_len = None
+        self.channels = None
+
+    def _build_model(self, seq_len, channels):
+        torch.manual_seed(self.seed)
+        m = _FreTSNet(seq_len=seq_len, channels=channels,
+                      embed_size=self.embed_size, hidden_size=self.hidden_size,
+                      dropout=self.dropout)
+        return m.to(self.device)
+
+    @staticmethod
+    def _as_tensor_X(X):
+        arr = np.asarray(X, dtype=np.float32)
+        return torch.from_numpy(arr)
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        X_t = self._as_tensor_X(X_tr)
+        if X_t.ndim != 3:
+            raise ValueError(f"TorchFreTSTrainer expects (N, L, C) sequences, got {tuple(X_t.shape)}")
+        N, L, C = X_t.shape
+        self.seq_len, self.channels = int(L), int(C)
+        y_t = torch.from_numpy(np.asarray(y_tr, dtype=np.float32).reshape(-1))
+        self.model = self._build_model(L, C)
+        ds = TensorDataset(X_t, y_t)
+        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        opt = torch.optim.AdamW(self.model.parameters(),
+                                lr=self.learning_rate,
+                                weight_decay=self.weight_decay)
+        pos_w = torch.tensor([float(self.pos_weight)], device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        self.model.train()
+        for _ep in range(self.epochs):
+            for xb, yb in loader:
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                logit = self.model(xb)
+                loss = loss_fn(logit, yb)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                opt.step()
+        self.model.eval()
+        return self
+
+    @torch.no_grad()
+    def predict_proba(self, X):
+        if self.model is None:
+            raise RuntimeError("TorchFreTSTrainer.predict_proba called before fit")
+        X_t = self._as_tensor_X(X)
+        if X_t.ndim != 3:
+            raise ValueError(f"TorchFreTSTrainer expects (N, L, C) sequences, got {tuple(X_t.shape)}")
+        out = []
+        bs = max(int(self.batch_size), 1)
+        self.model.eval()
+        for i in range(0, X_t.shape[0], bs):
+            xb = X_t[i:i + bs].to(self.device)
+            logit = self.model(xb)
+            p = torch.sigmoid(logit).detach().cpu().numpy().astype(np.float32)
+            out.append(p)
+        return np.concatenate(out, axis=0)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        ckpt = {
+            'state_dict': (self.model.state_dict() if self.model is not None else None),
+            'seq_len': self.seq_len,
+            'channels': self.channels,
+            'hparams': {
+                'embed_size': self.embed_size,
+                'hidden_size': self.hidden_size,
+                'dropout': self.dropout,
+                'learning_rate': self.learning_rate,
+                'weight_decay': self.weight_decay,
+                'pos_weight': self.pos_weight,
+                'epochs': self.epochs,
+                'batch_size': self.batch_size,
+                'seed': self.seed,
+            },
+        }
+        torch.save(ckpt, os.path.join(model_dir, 'torch_frets.pt'))
+        meta = {'name': self.name, 'consumes_sequences': self.consumes_sequences}
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+        return model_dir
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -13129,6 +13302,7 @@ TRAINERS = {
     'torch_chronos2': TorchChronos2EmbedTrainer,
     'anomaly_gated_histgb': AnomalyGatedHistGBTrainer,
     'dae_logreg': DAELogRegTrainer,
+    'torch_frets': TorchFreTSTrainer,
 }
 
 

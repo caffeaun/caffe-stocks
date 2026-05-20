@@ -1382,6 +1382,16 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_class_weight':     (1.0, 3.5),
     'random_state':         [42, 7, 1337],
 },
+    'torch_frets': {
+    'embed_size':    [32, 64, 128],
+    'hidden_size':   [64, 128, 256],
+    'dropout':       (0.0, 0.4),
+    'learning_rate': (1e-4, 5e-3),
+    'weight_decay':  (1e-6, 1e-3),
+    'pos_weight':    (1.0, 2.5),
+    'epochs':        [10, 20, 40],
+    'batch_size':    [128, 256, 512],
+},
 }
 
 
