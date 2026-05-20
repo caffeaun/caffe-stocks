@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Default HPs hit 4/7 wp ties best-ever ceiling AND drove W5 DD from 25.3% (last-21-iter avg) to 13.0% \u2014 direct OOD-gating signal. New knobs gate_threshold/gating_alpha/if_contamination are unswept; raising gate_threshold should promote a W6 pass (currently 29.6% WR \u2014 needs more aggressive abstention of low-quality marginal trades) and a W3 pass (DD 21.0% vs 20.0% cap, 1pp shortfall easily fixed by tighter gating). Strongest single-iter signal in the last ~150 iterations.",
-  "claude_iter_id": 1499,
-  "designated_at": "2026-05-20T18:11:18"
+  "rationale": "Keep \u2014 anomaly_gated_histgb still hits 5/7 wp (iter #1527 +51% ann) which is closer to 6/7 pass than the new dae_logreg's 1/7 default. The new family (dae_logreg) needs more claude-mode iterations / HP exploration before earning train-mode sweep budget; anomaly_gated_histgb's gate-threshold/gating-alpha knobs are still mid-sweep.",
+  "claude_iter_id": 1530,
+  "designated_at": "2026-05-21T00:10:05"
 }

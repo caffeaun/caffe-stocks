@@ -9116,6 +9116,8 @@ class KernelLogRegTrainer(BaseTrainer):
                  class_weight: str = 'balanced',
                  calibrate: str = 'none',   # 'none' | 'isotonic' | 'sigmoid'
                  calibrate_cv: int = 3,
+                 gamma_secondary: float = 0.0,
+                 n_components_secondary: int = 0,
                  random_state: int = 42,
                  **_):
         self._params = dict(
@@ -9127,6 +9129,8 @@ class KernelLogRegTrainer(BaseTrainer):
             class_weight=str(class_weight),
             calibrate=str(calibrate),
             calibrate_cv=int(calibrate_cv),
+            gamma_secondary=float(gamma_secondary),
+            n_components_secondary=int(n_components_secondary),
             random_state=int(random_state),
         )
         self.pipe = None
@@ -9139,7 +9143,7 @@ class KernelLogRegTrainer(BaseTrainer):
         from sklearn.decomposition import PCA
         from sklearn.kernel_approximation import Nystroem
         from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import Pipeline
+        from sklearn.pipeline import Pipeline, FeatureUnion
         from sklearn.preprocessing import StandardScaler
 
         if len(set(y_train)) < 2:
@@ -9165,12 +9169,41 @@ class KernelLogRegTrainer(BaseTrainer):
         # Nyström: 1/(n_features * X.var()) when gamma='scale'. Per sklearn
         # 1.8 API, Nystroem.gamma accepts None to auto-set; we mimic that
         # with explicit 'scale' handling: compute on post-scaler features.
-        steps.append(('nystroem', Nystroem(
+        nys_primary = Nystroem(
             kernel='rbf',
             gamma=None if gamma == 'scale' else gamma,
             n_components=ncomp,
             random_state=p['random_state'],
-        )))
+        )
+        # Multi-scale Nyström: when gamma_secondary > 0 AND
+        # n_components_secondary > 0, build a second RBF map at a different
+        # bandwidth and concatenate via FeatureUnion. The LR head then sees
+        # both scales — fine-grained (small gamma → wider RBF) and coarse
+        # (large gamma → narrow RBF) similarity. Motivation: kernel_logreg
+        # iter #1379 hit 5/7 at single-gamma 0.5 but failed W2 by n=19/20
+        # (one trade short — insufficient high-confidence picks in the
+        # transition window's mixed regime) and W5 wr=32% (over-confident on
+        # deep-bear OOD samples). A second bandwidth shifts the RKHS to
+        # mix local and global structure: small-gamma features sharpen
+        # discrimination in the bull-train domain (helps W2 get the 20th
+        # confident pick) while large-gamma features broaden the
+        # "similar-to-training" notion in regime-shifted W5 (pulling
+        # over-confident OOD predictions toward the prior).
+        if (p['gamma_secondary'] > 0
+                and p['n_components_secondary'] > 0):
+            ncomp2 = min(p['n_components_secondary'], X_full.shape[0])
+            nys_secondary = Nystroem(
+                kernel='rbf',
+                gamma=p['gamma_secondary'],
+                n_components=ncomp2,
+                random_state=p['random_state'] + 1,
+            )
+            steps.append(('nystroem', FeatureUnion([
+                ('nys_primary', nys_primary),
+                ('nys_secondary', nys_secondary),
+            ])))
+        else:
+            steps.append(('nystroem', nys_primary))
 
         base_clf = LogisticRegression(
             C=p['C'],
@@ -12762,6 +12795,279 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         return inst
 
 
+# --------------------------------------------------------------------- #
+# Denoising Autoencoder + LogReg classifier (iter #1530)
+#
+# Pivot from torch_chronos2 (exhausted, 2 attempts at wp=1). The brief's
+# foundation-model angle was "pretrained representation → linear head"; this
+# is the same pattern but with the encoder pretrained on OUR data via
+# denoising reconstruction — sidesteps the OOM-on-12GB-RTX-5070 issue with
+# Chronos-2 weights and gives a representation tuned to SET tabular features
+# rather than univariate close-price sequences.
+#
+# Three signals feed the LR head:
+#   1. Original X (24-d) — preserves linear baseline
+#   2. Bottleneck embedding (low-d non-linear regime-aware compression)
+#   3. Per-row reconstruction error — OOD signal (cf. anomaly_gated_histgb's
+#      IsolationForest, but learned rather than density-based)
+#
+# Failure-pattern motivation: W5 100% fail across last 29 iters, W3/W4 76%.
+# These are bear-regime test slices following bull-train; a learned encoder
+# trained on train+val + reconstruction-error OOD flag may distinguish
+# regime-transition rows from in-distribution rows better than the
+# IsolationForest density estimate used by anomaly_gated_histgb.
+# --------------------------------------------------------------------- #
+class DAELogRegTrainer(BaseTrainer):
+    """Denoising Autoencoder pretraining + LogReg head on [X | z | recon_err]."""
+
+    name = 'dae_logreg'
+
+    def __init__(self,
+                 bottleneck_dim: int = 8,
+                 hidden_dim: int = 32,
+                 noise_std: float = 0.15,
+                 dropout: float = 0.20,
+                 ae_learning_rate: float = 1e-3,
+                 ae_weight_decay: float = 1e-5,
+                 ae_batch_size: int = 512,
+                 ae_max_epochs: int = 25,
+                 ae_patience: int = 4,
+                 head_C: float = 1.0,
+                 head_max_iter: int = 2000,
+                 include_recon_err: int = 1,
+                 include_raw_x: int = 1,
+                 pos_class_weight: float = 1.5,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            bottleneck_dim=int(bottleneck_dim),
+            hidden_dim=int(hidden_dim),
+            noise_std=float(noise_std),
+            dropout=float(dropout),
+            ae_learning_rate=float(ae_learning_rate),
+            ae_weight_decay=float(ae_weight_decay),
+            ae_batch_size=int(ae_batch_size),
+            ae_max_epochs=int(ae_max_epochs),
+            ae_patience=int(ae_patience),
+            head_C=float(head_C),
+            head_max_iter=int(head_max_iter),
+            include_recon_err=int(include_recon_err),
+            include_raw_x=int(include_raw_x),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.scaler_ = None
+        self.ae_ = None
+        self.head_ = None
+        self._n_features = None
+        self._best_ae_epoch = None
+
+    def _build_ae(self, n_features):
+        import torch
+        import torch.nn as nn
+        p = self._params
+
+        class DAE(nn.Module):
+            def __init__(self, F, H, B, dp):
+                super().__init__()
+                self.enc = nn.Sequential(
+                    nn.Linear(F, H), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(H, B), nn.GELU(),
+                )
+                self.dec = nn.Sequential(
+                    nn.Linear(B, H), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(H, F),
+                )
+
+            def forward(self, x_noisy):
+                z = self.enc(x_noisy)
+                return self.dec(z), z
+
+        return DAE(n_features, p['hidden_dim'],
+                   p['bottleneck_dim'], p['dropout'])
+
+    def _features(self, X_scaled):
+        """Return [X | z | recon_err] feature matrix (clean X passed in)."""
+        import torch
+        p = self._params
+        device = next(self.ae_.parameters()).device
+        X_t = torch.from_numpy(np.asarray(X_scaled, dtype=np.float32)).to(device)
+        self.ae_.eval()
+        with torch.no_grad():
+            recon, z = self.ae_(X_t)
+            err = ((recon - X_t) ** 2).mean(dim=1, keepdim=True)
+        feats = [z.cpu().numpy()]
+        if p['include_raw_x']:
+            feats.insert(0, np.asarray(X_scaled, dtype=np.float64))
+        if p['include_recon_err']:
+            feats.append(err.cpu().numpy())
+        return np.concatenate(feats, axis=1).astype(np.float64)
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.linear_model import LogisticRegression
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        torch.manual_seed(p['random_state'])
+        np.random.seed(p['random_state'])
+
+        # Concat train+val for AE pretraining (semi-supervised use of all rows),
+        # but the LR head still fits on the train+val combined (matches
+        # logistic_elastic_net / kernel_logreg behavior).
+        X_full_raw = np.vstack([np.asarray(X_train, dtype=np.float32),
+                                np.asarray(X_val, dtype=np.float32)])
+        y_full = np.concatenate([np.asarray(y_train), np.asarray(y_val)])
+        self._n_features = X_full_raw.shape[1]
+
+        self.scaler_ = StandardScaler(with_mean=True, with_std=True)
+        X_full = self.scaler_.fit_transform(X_full_raw).astype(np.float32)
+        X_full = np.clip(X_full, -8.0, 8.0)
+
+        # ---- Phase 1: pretrain DAE on X_full (no labels) ----
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.ae_ = self._build_ae(self._n_features).to(device)
+        opt = torch.optim.AdamW(self.ae_.parameters(),
+                                lr=p['ae_learning_rate'],
+                                weight_decay=p['ae_weight_decay'])
+        # Held-out 10% slice for AE early-stop on reconstruction loss
+        n = X_full.shape[0]
+        rs = np.random.RandomState(p['random_state'])
+        idx = rs.permutation(n)
+        n_val = max(1, n // 10)
+        val_idx = idx[:n_val]
+        tr_idx = idx[n_val:]
+        Xtr = torch.from_numpy(X_full[tr_idx])
+        Xva = torch.from_numpy(X_full[val_idx]).to(device)
+
+        ds = TensorDataset(Xtr)
+        dl = DataLoader(ds, batch_size=p['ae_batch_size'], shuffle=True)
+        best_loss = float('inf')
+        best_state = None
+        bad = 0
+        for epoch in range(p['ae_max_epochs']):
+            self.ae_.train()
+            for (xb,) in dl:
+                xb = xb.to(device, non_blocking=True)
+                # Gaussian noise on input; clean target.
+                noise = torch.randn_like(xb) * p['noise_std']
+                opt.zero_grad(set_to_none=True)
+                recon, _ = self.ae_(xb + noise)
+                loss = nn.functional.mse_loss(recon, xb)
+                loss.backward()
+                opt.step()
+            # Val recon loss (clean inputs both ways)
+            self.ae_.eval()
+            with torch.no_grad():
+                recon_v, _ = self.ae_(Xva)
+                vloss = nn.functional.mse_loss(recon_v, Xva).item()
+            if verbose:
+                print(f'  AE ep{epoch:02d} val_mse={vloss:.4f}')
+            if vloss < best_loss - 1e-5:
+                best_loss = vloss
+                best_state = {k: v.detach().clone() for k, v in
+                              self.ae_.state_dict().items()}
+                self._best_ae_epoch = epoch
+                bad = 0
+            else:
+                bad += 1
+                if bad >= p['ae_patience']:
+                    break
+        if best_state is not None:
+            self.ae_.load_state_dict(best_state)
+
+        # ---- Phase 2: build features and fit LR head ----
+        F_full = self._features(X_full)
+        # class_weight balanced w/ pos boost
+        cw = {0: 1.0, 1: float(p['pos_class_weight'])}
+        self.head_ = LogisticRegression(
+            C=p['head_C'],
+            max_iter=p['head_max_iter'],
+            class_weight=cw,
+            random_state=p['random_state'],
+            solver='lbfgs',
+        )
+        self.head_.fit(F_full, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.ae_ is None or self.head_ is None or self.scaler_ is None:
+            raise RuntimeError('Model not fit')
+        X = np.asarray(X, dtype=np.float32)
+        Xs = self.scaler_.transform(X).astype(np.float32)
+        Xs = np.clip(Xs, -8.0, 8.0)
+        F = self._features(Xs)
+        return self.head_.predict_proba(F)[:, 1]
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def best_iteration(self):
+        return self._best_ae_epoch
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pt')
+        head_path = os.path.join(output_dir, 'head.pkl')
+        scaler_path = os.path.join(output_dir, 'scaler.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        torch.save({'state_dict': self.ae_.state_dict(),
+                    'n_features': self._n_features}, model_path)
+        with open(head_path, 'wb') as f:
+            pickle.dump(self.head_, f)
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(self.scaler_, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+            'best_ae_epoch': self._best_ae_epoch,
+            'n_features': self._n_features,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'head': head_path,
+                'scaler': scaler_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        import torch
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pt')
+        head_path = os.path.join(output_dir, 'head.pkl')
+        scaler_path = os.path.join(output_dir, 'scaler.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst._n_features = meta.get('n_features')
+        inst.ae_ = inst._build_ae(inst._n_features)
+        state = torch.load(model_path, weights_only=True)
+        inst.ae_.load_state_dict(state['state_dict'])
+        with open(head_path, 'rb') as f:
+            inst.head_ = pickle.load(f)
+        with open(scaler_path, 'rb') as f:
+            inst.scaler_ = pickle.load(f)
+        inst._best_ae_epoch = meta.get('best_ae_epoch')
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -12822,6 +13128,7 @@ TRAINERS = {
     'tabicl_v2': TabICLv2Trainer,
     'torch_chronos2': TorchChronos2EmbedTrainer,
     'anomaly_gated_histgb': AnomalyGatedHistGBTrainer,
+    'dae_logreg': DAELogRegTrainer,
 }
 
 

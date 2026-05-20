@@ -1086,6 +1086,13 @@ SEARCH_SPACES: dict[str, dict] = {
         # discriminative signal in bull regimes). Keep 'none' in the grid so
         # the historical 4/7 sweep peak (gamma=0.5, pca=32) remains reachable.
         'calibrate':          ['none', 'isotonic', 'sigmoid'],
+        # iter #1515 — multi-scale Nyström. When both > 0, a second RBF map
+        # at a different gamma is concatenated with the primary via
+        # FeatureUnion. 0 = single-scale (legacy). The two scales together
+        # let the LR head separate fine-grained discrimination (lower gamma)
+        # from broader regime structure (higher gamma).
+        'gamma_secondary':           [0.0, 0.05, 0.5, 2.0, 5.0],
+        'n_components_secondary':    [0, 200, 400, 600],
     },
     # Full-Bayesian Gaussian Process Classifier (iter #835). Knobs:
     #   n_inducing ∈ {300, 600, 1000} — subsample size for the exact kernel
@@ -1353,6 +1360,27 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_class_weight':   (1.5, 4.0),
     'use_monotonic':      [True, False],
     'random_state':       [42, 7, 1337],
+},
+# DAE + LR head (iter #1530). The autoencoder bottleneck width and noise
+# std are the regime-generalization knobs; head_C and pos_class_weight tune
+# the LR sharpness/recall trade-off. include_recon_err toggles whether the
+# OOD signal column is fed to the head (paper ablation hook).
+'dae_logreg': {
+    'bottleneck_dim':       [4, 8, 12, 16],
+    'hidden_dim':           [24, 32, 48, 64],
+    'noise_std':            (0.05, 0.30),
+    'dropout':              (0.10, 0.40),
+    'ae_learning_rate':     (5e-4, 3e-3),
+    'ae_weight_decay':      (1e-6, 1e-4),
+    'ae_batch_size':        [256, 512, 1024],
+    'ae_max_epochs':        [15, 25, 40],
+    'ae_patience':          [3, 5, 8],
+    'head_C':               (0.05, 5.0),
+    'head_max_iter':        [1000, 2000],
+    'include_recon_err':    [0, 1],
+    'include_raw_x':        [0, 1],
+    'pos_class_weight':     (1.0, 3.5),
+    'random_state':         [42, 7, 1337],
 },
 }
 
