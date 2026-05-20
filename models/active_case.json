@@ -1,12 +1,12 @@
 {
-  "trainer": "anomaly_gated_histgb",
+  "trainer": "torch_frets",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep \u2014 anomaly_gated_histgb still hits 5/7 wp (iter #1527 +51% ann) which is closer to 6/7 pass than the new dae_logreg's 1/7 default. The new family (dae_logreg) needs more claude-mode iterations / HP exploration before earning train-mode sweep budget; anomaly_gated_histgb's gate-threshold/gating-alpha knobs are still mid-sweep.",
-  "claude_iter_id": 1530,
-  "designated_at": "2026-05-21T00:10:05"
+  "rationale": "FreTS at defaults cracked W3 AND W4 \u2014 the two windows that failed 15-16/20 of recent iter \u2014 proving frequency-domain inductive bias has signal where time-domain saturated families don't; failure mode is over-trading in W2/W6 (95 and 85 trades), which is exactly what pos_weight (1.0\u20132.5) and dropout (0.0\u20130.4) HP sweeps can compress.",
+  "claude_iter_id": 1561,
+  "designated_at": "2026-05-21T06:04:49"
 }
