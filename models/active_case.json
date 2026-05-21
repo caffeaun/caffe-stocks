@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "FreTS at defaults cracked W3 AND W4 \u2014 the two windows that failed 15-16/20 of recent iter \u2014 proving frequency-domain inductive bias has signal where time-domain saturated families don't; failure mode is over-trading in W2/W6 (95 and 85 trades), which is exactly what pos_weight (1.0\u20132.5) and dropout (0.0\u20130.4) HP sweeps can compress.",
-  "claude_iter_id": 1561,
-  "designated_at": "2026-05-21T06:04:49"
+  "rationale": "FreTS trainer + search space already registered; iter #1562 proved the score-distribution / threshold-sweep is the failure mode (every thr\u22650.3 yielded 0 trades), which is exactly an HP-shaped problem. Train mode should sweep pos_weight \u2208 [1.8, 2.5] and epochs \u2208 [20, 40] with dropout \u22640.15 \u2014 that fully covers the recovery hypothesis without code changes.",
+  "claude_iter_id": 1562,
+  "designated_at": "2026-05-21T09:06:52"
 }
