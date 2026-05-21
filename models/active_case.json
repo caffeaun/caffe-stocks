@@ -1,12 +1,12 @@
 {
-  "trainer": "kernel_anomaly_blend",
+  "trainer": "rocket_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "New trainer at default fusion=max scored 3/7 (W2 +59% ann; W6 W7 clean). MAX-fusion regressed anomaly_gated_histgb's W1/W4 wins by pulling in low-conviction kernel picks. Train mode should sweep fusion_mode\u2208{mean, rank_max} first (softer aggregation), then kernel_gamma\u2208[0.3, 1.5] \u00d7 kernel_C\u2208[1.0, 5.0] \u00d7 anom_pos_class_weight\u2208[1.5, 3.5].",
-  "claude_iter_id": 1579,
-  "designated_at": "2026-05-21T15:14:50"
+  "rationale": "Brand-new family with 0 train-mode iters; default HP showed strong signal (W6 +126.7% ann at 40% WR \u2014 the highest single-window return in months) and four other windows missed pass by \u22641.7pp WR (W1 39.3%, W4 37.5%, W7 38.1%). Threshold sweep is FLAT for W2-W7 (all thresholds give same picks), meaning LR scores collapsed to one side. Train mode should sweep class_weight \u2208 {balanced, none}, ridge_alpha \u2208 [0.1, 10.0] (smaller widens calibration), n_kernels \u2208 {1000, 2000, 4000}, kernel_length \u2208 {7, 9, 11}, max_channels_per_kernel \u2208 {4, 6, 9, 12} \u2014 calibration first, kernel-count second.",
+  "claude_iter_id": 1625,
+  "designated_at": "2026-05-22T00:11:57"
 }

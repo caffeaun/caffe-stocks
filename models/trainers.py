@@ -13435,6 +13435,236 @@ class KernelAnomalyBlendTrainer(BaseTrainer):
         return inst
 
 
+# --------------------------------------------------------------------- #
+# ROCKET (iter #1595) — pivot from torch_frets (exhausted, 2/7 best in 2
+# claude attempts). Part A failure pattern (last 21 iters):
+#   W1 48%  W2 57%  W3 19%  W4 10%  W5 0%  W6 29%  W7 52%
+# W3/W4/W5 (transition+bear) blocked across every family tried. FreTS's
+# DFT-MLP framed signal as global periodicity — failed because deep-bear
+# regimes (W5) have non-stationary transient patterns, not stationary
+# spectra. ROCKET (Dempster et al. 2020, arXiv 1910.13051) instead uses
+# THOUSANDS of *random* non-trained dilated 1D conv kernels: each kernel
+# captures a different local transient shape at a different time scale,
+# and PPV (proportion of positive values) makes the representation
+# location-invariant. The ridge head is convex (no SGD instability that
+# collapsed FreTS scores below 0.3). The inductive bias — multi-scale
+# random transient detectors — is genuinely absent from the registry:
+# trees (axis splits), kernel_logreg (RBF in flat 96-d), GRU/Mamba/
+# Transformer (learned recurrence/attention), FreTS (frequency MLP).
+# Random fixed weights also bypass the train/test distribution-shift
+# problem that hurts deep nets in W5: no parameters can overfit a
+# bull-train regime if the kernels never learn anything from data.
+# --------------------------------------------------------------------- #
+class ROCKETClassifierTrainer(BaseTrainer):
+    name = 'rocket_classifier'
+    consumes_sequences = True
+
+    def __init__(self,
+                 n_kernels: int = 2000,
+                 kernel_length: int = 9,
+                 max_channels_per_kernel: int = 9,
+                 ridge_alpha: float = 1.0,
+                 class_weight: str = 'balanced',
+                 chunk_size: int = 4096,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_kernels=int(n_kernels),
+            kernel_length=int(kernel_length),
+            max_channels_per_kernel=int(max_channels_per_kernel),
+            ridge_alpha=float(ridge_alpha),
+            class_weight=str(class_weight),
+            chunk_size=int(chunk_size),
+            random_state=int(random_state),
+        )
+        self._kernels = None
+        self._seq_len = None
+        self._channels = None
+        self._scaler = None
+        self._clf = None
+
+    def _generate_kernels(self, seq_len: int, channels: int):
+        p = self._params
+        rng = np.random.RandomState(p['random_state'])
+        K = p['n_kernels']
+        klen = p['kernel_length']
+        # dilation: pick among {1, 2} so that effective span ((klen-1)*d + 1)
+        # fits within seq_len. For klen=9 seq_len=20: d=1 span 9; d=2 span 17.
+        max_dil = max(1, (seq_len - 1) // (klen - 1))
+        dilations = rng.choice(
+            [d for d in (1, 2) if d <= max_dil],
+            size=K).astype(np.int32)
+
+        # weights: standard normal, zero-mean within each kernel (Dempster trick)
+        weights = rng.randn(K, klen).astype(np.float32)
+        weights -= weights.mean(axis=1, keepdims=True)
+
+        # biases: drawn from output distribution proxy (uniform [-1, 1])
+        biases = rng.uniform(-1.0, 1.0, size=K).astype(np.float32)
+
+        # per-kernel channel subset: sample uniform 1..max_channels_per_kernel
+        max_ch = min(p['max_channels_per_kernel'], channels)
+        channel_masks = np.zeros((K, channels), dtype=np.float32)
+        chan_signs = np.zeros((K, channels), dtype=np.float32)
+        for k in range(K):
+            n_sel = rng.randint(1, max_ch + 1)
+            sel = rng.choice(channels, size=n_sel, replace=False)
+            channel_masks[k, sel] = 1.0
+            chan_signs[k, sel] = rng.choice([-1.0, 1.0], size=n_sel)
+
+        # effective channel weight: ±1 sign × mask, normalized by sqrt(n_sel)
+        n_sel_per_kernel = channel_masks.sum(axis=1, keepdims=True)
+        n_sel_per_kernel = np.maximum(n_sel_per_kernel, 1.0)
+        channel_proj = (chan_signs / np.sqrt(n_sel_per_kernel)).astype(np.float32)
+
+        return dict(
+            weights=weights, biases=biases, dilations=dilations,
+            channel_proj=channel_proj, kernel_length=klen,
+        )
+
+    def _transform(self, X3d: np.ndarray) -> np.ndarray:
+        """X3d: (N, L, C) → features (N, K) via PPV per kernel."""
+        p = self._params
+        N, L, C = X3d.shape
+        K = self._kernels['weights'].shape[0]
+        klen = self._kernels['kernel_length']
+        weights = self._kernels['weights']
+        biases = self._kernels['biases']
+        dilations = self._kernels['dilations']
+        channel_proj = self._kernels['channel_proj']
+
+        # group kernels by dilation for vectorized 9-gram extraction
+        out = np.zeros((N, K), dtype=np.float32)
+        chunk = max(int(p['chunk_size']), 64)
+        unique_dils = np.unique(dilations)
+        for d in unique_dils:
+            kmask = (dilations == d)
+            k_idx = np.where(kmask)[0]
+            Kd = len(k_idx)
+            span = (klen - 1) * int(d) + 1
+            T = L - span + 1
+            if T <= 0:
+                continue
+            # collapse channels per-kernel first: produce X_proj[n, t, k] of
+            # shape (N, L, Kd) via X3d (N,L,C) @ channel_proj[k_idx].T (C, Kd)
+            cp = channel_proj[k_idx].T.astype(np.float32)  # (C, Kd)
+            w_d = weights[k_idx]  # (Kd, klen)
+            b_d = biases[k_idx]   # (Kd,)
+            for s in range(0, N, chunk):
+                e = min(s + chunk, N)
+                # (m, L, C) @ (C, Kd) → (m, L, Kd)
+                Xp = np.einsum('mlc,ck->mlk', X3d[s:e], cp, optimize=True)
+                # build 9-gram windows along time axis with dilation d
+                # window indices: [t, t+d, t+2d, ..., t+(klen-1)d]
+                grams = np.stack(
+                    [Xp[:, t:t + klen * int(d):int(d), :] for t in range(T)],
+                    axis=1,  # (m, T, klen, Kd)
+                )
+                # apply per-kernel time weights: out_tk = sum_i w[k,i] * grams[m,t,i,k]
+                conv = np.einsum('mtik,ki->mtk', grams, w_d, optimize=True)
+                conv -= b_d[None, None, :]
+                ppv = (conv > 0).mean(axis=1).astype(np.float32)  # (m, Kd)
+                out[s:e, k_idx] = ppv
+        return out
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'rocket_classifier expects 3D (N, L, C); got {X_train.shape}.')
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        X = np.asarray(X_train, dtype=np.float32)
+        X = np.clip(X, -8.0, 8.0)
+        N, L, C = X.shape
+        self._seq_len, self._channels = int(L), int(C)
+        # also fold val into the fit (ROCKET has no early stopping concept)
+        Xv = np.asarray(X_val, dtype=np.float32)
+        Xv = np.clip(Xv, -8.0, 8.0)
+        X_full = np.concatenate([X, Xv], axis=0)
+        y_full = np.concatenate([
+            np.asarray(y_train).reshape(-1),
+            np.asarray(y_val).reshape(-1),
+        ])
+
+        self._kernels = self._generate_kernels(L, C)
+        Z = self._transform(X_full)  # (N_full, K)
+
+        # standardize PPV features
+        self._scaler = StandardScaler()
+        Z = self._scaler.fit_transform(Z)
+
+        p = self._params
+        # ridge-regularized logistic regression — convex optimization,
+        # ~30k rows × 2000 features is fast in scikit's lbfgs.
+        self._clf = LogisticRegression(
+            penalty='l2',
+            C=1.0 / max(p['ridge_alpha'], 1e-6),
+            solver='lbfgs',
+            max_iter=500,
+            class_weight=p['class_weight'] if p['class_weight'] else None,
+            random_state=p['random_state'],
+            n_jobs=1,
+        )
+        self._clf.fit(Z, y_full)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self._clf is None:
+            raise RuntimeError('Model not fit')
+        X = np.asarray(X, dtype=np.float32)
+        X = np.clip(X, -8.0, 8.0)
+        Z = self._transform(X)
+        Z = self._scaler.transform(Z)
+        return self._clf.predict_proba(Z)[:, 1]
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'rocket.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(dict(
+                kernels=self._kernels,
+                scaler=self._scaler,
+                clf=self._clf,
+                seq_len=self._seq_len,
+                channels=self._channels,
+            ), f)
+        meta = {'trainer': self.name, 'hyperparams': self._params}
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'rocket.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        with open(model_path, 'rb') as f:
+            blob = pickle.load(f)
+        inst._kernels = blob['kernels']
+        inst._scaler = blob['scaler']
+        inst._clf = blob['clf']
+        inst._seq_len = blob['seq_len']
+        inst._channels = blob['channels']
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -13498,6 +13728,7 @@ TRAINERS = {
     'dae_logreg': DAELogRegTrainer,
     'torch_frets': TorchFreTSTrainer,
     'kernel_anomaly_blend': KernelAnomalyBlendTrainer,
+    'rocket_classifier': ROCKETClassifierTrainer,
 }
 
 

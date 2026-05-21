@@ -1412,6 +1412,14 @@ SEARCH_SPACES: dict[str, dict] = {
     'fusion_mode':            ['max', 'mean', 'rank_max'],
     'random_state':           [42, 7, 1337],
 },
+'rocket_classifier': {
+    'n_kernels':                [1000, 2000, 4000],
+    'kernel_length':            [7, 9, 11],
+    'max_channels_per_kernel':  [4, 6, 9, 12],
+    'ridge_alpha':              (0.1, 10.0),
+    'class_weight':             ['balanced', 'none'],
+    'random_state':             [42, 7, 1337, 2024],
+},
 }
 
 
