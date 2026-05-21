@@ -1366,7 +1366,7 @@ SEARCH_SPACES: dict[str, dict] = {
 # the LR sharpness/recall trade-off. include_recon_err toggles whether the
 # OOD signal column is fed to the head (paper ablation hook).
 'dae_logreg': {
-    'bottleneck_dim':       [4, 8, 12, 16],
+    'bottleneck_dim':       [8, 12, 16, 20, 24],
     'hidden_dim':           [24, 32, 48, 64],
     'noise_std':            (0.05, 0.30),
     'dropout':              (0.10, 0.40),
@@ -1379,7 +1379,9 @@ SEARCH_SPACES: dict[str, dict] = {
     'head_max_iter':        [1000, 2000],
     'include_recon_err':    [0, 1],
     'include_raw_x':        [0, 1],
-    'pos_class_weight':     (1.0, 3.5),
+    'pos_class_weight':     (1.5, 3.5),
+    'abstain_strength':     (0.0, 6.0),
+    'abstain_recon_q':      (0.40, 0.85),
     'random_state':         [42, 7, 1337],
 },
     'torch_frets': {

@@ -12837,6 +12837,20 @@ class DAELogRegTrainer(BaseTrainer):
                  include_recon_err: int = 1,
                  include_raw_x: int = 1,
                  pos_class_weight: float = 1.5,
+                 # Anomaly-conditional abstention (iter #1530 lesson option b).
+                 # The DAE's own per-row reconstruction error doubles as an
+                 # OOD signal: rows whose features cannot be reconstructed by
+                 # the learned bottleneck are by definition out of the train
+                 # distribution and get probabilistically demoted by an
+                 # exponential multiplier. Differs structurally from
+                 # AnomalyGatedHistGB (IsolationForest + HistGB) by using the
+                 # SAME network that produced the bottleneck z to also score
+                 # anomaly, so abstention and representation are coupled.
+                 # abstain_strength=0.0 ⇒ off (legacy behaviour). The
+                 # threshold is the abstain_recon_q quantile of training
+                 # recon_err; only rows ABOVE it are demoted.
+                 abstain_strength: float = 2.0,
+                 abstain_recon_q: float = 0.70,
                  random_state: int = 42,
                  **_):
         self._params = dict(
@@ -12854,6 +12868,8 @@ class DAELogRegTrainer(BaseTrainer):
             include_recon_err=int(include_recon_err),
             include_raw_x=int(include_raw_x),
             pos_class_weight=float(pos_class_weight),
+            abstain_strength=float(abstain_strength),
+            abstain_recon_q=float(np.clip(abstain_recon_q, 0.10, 0.95)),
             random_state=int(random_state),
         )
         self.scaler_ = None
@@ -12861,6 +12877,7 @@ class DAELogRegTrainer(BaseTrainer):
         self.head_ = None
         self._n_features = None
         self._best_ae_epoch = None
+        self._recon_err_thresh = None
 
     def _build_ae(self, n_features):
         import torch
@@ -12886,8 +12903,8 @@ class DAELogRegTrainer(BaseTrainer):
         return DAE(n_features, p['hidden_dim'],
                    p['bottleneck_dim'], p['dropout'])
 
-    def _features(self, X_scaled):
-        """Return [X | z | recon_err] feature matrix (clean X passed in)."""
+    def _features_and_err(self, X_scaled):
+        """Return ([X | z | recon_err] features, raw_recon_err vector)."""
         import torch
         p = self._params
         device = next(self.ae_.parameters()).device
@@ -12896,12 +12913,17 @@ class DAELogRegTrainer(BaseTrainer):
         with torch.no_grad():
             recon, z = self.ae_(X_t)
             err = ((recon - X_t) ** 2).mean(dim=1, keepdim=True)
+        err_np = err.cpu().numpy()
         feats = [z.cpu().numpy()]
         if p['include_raw_x']:
             feats.insert(0, np.asarray(X_scaled, dtype=np.float64))
         if p['include_recon_err']:
-            feats.append(err.cpu().numpy())
-        return np.concatenate(feats, axis=1).astype(np.float64)
+            feats.append(err_np)
+        return (np.concatenate(feats, axis=1).astype(np.float64),
+                err_np.reshape(-1).astype(np.float64))
+
+    def _features(self, X_scaled):
+        return self._features_and_err(X_scaled)[0]
 
     def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
             pnl_train=None, pnl_val=None,
@@ -12985,7 +13007,7 @@ class DAELogRegTrainer(BaseTrainer):
             self.ae_.load_state_dict(best_state)
 
         # ---- Phase 2: build features and fit LR head ----
-        F_full = self._features(X_full)
+        F_full, err_full = self._features_and_err(X_full)
         # class_weight balanced w/ pos boost
         cw = {0: 1.0, 1: float(p['pos_class_weight'])}
         self.head_ = LogisticRegression(
@@ -12996,6 +13018,13 @@ class DAELogRegTrainer(BaseTrainer):
             solver='lbfgs',
         )
         self.head_.fit(F_full, y_full)
+        # Record the abstention threshold from training recon_err so that
+        # predict-time gating is anchored on the in-distribution mass.
+        self._recon_err_thresh = float(np.quantile(err_full, p['abstain_recon_q']))
+        if verbose:
+            print(f'  abstain_recon_q={p["abstain_recon_q"]:.2f} '
+                  f'thresh={self._recon_err_thresh:.4f} '
+                  f'(p99={float(np.quantile(err_full, 0.99)):.4f})')
         return self
 
     def predict_proba(self, X) -> np.ndarray:
@@ -13004,8 +13033,18 @@ class DAELogRegTrainer(BaseTrainer):
         X = np.asarray(X, dtype=np.float32)
         Xs = self.scaler_.transform(X).astype(np.float32)
         Xs = np.clip(Xs, -8.0, 8.0)
-        F = self._features(Xs)
-        return self.head_.predict_proba(F)[:, 1]
+        F, err = self._features_and_err(Xs)
+        p_raw = self.head_.predict_proba(F)[:, 1]
+        strength = float(self._params.get('abstain_strength', 0.0))
+        thresh = self._recon_err_thresh
+        if strength > 0.0 and thresh is not None and thresh > 0.0:
+            # Exponential demote only ABOVE the training-quantile threshold.
+            # excess > 0 ⇒ row is in the tail the DAE could not reconstruct
+            # ⇒ likely OOD ⇒ exp(-strength · excess) shrinks the prob.
+            excess = np.maximum(0.0, (err - thresh) / thresh)
+            mult = np.exp(-strength * excess)
+            p_raw = p_raw * mult
+        return p_raw
 
     def feature_importance(self):
         return None
