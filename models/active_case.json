@@ -1,12 +1,12 @@
 {
-  "trainer": "dae_logreg",
+  "trainer": "kernel_anomaly_blend",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "dae_logreg + new abstention layer 2/7 wp (vs 1/7 at #1530); two new HP dims (abstain_strength, abstain_recon_q) are unswept and W3/W5 are within 1-2pp of WR floor \u2014 train mode should sweep abstain_strength\u2208[1.0,4.0] \u00d7 abstain_recon_q\u2208[0.55,0.85] \u00d7 bottleneck_dim\u2208[8,12,16] \u00d7 pos_class_weight\u2208[1.5,2.5] to push the marginal windows over the line.",
-  "claude_iter_id": 1563,
-  "designated_at": "2026-05-21T12:16:53"
+  "rationale": "New trainer at default fusion=max scored 3/7 (W2 +59% ann; W6 W7 clean). MAX-fusion regressed anomaly_gated_histgb's W1/W4 wins by pulling in low-conviction kernel picks. Train mode should sweep fusion_mode\u2208{mean, rank_max} first (softer aggregation), then kernel_gamma\u2208[0.3, 1.5] \u00d7 kernel_C\u2208[1.0, 5.0] \u00d7 anom_pos_class_weight\u2208[1.5, 3.5].",
+  "claude_iter_id": 1579,
+  "designated_at": "2026-05-21T15:14:50"
 }

@@ -13280,6 +13280,161 @@ class TorchFreTSTrainer(BaseTrainer):
         return model_dir
 
 
+# --------------------------------------------------------------------- #
+# Kernel-Anomaly Blend (iter #1564) — pivot from torch_frets (exhausted).
+# Part A cross-tab: anomaly_gated_histgb (#1499) uniquely hits W1+W7;
+# kernel_logreg (#1344) uniquely hits W3+W5+W6. MAX-fusion of their
+# probabilities lets each base contribute its top-K-per-date picks
+# without absolute-score calibration — addresses torch_frets' failure
+# mode (score collapse below 0.3 → flood at thr=0.0).
+# --------------------------------------------------------------------- #
+class KernelAnomalyBlendTrainer(BaseTrainer):
+    """Score-MAX fusion of anomaly_gated_histgb and kernel_logreg."""
+
+    name = 'kernel_anomaly_blend'
+
+    def __init__(self,
+                 if_n_estimators: int = 200,
+                 if_max_samples: float = 0.5,
+                 if_contamination: float = 0.1,
+                 gate_threshold: float = 0.2,
+                 gating_alpha: float = 1.0,
+                 anom_max_iter: int = 400,
+                 anom_max_leaf_nodes: int = 31,
+                 anom_learning_rate: float = 0.05,
+                 anom_min_samples_leaf: int = 50,
+                 anom_l2_regularization: float = 1.0,
+                 anom_pos_class_weight: float = 2.5,
+                 anom_use_monotonic: bool = True,
+                 kernel_n_components: int = 300,
+                 kernel_gamma: float = 0.5,
+                 kernel_C: float = 3.0,
+                 kernel_max_iter: int = 200,
+                 kernel_pca_components: int = 32,
+                 kernel_class_weight: str = 'none',
+                 fusion_mode: str = 'max',
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            if_n_estimators=int(if_n_estimators),
+            if_max_samples=float(if_max_samples),
+            if_contamination=float(if_contamination),
+            gate_threshold=float(gate_threshold),
+            gating_alpha=float(gating_alpha),
+            anom_max_iter=int(anom_max_iter),
+            anom_max_leaf_nodes=int(anom_max_leaf_nodes),
+            anom_learning_rate=float(anom_learning_rate),
+            anom_min_samples_leaf=int(anom_min_samples_leaf),
+            anom_l2_regularization=float(anom_l2_regularization),
+            anom_pos_class_weight=float(anom_pos_class_weight),
+            anom_use_monotonic=bool(anom_use_monotonic),
+            kernel_n_components=int(kernel_n_components),
+            kernel_gamma=float(kernel_gamma),
+            kernel_C=float(kernel_C),
+            kernel_max_iter=int(kernel_max_iter),
+            kernel_pca_components=int(kernel_pca_components),
+            kernel_class_weight=str(kernel_class_weight),
+            fusion_mode=str(fusion_mode),
+            random_state=int(random_state),
+        )
+        self.anom_ = None
+        self.kernel_ = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        p = self._params
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        self.anom_ = AnomalyGatedHistGBTrainer(
+            if_n_estimators=p['if_n_estimators'],
+            if_max_samples=p['if_max_samples'],
+            if_contamination=p['if_contamination'],
+            gate_threshold=p['gate_threshold'],
+            gating_alpha=p['gating_alpha'],
+            max_iter=p['anom_max_iter'],
+            max_leaf_nodes=p['anom_max_leaf_nodes'],
+            learning_rate=p['anom_learning_rate'],
+            min_samples_leaf=p['anom_min_samples_leaf'],
+            l2_regularization=p['anom_l2_regularization'],
+            pos_class_weight=p['anom_pos_class_weight'],
+            use_monotonic=p['anom_use_monotonic'],
+            random_state=p['random_state'],
+        )
+        self.anom_.fit(X_train, y_train, X_val, y_val, verbose=False)
+
+        self.kernel_ = KernelLogRegTrainer(
+            n_components=p['kernel_n_components'],
+            gamma=p['kernel_gamma'],
+            C=p['kernel_C'],
+            max_iter=p['kernel_max_iter'],
+            pca_components=p['kernel_pca_components'],
+            class_weight=p['kernel_class_weight'],
+            calibrate='none',
+            random_state=p['random_state'] + 1,
+        )
+        self.kernel_.fit(X_train, y_train, X_val, y_val, verbose=False)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.anom_ is None or self.kernel_ is None:
+            raise RuntimeError('Model not fit')
+        p_a = np.asarray(self.anom_.predict_proba(X), dtype=np.float32)
+        p_k = np.asarray(self.kernel_.predict_proba(X), dtype=np.float32)
+        mode = self._params['fusion_mode']
+        if mode == 'mean':
+            return ((p_a + p_k) * 0.5).astype(np.float32)
+        if mode == 'rank_max':
+            def _rank01(v):
+                n = len(v)
+                if n == 0:
+                    return v
+                order = np.argsort(v, kind='mergesort')
+                ranks = np.empty(n, dtype=np.float32)
+                ranks[order] = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+                return ranks
+            return np.maximum(_rank01(p_a), _rank01(p_k)).astype(np.float32)
+        return np.maximum(p_a, p_k).astype(np.float32)
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def best_iteration(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        anom_dir = os.path.join(output_dir, 'anom')
+        kernel_dir = os.path.join(output_dir, 'kernel')
+        self.anom_.save(anom_dir)
+        self.kernel_.save(kernel_dir)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        meta = {'trainer': self.name, 'hyperparams': self._params}
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'metadata': meta_path, 'anom_dir': anom_dir, 'kernel_dir': kernel_dir}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.anom_ = AnomalyGatedHistGBTrainer.load(os.path.join(output_dir, 'anom'))
+        inst.kernel_ = KernelLogRegTrainer.load(os.path.join(output_dir, 'kernel'))
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -13342,6 +13497,7 @@ TRAINERS = {
     'anomaly_gated_histgb': AnomalyGatedHistGBTrainer,
     'dae_logreg': DAELogRegTrainer,
     'torch_frets': TorchFreTSTrainer,
+    'kernel_anomaly_blend': KernelAnomalyBlendTrainer,
 }
 
 

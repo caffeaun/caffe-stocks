@@ -1394,6 +1394,24 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':        [10, 20, 40],
     'batch_size':    [128, 256, 512],
 },
+'kernel_anomaly_blend': {
+    'gate_threshold':         (0.05, 0.40),
+    'gating_alpha':           (0.5, 3.0),
+    'anom_max_iter':          [200, 400, 800],
+    'anom_max_leaf_nodes':    [15, 31, 63],
+    'anom_learning_rate':     (0.01, 0.10),
+    'anom_min_samples_leaf':  [20, 50, 100],
+    'anom_l2_regularization': (0.0, 3.0),
+    'anom_pos_class_weight':  (1.5, 4.0),
+    'anom_use_monotonic':     [True, False],
+    'kernel_n_components':    [200, 300, 500],
+    'kernel_gamma':           (0.1, 2.0),
+    'kernel_C':               (0.3, 10.0),
+    'kernel_pca_components':  [0, 16, 32],
+    'kernel_class_weight':    ['none', 'balanced'],
+    'fusion_mode':            ['max', 'mean', 'rank_max'],
+    'random_state':           [42, 7, 1337],
+},
 }
 
 
