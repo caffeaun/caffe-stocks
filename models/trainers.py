@@ -13665,6 +13665,196 @@ class ROCKETClassifierTrainer(BaseTrainer):
         return inst
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class _XLSTMClassifierNet(nn.Module):
+    """xLSTM-based classifier for time-series day windows.
+
+    Input: (B, L, C) sequences where L=day window (typically 20) and C=channels (per-day features).
+    Architecture:
+      Linear(C -> E) input projection
+      xLSTMBlockStack with mLSTM-only blocks (slstm_at=[] -> no custom-CUDA dependency)
+        - matrix memory C ∈ R^{d_k × d_v} per head
+        - exponential input/forget gates with stabilizer state
+      Mean-pool over L
+      Linear(E -> 1) classification head -> logit
+    """
+
+    def __init__(self, seq_len, channels, embedding_dim=64, num_blocks=2,
+                 num_heads=4, dropout=0.1):
+        super().__init__()
+        from xlstm import (
+            xLSTMBlockStack, xLSTMBlockStackConfig,
+            mLSTMBlockConfig, mLSTMLayerConfig,
+        )
+        self.seq_len = int(seq_len)
+        self.channels = int(channels)
+        self.embedding_dim = int(embedding_dim)
+        # num_heads must divide embedding_dim; clamp defensively.
+        nh = int(num_heads)
+        while nh > 1 and (self.embedding_dim % nh) != 0:
+            nh //= 2
+        self.num_heads = max(1, nh)
+
+        self.input_proj = nn.Linear(self.channels, self.embedding_dim)
+        self.in_drop = nn.Dropout(float(dropout))
+
+        mlstm_cfg = mLSTMBlockConfig(
+            mlstm=mLSTMLayerConfig(num_heads=self.num_heads)
+        )
+        stack_cfg = xLSTMBlockStackConfig(
+            mlstm_block=mlstm_cfg,
+            slstm_block=None,
+            context_length=self.seq_len,
+            num_blocks=int(num_blocks),
+            embedding_dim=self.embedding_dim,
+            slstm_at=[],
+            dropout=float(dropout),
+        )
+        self.stack = xLSTMBlockStack(stack_cfg)
+        self.head_drop = nn.Dropout(float(dropout))
+        self.head = nn.Linear(self.embedding_dim, 1)
+
+    def forward(self, x):
+        # x: (B, L, C) — project to (B, L, E), run xLSTM stack, mean-pool, head.
+        h = self.input_proj(x)
+        h = self.in_drop(h)
+        h = self.stack(h)
+        h = h.mean(dim=1)
+        h = self.head_drop(h)
+        return self.head(h).squeeze(-1)
+
+
+class TorchXLSTMTrainer(BaseTrainer):
+    name = 'torch_xlstm'
+    consumes_sequences = True
+
+    def __init__(self, embedding_dim=64, num_blocks=2, num_heads=4,
+                 dropout=0.1, learning_rate=1e-3, weight_decay=1e-4,
+                 pos_weight=1.5, epochs=20, batch_size=256, device=None,
+                 seed=42, **kwargs):
+        self.embedding_dim = int(embedding_dim)
+        self.num_blocks = int(num_blocks)
+        self.num_heads = int(num_heads)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.pos_weight = float(pos_weight)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.seed = int(seed)
+        self.model = None
+        self.seq_len = None
+        self.channels = None
+
+    def _build_model(self, seq_len, channels):
+        torch.manual_seed(self.seed)
+        m = _XLSTMClassifierNet(
+            seq_len=seq_len, channels=channels,
+            embedding_dim=self.embedding_dim, num_blocks=self.num_blocks,
+            num_heads=self.num_heads, dropout=self.dropout,
+        )
+        return m.to(self.device)
+
+    @staticmethod
+    def _as_tensor_X(X):
+        arr = np.asarray(X, dtype=np.float32)
+        return torch.from_numpy(arr)
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        X_t = self._as_tensor_X(X_tr)
+        if X_t.ndim != 3:
+            raise ValueError(
+                f"TorchXLSTMTrainer expects (N, L, C) sequences, got {tuple(X_t.shape)}"
+            )
+        N, L, C = X_t.shape
+        self.seq_len, self.channels = int(L), int(C)
+        y_t = torch.from_numpy(np.asarray(y_tr, dtype=np.float32).reshape(-1))
+        self.model = self._build_model(L, C)
+        ds = TensorDataset(X_t, y_t)
+        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate, weight_decay=self.weight_decay,
+        )
+        pos_w = torch.tensor([float(self.pos_weight)], device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        self.model.train()
+        for _ep in range(self.epochs):
+            for xb, yb in loader:
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                logit = self.model(xb)
+                loss = loss_fn(logit, yb)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                opt.step()
+        self.model.eval()
+        return self
+
+    @torch.no_grad()
+    def predict_proba(self, X):
+        if self.model is None:
+            raise RuntimeError("TorchXLSTMTrainer.predict_proba called before fit")
+        X_t = self._as_tensor_X(X)
+        if X_t.ndim != 3:
+            raise ValueError(
+                f"TorchXLSTMTrainer expects (N, L, C) sequences, got {tuple(X_t.shape)}"
+            )
+        out = []
+        bs = max(int(self.batch_size), 1)
+        self.model.eval()
+        for i in range(0, X_t.shape[0], bs):
+            xb = X_t[i:i + bs].to(self.device)
+            logit = self.model(xb)
+            p = torch.sigmoid(logit).detach().cpu().numpy().astype(np.float32)
+            out.append(p)
+        return np.concatenate(out, axis=0)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        state_path = os.path.join(model_dir, 'xlstm_state.pt')
+        torch.save({
+            'model_state': self.model.state_dict() if self.model is not None else None,
+            'seq_len': self.seq_len,
+            'channels': self.channels,
+            'embedding_dim': self.embedding_dim,
+            'num_blocks': self.num_blocks,
+            'num_heads': self.num_heads,
+            'dropout': self.dropout,
+        }, state_path)
+        meta = {
+            'name': self.name,
+            'seq_len': self.seq_len,
+            'channels': self.channels,
+            'embedding_dim': self.embedding_dim,
+            'num_blocks': self.num_blocks,
+            'num_heads': self.num_heads,
+            'dropout': self.dropout,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'pos_weight': self.pos_weight,
+            'epochs': self.epochs,
+            'batch_size': self.batch_size,
+        }
+        if extra:
+            meta.update(extra)
+        meta_path = os.path.join(model_dir, 'meta.json')
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'state': state_path, 'meta': meta_path}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -13729,6 +13919,7 @@ TRAINERS = {
     'torch_frets': TorchFreTSTrainer,
     'kernel_anomaly_blend': KernelAnomalyBlendTrainer,
     'rocket_classifier': ROCKETClassifierTrainer,
+    'torch_xlstm': TorchXLSTMTrainer,
 }
 
 

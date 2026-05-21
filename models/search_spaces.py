@@ -1420,6 +1420,17 @@ SEARCH_SPACES: dict[str, dict] = {
     'class_weight':             ['balanced', 'none'],
     'random_state':             [42, 7, 1337, 2024],
 },
+    'torch_xlstm': {
+    'embedding_dim':  [32, 64, 128],
+    'num_blocks':     [2, 3, 4],
+    'num_heads':      [2, 4, 8],
+    'dropout':        (0.0, 0.3),
+    'learning_rate':  (1e-4, 5e-3),
+    'weight_decay':   (1e-5, 1e-3),
+    'pos_weight':     [1.0, 1.5, 2.0, 2.5],
+    'epochs':         [15, 25, 35],
+    'batch_size':     [256, 512],
+},
 }
 
 
