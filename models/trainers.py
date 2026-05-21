@@ -13691,6 +13691,11 @@ class _XLSTMClassifierNet(nn.Module):
     def __init__(self, seq_len, channels, embedding_dim=64, num_blocks=2,
                  num_heads=4, dropout=0.1):
         super().__init__()
+        # xlstm's slstm submodule imports cuda_init at top of package, which
+        # requires CUDA_HOME even though we only use mLSTM blocks. Provide a
+        # harmless fallback so import succeeds on systems without a full CUDA
+        # toolkit (we never JIT-compile sLSTM kernels here).
+        os.environ.setdefault("CUDA_HOME", "/usr")
         from xlstm import (
             xLSTMBlockStack, xLSTMBlockStackConfig,
             mLSTMBlockConfig, mLSTMLayerConfig,

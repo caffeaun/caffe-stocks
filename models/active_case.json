@@ -1,12 +1,12 @@
 {
-  "trainer": "rocket_classifier",
+  "trainer": "torch_xlstm",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Brand-new family with 0 train-mode iters; default HP showed strong signal (W6 +126.7% ann at 40% WR \u2014 the highest single-window return in months) and four other windows missed pass by \u22641.7pp WR (W1 39.3%, W4 37.5%, W7 38.1%). Threshold sweep is FLAT for W2-W7 (all thresholds give same picks), meaning LR scores collapsed to one side. Train mode should sweep class_weight \u2208 {balanced, none}, ridge_alpha \u2208 [0.1, 10.0] (smaller widens calibration), n_kernels \u2208 {1000, 2000, 4000}, kernel_length \u2208 {7, 9, 11}, max_channels_per_kernel \u2208 {4, 6, 9, 12} \u2014 calibration first, kernel-count second.",
-  "claude_iter_id": 1625,
-  "designated_at": "2026-05-22T00:11:57"
+  "rationale": "First-shot defaults hit 2/7 (W4 \u2713 WR=48%, W6 \u2713 WR=42.9% +17% ann); avg_ann -4.1% beats both baselines (random_topk -30%, rule_only -28%); W7 has +44% ann at WR=36.4% (1.7pp from floor). Threshold sweep is FLAT across all 7 windows (every thr in [0.0, 0.7] picks identical trade set) \u2014 classic score-collapse fingerprint seen in ROCKET #1625 and FreTS #1561. Train mode should sweep calibration first (pos_weight \u2208 [1.0, 2.5] but never \u22641.2 per FreTS lesson, dropout \u2208 [0.0, 0.3], lr \u2208 [1e-4, 5e-3]), then capacity (embedding_dim \u2208 {32, 64, 128}, num_blocks \u2208 {2, 3, 4}). The brief specifically warned not to over-rotate HPs to chase W5 (no monotonic prior), so DD-control HPs should target W3/W7 instead.",
+  "claude_iter_id": 1626,
+  "designated_at": "2026-05-22T06:12:28"
 }
