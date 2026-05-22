@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First-shot defaults hit 2/7 (W4 \u2713 WR=48%, W6 \u2713 WR=42.9% +17% ann); avg_ann -4.1% beats both baselines (random_topk -30%, rule_only -28%); W7 has +44% ann at WR=36.4% (1.7pp from floor). Threshold sweep is FLAT across all 7 windows (every thr in [0.0, 0.7] picks identical trade set) \u2014 classic score-collapse fingerprint seen in ROCKET #1625 and FreTS #1561. Train mode should sweep calibration first (pos_weight \u2208 [1.0, 2.5] but never \u22641.2 per FreTS lesson, dropout \u2208 [0.0, 0.3], lr \u2208 [1e-4, 5e-3]), then capacity (embedding_dim \u2208 {32, 64, 128}, num_blocks \u2208 {2, 3, 4}). The brief specifically warned not to over-rotate HPs to chase W5 (no monotonic prior), so DD-control HPs should target W3/W7 instead.",
-  "claude_iter_id": 1626,
-  "designated_at": "2026-05-22T06:12:28"
+  "rationale": "Brief executed twice now; calibration HP nudge (pos_weight 1.5->1.0, dropout 0.1->0.2) produced BIT-IDENTICAL gate output to iter #1626 \u2014 synthetic test confirms pos_weight DOES change predictions in isolation, so on the gate's real data the model converges to the same top-K ranking regardless of calibration. Redirect train mode to CAPACITY HPs ONLY: embedding_dim in {32,64,128} x num_blocks in {2,3,4} x num_heads in {2,4,8} x epochs in {15,25,35}. Pin pos_weight=1.5, dropout=0.1, lr=1e-3 (calibration sweep is wasted compute). Three near-misses (W2 19 trades vs 20; W3 38.7% WR; W7 36.4% WR with +44.4% ann) are the upside targets; W5 should be ignored (DD blowout in hostile regime, no monotonic prior to fix it).",
+  "claude_iter_id": 1627,
+  "designated_at": "2026-05-22T09:11:01"
 }
