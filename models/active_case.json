@@ -1,12 +1,12 @@
 {
-  "trainer": "kernel_anomaly_blend",
+  "trainer": "anomaly_gated_histgb",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Train-mode KAB has been producing steady 3-5/7 with two 6/7 peaks (#1607 +47% ann, #1611 +35% ann) \u2014 the strongest plateau in the registry. New kernel_histgb_stack default hit 3/7 (W7 unlocked at +31% ann/40% WR, validating the cross-family hypothesis) but rank-mean=0.5 diluted HistGB's W5/W6 bear-window edge. Keep KAB sweep active for now \u2014 kernel_histgb_stack is registered with a 19-HP space (stack_weight + fusion_mode) for the NEXT pivot to claim once KAB plateaus.",
-  "claude_iter_id": 1644,
-  "designated_at": "2026-05-22T18:10:42"
+  "rationale": "Pivot from KAB (plateaued at 2-3/7 across last 8 train-mode sweeps) to anomaly_gated_histgb with the new day_abstain_q knob. Day-level abstention is the new dimension to sweep \u2014 train mode should explore q \u2208 [0.0, 0.40] paired with gate_threshold \u2208 [0.10, 0.40] to find the W5-breaking combination. Default 0.25 already gives 4/7 (matches KAB ceiling) without HP tuning; the upside lives in jointly tuning the two abstention quantiles.",
+  "claude_iter_id": 1675,
+  "designated_at": "2026-05-23T00:11:52"
 }

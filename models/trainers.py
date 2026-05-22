@@ -12587,7 +12587,18 @@ class TorchChronos2EmbedTrainer(BaseTrainer):
 # the gating mechanism rather than the supervised loss surface.
 # --------------------------------------------------------------------- #
 class AnomalyGatedHistGBTrainer(BaseTrainer):
-    """IsolationForest-gated HistGB classifier for OOD abstention on bear windows."""
+    """IsolationForest-gated HistGB classifier for OOD abstention on bear windows.
+
+    Iter #1675 addition: ``day_abstain_q`` adds a *date-level* abstention floor
+    on top of the existing per-row IF gate. During fit, the trainer records the
+    per-training-date mean IF anomaly score (lower = whole day's cross-section
+    is more OOD vs the IF-fit distribution). At inference, any test date whose
+    mean IF score falls in the bottom ``day_abstain_q`` quantile of training
+    day-means has ALL row predictions zeroed — the model abstains the entire
+    day rather than just dampening individual rows. This targets W5
+    (Jan-Apr 2025, breadth=31.7%, SET return -12.7%) where Part A shows
+    1/20 passes across last 20 iters regardless of trainer family. The
+    rank-fusion W5 unlock (iter #1499) used a similar date-level mechanism."""
 
     name = 'anomaly_gated_histgb'
 
@@ -12600,9 +12611,13 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
                  # Gating: rows below `gate_threshold` quantile of training IF
                  # scores get partial damping (linear ramp to 0 at the most-
                  # anomalous training point). alpha controls damp aggression.
-                 gate_threshold: float = 0.2,
-                 gating_alpha: float = 1.0,
-                 # HistGB knobs (inherits iter #936 winning HPs)
+                 gate_threshold: float = 0.255,
+                 gating_alpha: float = 0.693,
+                 # Day-level abstention: zero out all rows on test dates whose
+                 # mean IF score lies below this quantile of training-day means.
+                 # 0.0 disables. Iter #1675.
+                 day_abstain_q: float = 0.25,
+                 # HistGB knobs (default to iter #1527 best 5/7 HPs)
                  max_iter: int = 400,
                  max_leaf_nodes: int = 31,
                  max_depth: Optional[int] = None,
@@ -12614,8 +12629,9 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
                  validation_fraction: float = 0.15,
                  n_iter_no_change: int = 20,
                  tol: float = 1e-4,
-                 pos_class_weight: float = 2.5,
+                 pos_class_weight: float = 3.371,
                  use_monotonic: bool = True,
+                 if_contamination_default_keep: bool = False,  # accept legacy kw
                  random_state: int = 42,
                  **_):
         self._params = dict(
@@ -12625,6 +12641,7 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
             if_random_state=int(if_random_state),
             gate_threshold=float(gate_threshold),
             gating_alpha=float(gating_alpha),
+            day_abstain_q=float(day_abstain_q),
             max_iter=int(max_iter),
             max_leaf_nodes=int(max_leaf_nodes),
             max_depth=None if max_depth in (None, 0, -1) else int(max_depth),
@@ -12643,6 +12660,8 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         self.iso_ = None
         self.histgb_ = None
         self._train_anom_sorted = None
+        self._train_day_anom_sorted = None
+        self._predict_dates = None
         self._n_features = None
         self._monotonic_cst = None
 
@@ -12695,6 +12714,22 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         train_anom = self.iso_.score_samples(X_full).astype(np.float32)
         self._train_anom_sorted = np.sort(train_anom)
 
+        # Per-training-date mean IF score → distribution of "how OOD is the
+        # whole day's cross-section". Used by the day-level abstention gate at
+        # predict time. Concatenate dates from inner-train + inner-val (full
+        # training span) so the day quantile reflects all training cohorts.
+        if p['day_abstain_q'] > 0 and dates_train is not None and dates_val is not None:
+            try:
+                d_full = np.concatenate([np.asarray(dates_train), np.asarray(dates_val)])
+                if len(d_full) == len(train_anom):
+                    uniq = np.unique(d_full)
+                    day_means = np.empty(len(uniq), dtype=np.float32)
+                    for i, d in enumerate(uniq):
+                        day_means[i] = float(np.mean(train_anom[d_full == d]))
+                    self._train_day_anom_sorted = np.sort(day_means)
+            except Exception:
+                self._train_day_anom_sorted = None
+
         sw = np.where(y_full == 1, p['pos_class_weight'], 1.0).astype(np.float32)
         self.histgb_ = HistGradientBoostingClassifier(
             max_iter=p['max_iter'],
@@ -12732,12 +12767,33 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
             gate = gate ** alpha
         return gate
 
+    def set_predict_context(self, dates):
+        self._predict_dates = (
+            np.asarray(dates) if dates is not None else None)
+
     def predict_proba(self, X) -> np.ndarray:
         if self.histgb_ is None:
             raise RuntimeError('Model not fit')
         p_clf = self.histgb_.predict_proba(X)[:, 1].astype(np.float32)
         gate = self._gate(X)
-        return (p_clf * gate).astype(np.float32)
+        scores = (p_clf * gate).astype(np.float32)
+
+        q = self._params.get('day_abstain_q', 0.0)
+        if (q > 0 and self._predict_dates is not None
+                and self._train_day_anom_sorted is not None
+                and len(self._train_day_anom_sorted) > 0
+                and len(self._predict_dates) == len(scores)):
+            anom_test = self.iso_.score_samples(X).astype(np.float32)
+            d = np.asarray(self._predict_dates)
+            sorted_day = self._train_day_anom_sorted
+            n_day = len(sorted_day)
+            for u in np.unique(d):
+                mask = d == u
+                day_mean = float(np.mean(anom_test[mask]))
+                rank_q = np.searchsorted(sorted_day, day_mean, side='right') / n_day
+                if rank_q < q:
+                    scores[mask] = 0.0
+        return scores
 
     def feature_importance(self):
         return None
@@ -12761,6 +12817,7 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
                 'iso': self.iso_,
                 'histgb': self.histgb_,
                 'train_anom_sorted': self._train_anom_sorted,
+                'train_day_anom_sorted': self._train_day_anom_sorted,
             }, f)
         meta = {
             'trainer': self.name,
@@ -12792,6 +12849,7 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         inst.iso_ = blob['iso']
         inst.histgb_ = blob['histgb']
         inst._train_anom_sorted = blob['train_anom_sorted']
+        inst._train_day_anom_sorted = blob.get('train_day_anom_sorted')
         return inst
 
 
@@ -14054,6 +14112,328 @@ class TorchXLSTMTrainer(BaseTrainer):
         return {'state': state_path, 'meta': meta_path}
 
 
+# --------------------------------------------------------------------- #
+# RocketBaggedCalibratedTrainer (claude iter #1660, brief-exhausted pivot)
+#
+# Brief pivot: torch_xlstm (matrix-memory recurrence) tried twice at 2/7;
+# its W5 collapse (25.8% WR, -52.9% ann, 23.5% DD) matched the universal
+# W5 wall (1/19 pass rate over last 20 iters across all families). The
+# sequence-NN family doesn't solve the structural W5 problem.
+#
+# Pivot rationale (Part A): ROCKET (iter #1625) had 1/7 (W6 only) but
+# also collapsed W5 (22.2% WR, -58.8% ann). The collapse mode in both
+# cases is "score saturation"—predictions cluster around 0.5 and the
+# threshold sweep is forced to thr=0.0, picking the worst possible 36-40
+# examples in the worst regime. Three structural fixes vs vanilla
+# rocket_classifier, each addressing a distinct failure mode:
+#   (1) Date-block bagging (K=5) — variance reduction in the linear head
+#       for hostile-regime test slices; train bags on disjoint date blocks
+#       so each bag sees different regime mixtures, then average.
+#   (2) Isotonic calibration on val — anchors output prob distribution
+#       to true val-set frequency, breaking the score-collapse failure
+#       where every output ≈ 0.5 and threshold sweep degenerates.
+#   (3) Per-date z-score normalization on inference — converts raw scores
+#       into cross-sectional ranks within each test date, so picks are
+#       made by within-day relative quality even when absolute scores
+#       degrade in hostile regimes. Critical for W5 where the model is
+#       genuinely uncertain but must still pick a daily top.
+#
+# Structurally NEW vs registry:
+#   * rocket_classifier — single LR head, no bagging, no calibration,
+#     no per-date norm (the W6 score-collapse iter #1625 victim)
+#   * histgb_monotonic_bagged — date-block bagging exists but on
+#     HistGBM trees, NOT on ROCKET random-conv features
+#   * xgb_iso_calibrated — isotonic exists but on raw XGB, not chained
+#     to ROCKET features
+#   * kernel_anomaly_blend — bagging exists internally but in a kernel
+#     pipeline, NOT after random-conv feature extraction
+# No other trainer composes (random conv kernels) → (date-block bag) →
+# (isotonic calibration) → (per-date z-score). This is the structural
+# composition gap.
+#
+# Hypothesis: ROCKET's W6 +126% ann iter #1625 result proves the random
+# conv features are bull-regime predictive when scored confidently; the
+# W5 collapse was a head-side failure (LR overfit train-bull distribution).
+# Bagging + iso-calibration + per-date norm directly attack the
+# head-side score-collapse without changing the feature extractor.
+# --------------------------------------------------------------------- #
+class ROCKETBaggedCalibratedTrainer(BaseTrainer):
+    """ROCKET random-conv features + date-block bagged Ridge + isotonic
+    calibration + per-date z-score normalization. Pivot from torch_xlstm
+    targeting the W5 score-collapse failure mode."""
+
+    name = 'rocket_bagged_calibrated'
+    consumes_sequences = True
+
+    def __init__(self,
+                 n_kernels: int = 4000,
+                 kernel_length: int = 9,
+                 max_channels_per_kernel: int = 9,
+                 n_bags: int = 5,
+                 bag_frac: float = 0.7,
+                 ridge_alpha: float = 1.0,
+                 pos_class_weight: float = 1.5,
+                 calibrate: str = 'isotonic',
+                 per_date_zscore: bool = True,
+                 chunk_size: int = 4096,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_kernels=int(n_kernels),
+            kernel_length=int(kernel_length),
+            max_channels_per_kernel=int(max_channels_per_kernel),
+            n_bags=max(1, int(n_bags)),
+            bag_frac=float(np.clip(bag_frac, 0.3, 1.0)),
+            ridge_alpha=float(ridge_alpha),
+            pos_class_weight=float(pos_class_weight),
+            calibrate=str(calibrate),
+            per_date_zscore=bool(per_date_zscore),
+            chunk_size=int(chunk_size),
+            random_state=int(random_state),
+        )
+        self._kernels = None
+        self._seq_len = None
+        self._channels = None
+        self._scaler = None
+        self._bags = []          # list of LogisticRegression
+        self._iso = None         # IsotonicRegression or None
+        self._predict_dates = None
+
+    # ROCKET kernel generation and transform are identical to the
+    # vanilla rocket_classifier (kept inline so this trainer is
+    # self-contained — see ROCKETClassifierTrainer for design notes).
+    def _generate_kernels(self, seq_len: int, channels: int):
+        p = self._params
+        rng = np.random.RandomState(p['random_state'])
+        K = p['n_kernels']
+        klen = p['kernel_length']
+        max_dil = max(1, (seq_len - 1) // (klen - 1))
+        dilations = rng.choice(
+            [d for d in (1, 2) if d <= max_dil],
+            size=K).astype(np.int32)
+        weights = rng.randn(K, klen).astype(np.float32)
+        weights -= weights.mean(axis=1, keepdims=True)
+        biases = rng.uniform(-1.0, 1.0, size=K).astype(np.float32)
+        max_ch = min(p['max_channels_per_kernel'], channels)
+        channel_masks = np.zeros((K, channels), dtype=np.float32)
+        chan_signs = np.zeros((K, channels), dtype=np.float32)
+        for k in range(K):
+            n_sel = rng.randint(1, max_ch + 1)
+            sel = rng.choice(channels, size=n_sel, replace=False)
+            channel_masks[k, sel] = 1.0
+            chan_signs[k, sel] = rng.choice([-1.0, 1.0], size=n_sel)
+        n_sel_per_kernel = channel_masks.sum(axis=1, keepdims=True)
+        n_sel_per_kernel = np.maximum(n_sel_per_kernel, 1.0)
+        channel_proj = (chan_signs / np.sqrt(n_sel_per_kernel)).astype(np.float32)
+        return dict(
+            weights=weights, biases=biases, dilations=dilations,
+            channel_proj=channel_proj, kernel_length=klen,
+        )
+
+    def _transform(self, X3d: np.ndarray) -> np.ndarray:
+        p = self._params
+        N, L, C = X3d.shape
+        K = self._kernels['weights'].shape[0]
+        klen = self._kernels['kernel_length']
+        weights = self._kernels['weights']
+        biases = self._kernels['biases']
+        dilations = self._kernels['dilations']
+        channel_proj = self._kernels['channel_proj']
+        out = np.zeros((N, K), dtype=np.float32)
+        chunk = max(int(p['chunk_size']), 64)
+        unique_dils = np.unique(dilations)
+        for d in unique_dils:
+            kmask = (dilations == d)
+            k_idx = np.where(kmask)[0]
+            Kd = len(k_idx)
+            span = (klen - 1) * int(d) + 1
+            T = L - span + 1
+            if T <= 0:
+                continue
+            cp = channel_proj[k_idx].T.astype(np.float32)
+            w_d = weights[k_idx]
+            b_d = biases[k_idx]
+            for s in range(0, N, chunk):
+                e = min(s + chunk, N)
+                Xp = np.einsum('mlc,ck->mlk', X3d[s:e], cp, optimize=True)
+                grams = np.stack(
+                    [Xp[:, t:t + klen * int(d):int(d), :] for t in range(T)],
+                    axis=1,
+                )
+                conv = np.einsum('mtik,ki->mtk', grams, w_d, optimize=True)
+                conv -= b_d[None, None, :]
+                ppv = (conv > 0).mean(axis=1).astype(np.float32)
+                out[s:e, k_idx] = ppv
+        return out
+
+    def set_predict_context(self, dates):
+        """Receive test-set dates from return_gate before predict_proba
+        so per-date z-score normalization is anchored to the right
+        date partition (the gate passes test_dates here)."""
+        self._predict_dates = np.asarray(dates)
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.isotonic import IsotonicRegression
+
+        if X_train.ndim != 3:
+            raise ValueError(
+                f'rocket_bagged_calibrated expects 3D (N, L, C); got {X_train.shape}.')
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X = np.clip(np.asarray(X_train, dtype=np.float32), -8.0, 8.0)
+        Xv = np.clip(np.asarray(X_val, dtype=np.float32), -8.0, 8.0)
+        N, L, C = X.shape
+        self._seq_len, self._channels = int(L), int(C)
+
+        # 1. Build random conv kernels and transform train + val
+        self._kernels = self._generate_kernels(L, C)
+        Z_tr = self._transform(X)
+        Z_va = self._transform(Xv)
+        self._scaler = StandardScaler()
+        Z_tr = self._scaler.fit_transform(Z_tr)
+        Z_va = self._scaler.transform(Z_va)
+
+        # 2. Date-block bagging on the train set. Each bag gets a random
+        #    subset of unique train dates (bag_frac), trained as Ridge LR.
+        rng = np.random.RandomState(p['random_state'])
+        if dates_train is not None:
+            train_dates = np.asarray(dates_train)
+            unique_dates = np.sort(np.unique(train_dates))
+        else:
+            train_dates = None
+            unique_dates = None
+
+        y_tr_arr = np.asarray(y_train).reshape(-1)
+        cw = {0: 1.0, 1: float(p['pos_class_weight'])}
+
+        self._bags = []
+        for b in range(p['n_bags']):
+            if unique_dates is not None and len(unique_dates) >= 8:
+                # Sample bag_frac of unique dates (without replacement)
+                n_sample = max(4, int(p['bag_frac'] * len(unique_dates)))
+                sel_dates = rng.choice(unique_dates, size=n_sample, replace=False)
+                row_mask = np.isin(train_dates, sel_dates)
+                Z_b = Z_tr[row_mask]
+                y_b = y_tr_arr[row_mask]
+            else:
+                # Fallback: random row bootstrap of bag_frac
+                idx = rng.choice(len(Z_tr), size=int(p['bag_frac'] * len(Z_tr)),
+                                 replace=False)
+                Z_b = Z_tr[idx]
+                y_b = y_tr_arr[idx]
+            if len(set(y_b)) < 2:
+                # Skip degenerate bag rather than crash
+                continue
+            clf = LogisticRegression(
+                penalty='l2',
+                C=1.0 / max(p['ridge_alpha'], 1e-6),
+                solver='lbfgs',
+                max_iter=500,
+                class_weight=cw,
+                random_state=int(p['random_state']) + b,
+                n_jobs=1,
+            )
+            clf.fit(Z_b, y_b)
+            self._bags.append(clf)
+
+        if not self._bags:
+            raise RuntimeError('All bags degenerate — fit aborted.')
+
+        # 3. Isotonic calibration on val (mean of bag probs vs y_val)
+        y_va_arr = np.asarray(y_val).reshape(-1)
+        if p['calibrate'] == 'isotonic' and len(set(y_va_arr)) == 2:
+            p_va = np.mean([c.predict_proba(Z_va)[:, 1] for c in self._bags],
+                           axis=0)
+            self._iso = IsotonicRegression(out_of_bounds='clip',
+                                            y_min=0.0, y_max=1.0)
+            self._iso.fit(p_va, y_va_arr)
+        else:
+            self._iso = None
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if not self._bags:
+            raise RuntimeError('Model not fit')
+        X = np.clip(np.asarray(X, dtype=np.float32), -8.0, 8.0)
+        Z = self._transform(X)
+        Z = self._scaler.transform(Z)
+        # Mean of bag probabilities
+        p_raw = np.mean([c.predict_proba(Z)[:, 1] for c in self._bags], axis=0)
+        # Optional isotonic calibration
+        if self._iso is not None:
+            p_raw = self._iso.transform(p_raw)
+        # Optional per-date z-score normalization (then sigmoid)
+        if (self._params['per_date_zscore'] and self._predict_dates is not None
+                and len(self._predict_dates) == len(p_raw)):
+            out = np.empty_like(p_raw, dtype=np.float32)
+            dates_arr = np.asarray(self._predict_dates)
+            for d in np.unique(dates_arr):
+                mask = dates_arr == d
+                vals = p_raw[mask]
+                if len(vals) <= 1:
+                    out[mask] = 0.5
+                    continue
+                mu = float(np.mean(vals))
+                sd = float(np.std(vals))
+                if sd < 1e-9:
+                    out[mask] = 0.5
+                    continue
+                z = (vals - mu) / sd
+                # map z back to [0, 1] via logistic with tau=1.0
+                out[mask] = (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+            return out
+        return np.asarray(p_raw, dtype=np.float32)
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'rocket_bagged.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump(dict(
+                kernels=self._kernels,
+                scaler=self._scaler,
+                bags=self._bags,
+                iso=self._iso,
+                seq_len=self._seq_len,
+                channels=self._channels,
+            ), f)
+        meta = {'trainer': self.name, 'hyperparams': self._params}
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'rocket_bagged.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        with open(model_path, 'rb') as f:
+            blob = pickle.load(f)
+        inst._kernels = blob['kernels']
+        inst._scaler = blob['scaler']
+        inst._bags = blob['bags']
+        inst._iso = blob['iso']
+        inst._seq_len = blob['seq_len']
+        inst._channels = blob['channels']
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -14120,6 +14500,7 @@ TRAINERS = {
     'rocket_classifier': ROCKETClassifierTrainer,
     'torch_xlstm': TorchXLSTMTrainer,
     'kernel_histgb_stack': KernelHistGBStackTrainer,
+    'rocket_bagged_calibrated': ROCKETBaggedCalibratedTrainer,
 }
 
 

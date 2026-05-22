@@ -1352,6 +1352,10 @@ SEARCH_SPACES: dict[str, dict] = {
     'if_contamination':   (0.02, 0.20),
     'gate_threshold':     (0.05, 0.40),
     'gating_alpha':       (0.5, 3.0),
+    # Iter #1675: day-level abstention quantile. 0.0 disables. Range chosen to
+    # bracket bottom 5-40% of training day-anomaly quantile — the hostile-bear
+    # tail (W5 breadth=31.7% sits near the bottom 15-25% of training days).
+    'day_abstain_q':      (0.0, 0.40),
     'max_iter':           [200, 400, 800],
     'max_leaf_nodes':     [15, 31, 63],
     'learning_rate':      (0.01, 0.10),
@@ -1451,6 +1455,18 @@ SEARCH_SPACES: dict[str, dict] = {
     'stack_weight':               (0.2, 0.8),
     'fusion_mode':                ['rank_mean', 'prob_mean', 'rank_max', 'rank_min'],
     'random_state':               [42, 7, 1337],
+},
+'rocket_bagged_calibrated': {
+    'n_kernels':                [2000, 4000, 6000],
+    'kernel_length':            [7, 9, 11],
+    'max_channels_per_kernel':  [4, 6, 9, 12],
+    'n_bags':                   [3, 5, 7],
+    'bag_frac':                 (0.55, 0.85),
+    'ridge_alpha':              (0.1, 10.0),
+    'pos_class_weight':         (1.0, 3.0),
+    'calibrate':                ['isotonic', 'none'],
+    'per_date_zscore':          [True, False],
+    'random_state':             [42, 7, 1337, 2024],
 },
 }
 
