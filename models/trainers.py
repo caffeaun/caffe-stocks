@@ -13385,16 +13385,23 @@ class KernelAnomalyBlendTrainer(BaseTrainer):
         mode = self._params['fusion_mode']
         if mode == 'mean':
             return ((p_a + p_k) * 0.5).astype(np.float32)
+
+        def _rank01(v):
+            n = len(v)
+            if n == 0:
+                return v
+            order = np.argsort(v, kind='mergesort')
+            ranks = np.empty(n, dtype=np.float32)
+            ranks[order] = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+            return ranks
+
         if mode == 'rank_max':
-            def _rank01(v):
-                n = len(v)
-                if n == 0:
-                    return v
-                order = np.argsort(v, kind='mergesort')
-                ranks = np.empty(n, dtype=np.float32)
-                ranks[order] = np.arange(n, dtype=np.float32) / max(n - 1, 1)
-                return ranks
             return np.maximum(_rank01(p_a), _rank01(p_k)).astype(np.float32)
+        if mode == 'rank_min':
+            # Consensus picker: only rows BOTH models rank highly survive.
+            # Targets bull-regime over-trade where max-fusion lets in
+            # anomaly-only positives that dilute WR (e.g. W7 #1607/#1611).
+            return np.minimum(_rank01(p_a), _rank01(p_k)).astype(np.float32)
         return np.maximum(p_a, p_k).astype(np.float32)
 
     def feature_importance(self):

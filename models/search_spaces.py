@@ -1409,7 +1409,7 @@ SEARCH_SPACES: dict[str, dict] = {
     'kernel_C':               (0.3, 10.0),
     'kernel_pca_components':  [0, 16, 32],
     'kernel_class_weight':    ['none', 'balanced'],
-    'fusion_mode':            ['max', 'mean', 'rank_max'],
+    'fusion_mode':            ['max', 'mean', 'rank_max', 'rank_min'],
     'random_state':           [42, 7, 1337],
 },
 'rocket_classifier': {

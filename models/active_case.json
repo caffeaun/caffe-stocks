@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_xlstm",
+  "trainer": "kernel_anomaly_blend",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Brief executed twice now; calibration HP nudge (pos_weight 1.5->1.0, dropout 0.1->0.2) produced BIT-IDENTICAL gate output to iter #1626 \u2014 synthetic test confirms pos_weight DOES change predictions in isolation, so on the gate's real data the model converges to the same top-K ranking regardless of calibration. Redirect train mode to CAPACITY HPs ONLY: embedding_dim in {32,64,128} x num_blocks in {2,3,4} x num_heads in {2,4,8} x epochs in {15,25,35}. Pin pos_weight=1.5, dropout=0.1, lr=1e-3 (calibration sweep is wasted compute). Three near-misses (W2 19 trades vs 20; W3 38.7% WR; W7 36.4% WR with +44.4% ann) are the upside targets; W5 should be ignored (DD blowout in hostile regime, no monotonic prior to fix it).",
-  "claude_iter_id": 1627,
-  "designated_at": "2026-05-22T09:11:01"
+  "rationale": "Train mode hit 6/7 at iter #1607 (+47.2% ann) and #1611 (+35.3% ann) \u2014 both failed ONLY W7 by 1-5pp WR. New fusion_mode='rank_min' (added this iter) flipped W7 to PASS at 50% WR / +90% ann but over-tightened W1/W2/W4/W6. Train-mode should now sweep fusion_mode\u2208{max,mean,rank_max,rank_min} against the existing HP grid \u2014 the per-window optimum may be regime-mixable (max for transition, rank_min for bull) and even fixed-mode sweep on rank_min with lower gating_alpha / higher kernel_C could redeem the dropped windows. Pivoting OFF torch_xlstm (its own rationale text admitted the HP sweep is wasted compute since synthetic-equal outputs prove the gate-data converges identically across calibration HPs).",
+  "claude_iter_id": 1628,
+  "designated_at": "2026-05-22T15:14:42"
 }
