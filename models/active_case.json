@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Train mode hit 6/7 at iter #1607 (+47.2% ann) and #1611 (+35.3% ann) \u2014 both failed ONLY W7 by 1-5pp WR. New fusion_mode='rank_min' (added this iter) flipped W7 to PASS at 50% WR / +90% ann but over-tightened W1/W2/W4/W6. Train-mode should now sweep fusion_mode\u2208{max,mean,rank_max,rank_min} against the existing HP grid \u2014 the per-window optimum may be regime-mixable (max for transition, rank_min for bull) and even fixed-mode sweep on rank_min with lower gating_alpha / higher kernel_C could redeem the dropped windows. Pivoting OFF torch_xlstm (its own rationale text admitted the HP sweep is wasted compute since synthetic-equal outputs prove the gate-data converges identically across calibration HPs).",
-  "claude_iter_id": 1628,
-  "designated_at": "2026-05-22T15:14:42"
+  "rationale": "Train-mode KAB has been producing steady 3-5/7 with two 6/7 peaks (#1607 +47% ann, #1611 +35% ann) \u2014 the strongest plateau in the registry. New kernel_histgb_stack default hit 3/7 (W7 unlocked at +31% ann/40% WR, validating the cross-family hypothesis) but rank-mean=0.5 diluted HistGB's W5/W6 bear-window edge. Keep KAB sweep active for now \u2014 kernel_histgb_stack is registered with a 19-HP space (stack_weight + fusion_mode) for the NEXT pivot to claim once KAB plateaus.",
+  "claude_iter_id": 1644,
+  "designated_at": "2026-05-22T18:10:42"
 }

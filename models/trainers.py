@@ -13745,6 +13745,193 @@ class _XLSTMClassifierNet(nn.Module):
         return self.head(h).squeeze(-1)
 
 
+# --------------------------------------------------------------------- #
+# KernelHistGBStack (claude iter #1629, brief-exhausted pivot from torch_xlstm)
+#
+# Pivot evidence (Part A.3 diagnosis): two distinct 6/7 ceiling-hitters in
+# the registry fail on DIFFERENT single windows:
+#   iter #1218 HistGBMonotonic (pure tree, regime+momentum monotone cst):
+#     PASS W1,W2,W3,W5,W6,W7  FAIL W4 (33% WR, +3% ann, 14% DD)
+#   iter #1607 KernelAnomalyBlend (IsolationForest-gated HistGB + kernel-LR):
+#     PASS W1..W6              FAIL W7 (34% WR, +17% ann, 11% DD)
+# Both single-window failures miss the 40% WR bar by ~5-7pp. Their PASS
+# windows mostly overlap (W1,W2,W3,W5,W6), but their FAIL windows are
+# orthogonal — implying the two engines have complementary inductive
+# blind spots:
+#   * HistGB axis-splits + regime monotonic cst sees breadth-driven bear
+#     reversals cleanly (cracks W5/W6/W7) but mis-prices transition W4.
+#   * Kernel-RBF over a flat 96-d projection sees similarity-based bull/
+#     transition patterns (W1-W6) but gets gated out of W7's late
+#     transition by the IsolationForest contamination filter.
+# A rank-mean fusion of the two engines should retain both PASS sets and
+# average down each engine's weak-window false positives.
+#
+# Structurally NEW vs. existing registry:
+#   * stacked_ranker — intra-XGB stacking (LightGBM/XGB/different losses)
+#   * kernel_anomaly_blend — fuses anomaly_gated_histgb + kernel_logreg
+#     (both internally; uses max/mean/rank_max/rank_min over those two
+#     COMPONENT outputs, NOT over the full histgb_monotonic engine)
+#   * xgb_rank_fusion — fuses multiple XGB heads only
+# This trainer fuses TWO TOP-LEVEL families (HistGB-monotone tree +
+# KernelAnomalyBlend composite) — a cross-family stack absent from the
+# registry.
+# --------------------------------------------------------------------- #
+class KernelHistGBStackTrainer(BaseTrainer):
+    """Rank-mean cross-family ensemble of HistGBMonotonic + KernelAnomalyBlend."""
+
+    name = 'kernel_histgb_stack'
+
+    def __init__(self,
+                 # HistGBMonotonic base — defaults from #1218 winning HPs.
+                 histgb_max_iter: int = 400,
+                 histgb_max_leaf_nodes: int = 63,
+                 histgb_learning_rate: float = 0.05,
+                 histgb_min_samples_leaf: int = 50,
+                 histgb_l2_regularization: float = 1.0,
+                 histgb_pos_class_weight: float = 3.0,
+                 histgb_use_monotonic: bool = True,
+                 # KernelAnomalyBlend base — defaults from #1607 winning HPs.
+                 kab_gate_threshold: float = 0.20,
+                 kab_gating_alpha: float = 1.0,
+                 kab_anom_max_iter: int = 400,
+                 kab_anom_learning_rate: float = 0.05,
+                 kab_anom_pos_class_weight: float = 2.5,
+                 kab_kernel_n_components: int = 300,
+                 kab_kernel_gamma: float = 0.5,
+                 kab_kernel_C: float = 3.0,
+                 kab_fusion_mode: str = 'max',
+                 # Stack-level.
+                 stack_weight: float = 0.5,
+                 fusion_mode: str = 'rank_mean',
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            histgb_max_iter=int(histgb_max_iter),
+            histgb_max_leaf_nodes=int(histgb_max_leaf_nodes),
+            histgb_learning_rate=float(histgb_learning_rate),
+            histgb_min_samples_leaf=int(histgb_min_samples_leaf),
+            histgb_l2_regularization=float(histgb_l2_regularization),
+            histgb_pos_class_weight=float(histgb_pos_class_weight),
+            histgb_use_monotonic=bool(histgb_use_monotonic),
+            kab_gate_threshold=float(kab_gate_threshold),
+            kab_gating_alpha=float(kab_gating_alpha),
+            kab_anom_max_iter=int(kab_anom_max_iter),
+            kab_anom_learning_rate=float(kab_anom_learning_rate),
+            kab_anom_pos_class_weight=float(kab_anom_pos_class_weight),
+            kab_kernel_n_components=int(kab_kernel_n_components),
+            kab_kernel_gamma=float(kab_kernel_gamma),
+            kab_kernel_C=float(kab_kernel_C),
+            kab_fusion_mode=str(kab_fusion_mode),
+            stack_weight=float(stack_weight),
+            fusion_mode=str(fusion_mode),
+            random_state=int(random_state),
+        )
+        self.histgb_ = None
+        self.kab_ = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        p = self._params
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        self.histgb_ = HistGBMonotonicTrainer(
+            max_iter=p['histgb_max_iter'],
+            max_leaf_nodes=p['histgb_max_leaf_nodes'],
+            learning_rate=p['histgb_learning_rate'],
+            min_samples_leaf=p['histgb_min_samples_leaf'],
+            l2_regularization=p['histgb_l2_regularization'],
+            pos_class_weight=p['histgb_pos_class_weight'],
+            use_monotonic=p['histgb_use_monotonic'],
+            random_state=p['random_state'],
+        )
+        self.histgb_.fit(X_train, y_train, X_val, y_val, verbose=False)
+
+        self.kab_ = KernelAnomalyBlendTrainer(
+            gate_threshold=p['kab_gate_threshold'],
+            gating_alpha=p['kab_gating_alpha'],
+            anom_max_iter=p['kab_anom_max_iter'],
+            anom_learning_rate=p['kab_anom_learning_rate'],
+            anom_pos_class_weight=p['kab_anom_pos_class_weight'],
+            kernel_n_components=p['kab_kernel_n_components'],
+            kernel_gamma=p['kab_kernel_gamma'],
+            kernel_C=p['kab_kernel_C'],
+            fusion_mode=p['kab_fusion_mode'],
+            random_state=p['random_state'] + 1,
+        )
+        self.kab_.fit(X_train, y_train, X_val, y_val, verbose=False)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.histgb_ is None or self.kab_ is None:
+            raise RuntimeError('Model not fit')
+        p_h = np.asarray(self.histgb_.predict_proba(X), dtype=np.float32)
+        p_k = np.asarray(self.kab_.predict_proba(X), dtype=np.float32)
+        mode = self._params['fusion_mode']
+        w = float(self._params['stack_weight'])
+        w = max(0.0, min(1.0, w))
+
+        def _rank01(v):
+            n = len(v)
+            if n == 0:
+                return v
+            order = np.argsort(v, kind='mergesort')
+            ranks = np.empty(n, dtype=np.float32)
+            ranks[order] = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+            return ranks
+
+        if mode == 'rank_mean':
+            # Symmetric (default) rank-mean — both engines vote equally.
+            return (w * _rank01(p_h) + (1.0 - w) * _rank01(p_k)).astype(np.float32)
+        if mode == 'prob_mean':
+            return (w * p_h + (1.0 - w) * p_k).astype(np.float32)
+        if mode == 'rank_max':
+            return np.maximum(_rank01(p_h), _rank01(p_k)).astype(np.float32)
+        if mode == 'rank_min':
+            # Both-must-agree consensus — filters out single-engine FPs.
+            return np.minimum(_rank01(p_h), _rank01(p_k)).astype(np.float32)
+        # Default fallback: rank-mean
+        return (w * _rank01(p_h) + (1.0 - w) * _rank01(p_k)).astype(np.float32)
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def best_iteration(self):
+        return None
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        histgb_dir = os.path.join(output_dir, 'histgb')
+        kab_dir = os.path.join(output_dir, 'kab')
+        self.histgb_.save(histgb_dir)
+        self.kab_.save(kab_dir)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        meta = {'trainer': self.name, 'hyperparams': self._params}
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'metadata': meta_path, 'histgb_dir': histgb_dir, 'kab_dir': kab_dir}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        inst.histgb_ = HistGBMonotonicTrainer.load(os.path.join(output_dir, 'histgb'))
+        inst.kab_ = KernelAnomalyBlendTrainer.load(os.path.join(output_dir, 'kab'))
+        return inst
+
+
 class TorchXLSTMTrainer(BaseTrainer):
     name = 'torch_xlstm'
     consumes_sequences = True
@@ -13932,6 +14119,7 @@ TRAINERS = {
     'kernel_anomaly_blend': KernelAnomalyBlendTrainer,
     'rocket_classifier': ROCKETClassifierTrainer,
     'torch_xlstm': TorchXLSTMTrainer,
+    'kernel_histgb_stack': KernelHistGBStackTrainer,
 }
 
 

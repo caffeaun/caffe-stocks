@@ -1431,6 +1431,27 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':         [15, 25, 35],
     'batch_size':     [256, 512],
 },
+'kernel_histgb_stack': {
+    'histgb_max_iter':            [200, 400, 800],
+    'histgb_max_leaf_nodes':      [31, 63, 127],
+    'histgb_learning_rate':       (0.01, 0.10),
+    'histgb_min_samples_leaf':    [20, 50, 100],
+    'histgb_l2_regularization':   (0.0, 3.0),
+    'histgb_pos_class_weight':    (1.5, 5.0),
+    'histgb_use_monotonic':       [True, False],
+    'kab_gate_threshold':         (0.05, 0.40),
+    'kab_gating_alpha':           (0.5, 3.0),
+    'kab_anom_max_iter':          [200, 400, 800],
+    'kab_anom_learning_rate':     (0.02, 0.10),
+    'kab_anom_pos_class_weight':  (1.5, 4.0),
+    'kab_kernel_n_components':    [200, 300, 500],
+    'kab_kernel_gamma':           (0.3, 2.0),
+    'kab_kernel_C':               (0.5, 10.0),
+    'kab_fusion_mode':            ['max', 'mean', 'rank_max', 'rank_min'],
+    'stack_weight':               (0.2, 0.8),
+    'fusion_mode':                ['rank_mean', 'prob_mean', 'rank_max', 'rank_min'],
+    'random_state':               [42, 7, 1337],
+},
 }
 
 
