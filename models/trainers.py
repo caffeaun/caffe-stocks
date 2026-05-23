@@ -18,6 +18,15 @@ from typing import Optional
 
 import numpy as np
 
+# Workaround for current host: NVML library (595.71) is newer than the loaded
+# kernel driver, so torch.cuda's NVML-driven device-count check inside the
+# CUDA caching allocator hits "NVML_SUCCESS == nvmlInit_v2_() ASSERT FAILED"
+# on multi-GPU enumeration. backend:native skips the NVML path, and pinning
+# to GPU 0 sidesteps the multi-device enumeration entirely. Both via
+# setdefault so an explicit cron-level override still wins.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'backend:native')
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+
 
 class BaseTrainer:
     """Interface for binary classifiers in the v1 pipeline."""
@@ -14434,6 +14443,298 @@ class ROCKETBaggedCalibratedTrainer(BaseTrainer):
         return inst
 
 
+# Iter #1706 — TimesFM-2.5 (Google patched decoder-only TS foundation model)
+# frozen-backbone zero-shot quantile forecast → MLP classifier head. Brief
+# §5b 2026-05-23 recommends this as a complementary information channel to
+# the registered Chronos-2 (value-token encoder) and Time-MoE (sparse MoE
+# decoder) foundation-model slots — TimesFM patches continuous values
+# instead of tokenizing them, so its quantile spread carries independently
+# calibrated regime-conditional uncertainty.
+#
+# Inductive prior: pass one univariate channel (default = last column =
+# set_ret_5d_zscore_60d, a regime-invariant return z-score) into TimesFM,
+# get 1 point + 10 quantile forecasts per row, concatenate with the
+# last-step tabular row, train a small MLP head on top.
+#
+# Host workarounds (this machine, May-2026):
+#   - NVML library/driver mismatch: PYTORCH_CUDA_ALLOC_CONF=backend:native
+#     and CUDA_VISIBLE_DEVICES=0 (set at module top above).
+#   - ForecastConfig max_context capped at 512 / per_core_batch_size=64 —
+#     larger values trigger the failing NVML path inside the KV-cache
+#     allocation. seq_len=20 << 512 so the input fits without truncation.
+class _TimesFMHead:
+    """Lazy import lives in the trainer to keep module-level imports light."""
+
+    @staticmethod
+    def build(in_dim, hidden, dropout):
+        import torch.nn as nn
+
+        class _Head(nn.Module):
+            def __init__(self, D, H, dp):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(D, H), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(H, H), nn.GELU(), nn.Dropout(dp),
+                    nn.Linear(H, 1),
+                )
+
+            def forward(self, x):
+                return self.net(x).squeeze(-1)
+
+        return _Head(int(in_dim), int(hidden), float(dropout))
+
+
+# Module-level singleton — TimesFM weights are ~800MB; load once across the
+# 7 gate windows.
+_TIMESFM_CACHE: dict = {}
+
+
+class TorchTimesFMTrainer(BaseTrainer):
+    """Frozen TimesFM-2.5 backbone → MLP classifier head."""
+
+    name = 'torch_timesfm'
+    consumes_sequences = True
+
+    def __init__(self,
+                 model_id: str = 'google/timesfm-2.5-200m-pytorch',
+                 horizon: int = 1,
+                 channel_index: int = -1,
+                 head_hidden: int = 128,
+                 dropout: float = 0.15,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 pos_weight: float = 1.5,
+                 epochs: int = 30,
+                 batch_size: int = 512,
+                 inference_batch: int = 1024,
+                 patience: int = 5,
+                 max_context: int = 512,
+                 max_horizon: int = 64,
+                 per_core_batch_size: int = 64,
+                 device: str = None,
+                 random_state: int = 42,
+                 **_):
+        self.model_id = str(model_id)
+        self.horizon = int(horizon)
+        self.channel_index = int(channel_index)
+        self.head_hidden = int(head_hidden)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.pos_weight = float(pos_weight)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.inference_batch = int(inference_batch)
+        self.patience = int(patience)
+        self.max_context = int(max_context)
+        self.max_horizon = int(max_horizon)
+        self.per_core_batch_size = int(per_core_batch_size)
+        self.requested_device = device
+        self.random_state = int(random_state)
+        self._head = None
+        self._scaler_mean = None
+        self._scaler_std = None
+        self._in_dim = None
+        self._device = None
+
+    def _resolve_device(self):
+        import torch
+        if self.requested_device:
+            return self.requested_device
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _load_backbone(self):
+        key = (self.model_id, self.max_context, self.max_horizon,
+               self.per_core_batch_size)
+        if key in _TIMESFM_CACHE:
+            return _TIMESFM_CACHE[key]
+        import timesfm
+        from huggingface_hub import hf_hub_download
+        weight_file = hf_hub_download(repo_id=self.model_id,
+                                       filename='model.safetensors')
+        tfm = timesfm.TimesFM_2p5_200M_torch()
+        tfm.model.load_checkpoint(weight_file, torch_compile=False)
+        device = self._resolve_device()
+        tfm.model.to(device)
+        tfm.compile(timesfm.ForecastConfig(
+            max_context=self.max_context,
+            max_horizon=self.max_horizon,
+            normalize_inputs=True,
+            use_continuous_quantile_head=True,
+            force_flip_invariance=True,
+            infer_is_positive=False,
+            fix_quantile_crossing=True,
+            per_core_batch_size=self.per_core_batch_size,
+        ))
+        _TIMESFM_CACHE[key] = tfm
+        self._device = device
+        return tfm
+
+    def _encode(self, X_3d):
+        """Run TimesFM forecast on one channel per row. Returns (N, 11*horizon)."""
+        tfm = self._load_backbone()
+        N, L, C = X_3d.shape
+        ci = self.channel_index if self.channel_index >= 0 else (C + self.channel_index)
+        ci = max(0, min(int(ci), C - 1))
+        channel = X_3d[:, :, ci].astype(np.float32)
+        channel = np.nan_to_num(channel, nan=0.0, posinf=0.0, neginf=0.0)
+        out_chunks = []
+        bs = max(self.inference_batch, self.per_core_batch_size)
+        for i in range(0, N, bs):
+            j = min(N, i + bs)
+            inputs = [channel[k] for k in range(i, j)]
+            point_fc, quant_fc = tfm.forecast(horizon=self.horizon, inputs=inputs)
+            pf = np.asarray(point_fc, dtype=np.float32).reshape(j - i, self.horizon, 1)
+            qf = np.asarray(quant_fc, dtype=np.float32).reshape(j - i, self.horizon, -1)
+            emb = np.concatenate([pf, qf], axis=2).reshape(j - i, -1)
+            out_chunks.append(emb)
+        return np.concatenate(out_chunks, axis=0)
+
+    @staticmethod
+    def _stack_features(X_3d, emb):
+        last = X_3d[:, -1, :].astype(np.float32)
+        last = np.nan_to_num(last, nan=0.0, posinf=0.0, neginf=0.0)
+        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.concatenate([last, emb], axis=1)
+
+    def _fit_scaler(self, F):
+        self._scaler_mean = F.mean(axis=0).astype(np.float32)
+        self._scaler_std = (F.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_scaler(self, F):
+        return ((F - self._scaler_mean) / self._scaler_std).astype(np.float32)
+
+    def fit(self, X_train, y_train, X_val=None, y_val=None, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        import torch
+        import torch.nn as nn
+
+        X_tr_3d = np.asarray(X_train, dtype=np.float32)
+        if X_tr_3d.ndim != 3:
+            raise ValueError(
+                f'torch_timesfm expects 3D sequence input (N, L, F); '
+                f'got shape {X_tr_3d.shape}.')
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        emb_tr = self._encode(X_tr_3d)
+        F_tr = self._stack_features(X_tr_3d, emb_tr)
+        self._fit_scaler(F_tr)
+        F_tr = self._apply_scaler(F_tr)
+        self._in_dim = int(F_tr.shape[1])
+
+        has_val = (X_val is not None) and (y_val is not None) and len(y_val) > 0
+        if has_val:
+            X_val_3d = np.asarray(X_val, dtype=np.float32)
+            emb_val = self._encode(X_val_3d)
+            F_val = self._apply_scaler(self._stack_features(X_val_3d, emb_val))
+        else:
+            F_val = None
+
+        device = self._device or self._resolve_device()
+        self._head = _TimesFMHead.build(self._in_dim, self.head_hidden,
+                                         self.dropout).to(device)
+        opt = torch.optim.AdamW(self._head.parameters(),
+                                 lr=self.learning_rate,
+                                 weight_decay=self.weight_decay)
+        pos_w = torch.tensor([self.pos_weight], device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+
+        F_tr_t = torch.from_numpy(F_tr).to(device)
+        y_tr_t = torch.from_numpy(np.asarray(y_train, dtype=np.float32).reshape(-1)).to(device)
+        if has_val:
+            F_val_t = torch.from_numpy(F_val).to(device)
+            y_val_t = torch.from_numpy(np.asarray(y_val, dtype=np.float32).reshape(-1)).to(device)
+
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        N = F_tr_t.size(0)
+        for _ep in range(self.epochs):
+            self._head.train()
+            perm = torch.randperm(N, device=device)
+            for i in range(0, N, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                logit = self._head(F_tr_t[idx])
+                loss = loss_fn(logit, y_tr_t[idx])
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self._head.parameters(), 1.0)
+                opt.step()
+            if has_val:
+                self._head.eval()
+                with torch.no_grad():
+                    vloss = loss_fn(self._head(F_val_t), y_val_t).item()
+                if vloss < best_val - 1e-4:
+                    best_val = vloss
+                    best_state = {k: v.detach().clone()
+                                  for k, v in self._head.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+        if best_state is not None:
+            self._head.load_state_dict(best_state)
+        self._head.eval()
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        import torch
+        if self._head is None:
+            raise RuntimeError('TorchTimesFMTrainer.predict_proba before fit')
+        X_3d = np.asarray(X, dtype=np.float32)
+        if X_3d.ndim != 3:
+            raise ValueError(
+                f'torch_timesfm.predict_proba expects 3D input (N, L, F); '
+                f'got shape {X_3d.shape}.')
+        emb = self._encode(X_3d)
+        F = self._apply_scaler(self._stack_features(X_3d, emb))
+        device = self._device or self._resolve_device()
+        out = []
+        self._head.eval()
+        bs = max(self.batch_size, 1)
+        with torch.no_grad():
+            for i in range(0, F.shape[0], bs):
+                xb = torch.from_numpy(F[i:i + bs]).to(device)
+                p = torch.sigmoid(self._head(xb)).cpu().numpy().astype(np.float64)
+                out.append(p)
+        return np.concatenate(out, axis=0)
+
+    @property
+    def hyperparams(self):
+        return dict(
+            model_id=self.model_id, horizon=self.horizon,
+            channel_index=self.channel_index, head_hidden=self.head_hidden,
+            dropout=self.dropout, learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay, pos_weight=self.pos_weight,
+            epochs=self.epochs, batch_size=self.batch_size,
+            inference_batch=self.inference_batch, patience=self.patience,
+            max_context=self.max_context, max_horizon=self.max_horizon,
+            per_core_batch_size=self.per_core_batch_size,
+            random_state=self.random_state,
+        )
+
+    def save(self, output_dir, extra=None):
+        import torch
+        os.makedirs(output_dir, exist_ok=True)
+        state_path = os.path.join(output_dir, 'timesfm_head.pt')
+        torch.save({
+            'state_dict': self._head.state_dict() if self._head is not None else None,
+            'in_dim': self._in_dim,
+            'scaler_mean': self._scaler_mean,
+            'scaler_std': self._scaler_std,
+        }, state_path)
+        meta = dict(self.hyperparams, in_dim=self._in_dim)
+        if extra:
+            meta.update(extra)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+        return {'state': state_path, 'meta': meta_path}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -14501,6 +14802,7 @@ TRAINERS = {
     'torch_xlstm': TorchXLSTMTrainer,
     'kernel_histgb_stack': KernelHistGBStackTrainer,
     'rocket_bagged_calibrated': ROCKETBaggedCalibratedTrainer,
+    'torch_timesfm': TorchTimesFMTrainer,
 }
 
 

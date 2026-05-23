@@ -1468,6 +1468,19 @@ SEARCH_SPACES: dict[str, dict] = {
     'per_date_zscore':          [True, False],
     'random_state':             [42, 7, 1337, 2024],
 },
+'torch_timesfm': {
+    'horizon':         [1, 3, 5],
+    'channel_index':   [-1, 0, 7, 8],
+    'head_hidden':     [64, 128, 256],
+    'dropout':         (0.0, 0.35),
+    'learning_rate':   (1e-4, 5e-3),
+    'weight_decay':    (1e-5, 1e-3),
+    'pos_weight':      [1.0, 1.5, 2.0, 2.5],
+    'epochs':          [20, 30, 50],
+    'batch_size':      [256, 512, 1024],
+    'inference_batch': [512, 1024, 2048],
+    'random_state':    [42, 7, 1337],
+},
 }
 
 
