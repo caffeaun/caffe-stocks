@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First TimesFM run at default HPs hit 2/7 including W1 (+67.6% ann, 48.3% WR @ thr=0.65) AND W5 (+/-30% ann, 40.9% WR @ thr=0.3 \u2014 first W5 break in 20+ iters from a structurally new bear-regime prior). W7 missed by 0.7pp WR (+71.4% ann); W2/W3/W6 collapsed to thr=0.0 flood. Train mode should sweep pos_weight (1.5\u21922.0\u20132.5 to fix score collapse) and channel_index \u2208 {-1, 0, 7, 8} per the brief's diagnostic \u2014 and dropout/head_hidden for over-flood regularization. The 11-dim HP space is wide open and W7's 0.7pp gap is the highest-leverage near-term win.",
-  "claude_iter_id": 1721,
-  "designated_at": "2026-05-23T09:17:34"
+  "rationale": "Iter #1721 default (pos_weight=1.5, channel_index=-1) remains best at 2/7 (W1 +67.6%, W5 +/-30% \u2014 first W5 break in 20 iters). Iter #1722 confirmed pos_weight \u22652.0 regresses to 0/7 by collapsing the threshold sweep, so train mode should sweep pos_weight \u2208 [1.0, 1.5] x channel_index \u2208 {-1, 0, 7, 8} x dropout/head_hidden. The W5 break is the structural lift; protect it by NOT raising pos_weight above 1.5.",
+  "claude_iter_id": 1722,
+  "designated_at": "2026-05-24T15:16:17"
 }
