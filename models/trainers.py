@@ -12599,15 +12599,18 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
     """IsolationForest-gated HistGB classifier for OOD abstention on bear windows.
 
     Iter #1675 addition: ``day_abstain_q`` adds a *date-level* abstention floor
-    on top of the existing per-row IF gate. During fit, the trainer records the
-    per-training-date mean IF anomaly score (lower = whole day's cross-section
-    is more OOD vs the IF-fit distribution). At inference, any test date whose
-    mean IF score falls in the bottom ``day_abstain_q`` quantile of training
-    day-means has ALL row predictions zeroed — the model abstains the entire
-    day rather than just dampening individual rows. This targets W5
-    (Jan-Apr 2025, breadth=31.7%, SET return -12.7%) where Part A shows
-    1/20 passes across last 20 iters regardless of trainer family. The
-    rank-fusion W5 unlock (iter #1499) used a similar date-level mechanism."""
+    on top of the existing per-row IF gate.
+
+    Iter #1723 addition: ``anomaly_as_feature`` feeds the per-row IF anomaly
+    score as an ADDITIONAL HistGB feature (with monotonic +1 constraint —
+    more normal → higher win probability). Before, IF was used only as a
+    post-hoc multiplicative gate; now the model can learn NONLINEAR
+    INTERACTIONS between anomaly and other features (e.g., "high atr_pct
+    AND high anomaly → reject"). This addresses the failure mode of
+    torch_timesfm (iter #1721/#1722), where regime-uniform input produced
+    score collapse on bear windows — feeding an explicit per-row
+    anomaly signal as a tree feature gives the classifier within-day
+    dispersion that the multiplicative gate alone cannot produce."""
 
     name = 'anomaly_gated_histgb'
 
@@ -12626,6 +12629,10 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
                  # mean IF score lies below this quantile of training-day means.
                  # 0.0 disables. Iter #1675.
                  day_abstain_q: float = 0.25,
+                 # Anomaly score concatenated as HistGB feature (iter #1723).
+                 # Adds 1 column to X with monotonic +1 constraint (higher IF
+                 # score = more normal = higher win prob).
+                 anomaly_as_feature: bool = True,
                  # HistGB knobs (default to iter #1527 best 5/7 HPs)
                  max_iter: int = 400,
                  max_leaf_nodes: int = 31,
@@ -12651,6 +12658,7 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
             gate_threshold=float(gate_threshold),
             gating_alpha=float(gating_alpha),
             day_abstain_q=float(day_abstain_q),
+            anomaly_as_feature=bool(anomaly_as_feature),
             max_iter=int(max_iter),
             max_leaf_nodes=int(max_leaf_nodes),
             max_depth=None if max_depth in (None, 0, -1) else int(max_depth),
@@ -12682,7 +12690,8 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         except Exception:
             return None
         F = len(CURATED_FEATURES)
-        if n_features != 4 * F:
+        extra = 1 if self._params.get('anomaly_as_feature', False) else 0
+        if n_features != 4 * F + extra:
             return None
         cst = np.zeros(n_features, dtype=np.int8)
         name_to_idx = {n: i for i, n in enumerate(CURATED_FEATURES)}
@@ -12692,6 +12701,10 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
                 continue
             cst[i] = 1
             cst[F + i] = 1
+        if extra:
+            # The anomaly column is appended at the end. Higher IF
+            # score = more normal = higher predicted win probability.
+            cst[-1] = 1
         return cst
 
     def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
@@ -12705,8 +12718,6 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         p = self._params
         X_full = np.vstack([X_train, X_val])
         y_full = np.concatenate([y_train, y_val])
-        self._n_features = X_full.shape[1]
-        self._monotonic_cst = self._build_monotonic_constraints(self._n_features)
 
         # Fit IsolationForest on training distribution. Lower max_samples
         # increases tree diversity and produces a smoother quantile rank.
@@ -12722,6 +12733,14 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
         # inference. score_samples returns higher = more normal.
         train_anom = self.iso_.score_samples(X_full).astype(np.float32)
         self._train_anom_sorted = np.sort(train_anom)
+
+        if p.get('anomaly_as_feature', False):
+            X_full_fit = np.hstack(
+                [X_full, train_anom.reshape(-1, 1).astype(X_full.dtype)])
+        else:
+            X_full_fit = X_full
+        self._n_features = X_full_fit.shape[1]
+        self._monotonic_cst = self._build_monotonic_constraints(self._n_features)
 
         # Per-training-date mean IF score → distribution of "how OOD is the
         # whole day's cross-section". Used by the day-level abstention gate at
@@ -12756,7 +12775,7 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
             random_state=p['random_state'],
             verbose=0,
         )
-        self.histgb_.fit(X_full, y_full, sample_weight=sw)
+        self.histgb_.fit(X_full_fit, y_full, sample_weight=sw)
         return self
 
     def _gate(self, X) -> np.ndarray:
@@ -12783,7 +12802,12 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
     def predict_proba(self, X) -> np.ndarray:
         if self.histgb_ is None:
             raise RuntimeError('Model not fit')
-        p_clf = self.histgb_.predict_proba(X)[:, 1].astype(np.float32)
+        anom_test = self.iso_.score_samples(X).astype(np.float32)
+        if self._params.get('anomaly_as_feature', False):
+            X_pred = np.hstack([X, anom_test.reshape(-1, 1).astype(X.dtype)])
+        else:
+            X_pred = X
+        p_clf = self.histgb_.predict_proba(X_pred)[:, 1].astype(np.float32)
         gate = self._gate(X)
         scores = (p_clf * gate).astype(np.float32)
 
@@ -12792,7 +12816,6 @@ class AnomalyGatedHistGBTrainer(BaseTrainer):
                 and self._train_day_anom_sorted is not None
                 and len(self._train_day_anom_sorted) > 0
                 and len(self._predict_dates) == len(scores)):
-            anom_test = self.iso_.score_samples(X).astype(np.float32)
             d = np.asarray(self._predict_dates)
             sorted_day = self._train_day_anom_sorted
             n_day = len(sorted_day)
@@ -14735,6 +14758,288 @@ class TorchTimesFMTrainer(BaseTrainer):
         return {'state': state_path, 'meta': meta_path}
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _PLRLiteEncoder(nn.Module):
+    """Periodic-Linear-ReLU 'lite' encoder for numerical features (ModernNCA, ICLR 2025).
+
+    For each feature x_j, build cos/sin(2*pi * x_j * c_jk) over K learned coefficients
+    c_jk, then a per-feature Linear+ReLU into d_emb dims. Outputs (B, n_features * d_emb).
+    """
+
+    def __init__(self, n_features: int, n_frequencies: int = 24,
+                 sigma: float = 1.0, d_emb: int = 16):
+        super().__init__()
+        self.n_features = n_features
+        self.n_frequencies = n_frequencies
+        # one set of coefficients per feature
+        self.coefficients = nn.Parameter(torch.randn(n_features, n_frequencies) * sigma)
+        self.linear = nn.Linear(2 * n_frequencies, d_emb)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (B, n_features)
+        # broadcast: (B, F, 1) * (1, F, K) -> (B, F, K)
+        z = 2 * math.pi * x.unsqueeze(-1) * self.coefficients.unsqueeze(0)
+        z = torch.cat([torch.cos(z), torch.sin(z)], dim=-1)  # (B, F, 2K)
+        z = F.relu(self.linear(z))  # (B, F, d_emb)
+        return z.flatten(start_dim=1)  # (B, F * d_emb)
+
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, dim: int, hidden: int, dropout: float):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(dim)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        h = self.bn(x)
+        h = F.relu(self.fc1(h))
+        h = self.drop(h)
+        h = self.fc2(h)
+        return x + h
+
+
+class _ModernNCAEncoder(nn.Module):
+    """Deep encoder φ that maps (B, n_features) -> (B, d_embed)."""
+
+    def __init__(self, n_features: int, d_embed: int = 128, n_blocks: int = 2,
+                 hidden_mult: int = 2, dropout: float = 0.1,
+                 plr_freq: int = 24, plr_sigma: float = 1.0, plr_d_emb: int = 16):
+        super().__init__()
+        self.num_enc = _PLRLiteEncoder(n_features, n_frequencies=plr_freq,
+                                       sigma=plr_sigma, d_emb=plr_d_emb)
+        d_after_plr = n_features * plr_d_emb
+        self.proj_in = nn.Linear(d_after_plr, d_embed)
+        self.blocks = nn.ModuleList([
+            _ResidualBlock(d_embed, d_embed * hidden_mult, dropout)
+            for _ in range(n_blocks)
+        ])
+        self.proj_out = nn.Linear(d_embed, d_embed)
+
+    def forward(self, x):
+        h = self.num_enc(x)
+        h = self.proj_in(h)
+        for blk in self.blocks:
+            h = blk(h)
+        return self.proj_out(h)
+
+
+class ModernNCATrainer(BaseTrainer):
+    """ModernNCA — differentiable deep nearest-neighbour (ICLR 2025).
+
+    Reference: Ye et al., "Revisiting Nearest Neighbor for Tabular Data: A Deep Tabular
+    Baseline Two Decades Later", arXiv:2407.03257.
+
+    Architecture:
+        x  ->  PLR-lite per-feature embedding  ->  residual MLP encoder φ  ->  z
+        p(y=1 | x) = sum_j softmax(-||z - φ(x_j)||^2)_j * 1[y_j = 1]
+
+    Training: cross-entropy on soft-NN probabilities. Stochastic Neighbourhood Sampling
+    (SNS): each minibatch's "neighbour bank" is a uniform-random subsample (rate
+    sns_rate) of the training set, so the encoder learns from many candidate sets
+    rather than a single fixed graph.
+
+    Inference: the full training set (post-fit) is the retrieval bank; this trainer
+    therefore keeps X_train / y_train in memory and re-encodes them when predict_proba
+    is called. Memory for our 190k x 96 setup: O(190k * d_embed) ≈ 100MB on GPU.
+    """
+
+    name = 'modernnca'
+    consumes_sequences = False
+
+    def __init__(self, d_embed: int = 128, n_blocks: int = 2, hidden_mult: int = 2,
+                 dropout: float = 0.1, plr_freq: int = 24, plr_sigma: float = 1.0,
+                 plr_d_emb: int = 16, lr: float = 1e-3, weight_decay: float = 1e-4,
+                 batch_size: int = 1024, sns_rate: float = 0.2, epochs: int = 50,
+                 patience: int = 8, inference_batch: int = 256, seed: int = 0,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.d_embed = int(d_embed)
+        self.n_blocks = int(n_blocks)
+        self.hidden_mult = int(hidden_mult)
+        self.dropout = float(dropout)
+        self.plr_freq = int(plr_freq)
+        self.plr_sigma = float(plr_sigma)
+        self.plr_d_emb = int(plr_d_emb)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.sns_rate = float(sns_rate)
+        self.epochs = int(epochs)
+        self.patience = int(patience)
+        self.inference_batch = int(inference_batch)
+        self.seed = int(seed)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self._encoder = None
+        self._X_train_t = None
+        self._y_train_t = None
+        self._x_mean = None
+        self._x_std = None
+
+    def _standardize(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        if fit:
+            self._x_mean = X.mean(axis=0).astype(np.float32)
+            self._x_std = (X.std(axis=0) + 1e-6).astype(np.float32)
+        return ((X - self._x_mean) / self._x_std).astype(np.float32)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        X_tr = self._standardize(np.asarray(X_tr, dtype=np.float32), fit=True)
+        X_val = self._standardize(np.asarray(X_val, dtype=np.float32), fit=False)
+        y_tr = np.asarray(y_tr, dtype=np.int64).reshape(-1)
+        y_val = np.asarray(y_val, dtype=np.int64).reshape(-1)
+
+        n_features = X_tr.shape[1]
+        self._encoder = _ModernNCAEncoder(
+            n_features=n_features, d_embed=self.d_embed, n_blocks=self.n_blocks,
+            hidden_mult=self.hidden_mult, dropout=self.dropout,
+            plr_freq=self.plr_freq, plr_sigma=self.plr_sigma, plr_d_emb=self.plr_d_emb,
+        ).to(self.device)
+
+        X_tr_t = torch.from_numpy(X_tr).to(self.device)
+        y_tr_t = torch.from_numpy(y_tr).to(self.device)
+        X_val_t = torch.from_numpy(X_val).to(self.device)
+        y_val_t = torch.from_numpy(y_val).to(self.device)
+        self._X_train_t = X_tr_t
+        self._y_train_t = y_tr_t
+
+        opt = torch.optim.AdamW(self._encoder.parameters(), lr=self.lr,
+                                weight_decay=self.weight_decay)
+
+        N = X_tr_t.shape[0]
+        n_cand = max(128, int(N * self.sns_rate))
+
+        best_val = float('inf')
+        bad_epochs = 0
+        best_state = None
+
+        for epoch in range(self.epochs):
+            self._encoder.train()
+            perm = torch.randperm(N, device=self.device)
+            for i in range(0, N, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                x_q = X_tr_t[idx]
+                y_q = y_tr_t[idx]
+
+                # SNS: stochastic candidate pool (uniform sample from training set)
+                cand_idx = torch.randint(0, N, (n_cand,), device=self.device)
+                x_c = X_tr_t[cand_idx]
+                y_c = y_tr_t[cand_idx]
+
+                e_q = self._encoder(x_q)            # (B, d)
+                e_c = self._encoder(x_c)            # (n_cand, d)
+                # squared euclidean distance (ModernNCA uses Euclidean, not squared
+                # in the equation but standard implementations square it inside softmax)
+                d2 = torch.cdist(e_q, e_c, p=2.0) ** 2  # (B, n_cand)
+                w = torch.softmax(-d2, dim=1)       # (B, n_cand)
+                p1 = (w * (y_c == 1).float().unsqueeze(0)).sum(dim=1)
+                p1 = p1.clamp(1e-7, 1 - 1e-7)
+                target = (y_q == 1).float()
+                loss = -(target * torch.log(p1) + (1 - target) * torch.log(1 - p1)).mean()
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+            # validation: soft-NN over the full training set
+            self._encoder.eval()
+            with torch.no_grad():
+                p_val = self._predict_proba_torch(X_val_t)
+                p_val = p_val.clamp(1e-7, 1 - 1e-7)
+                val_loss = F.binary_cross_entropy(p_val, (y_val_t == 1).float()).item()
+
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                bad_epochs = 0
+                best_state = {k: v.detach().clone() for k, v in self._encoder.state_dict().items()}
+            else:
+                bad_epochs += 1
+                if bad_epochs >= self.patience:
+                    break
+
+        if best_state is not None:
+            self._encoder.load_state_dict(best_state)
+        self._encoder.eval()
+
+    def _predict_proba_torch(self, X_t: torch.Tensor) -> torch.Tensor:
+        """Soft-NN probability of class 1 for each query against full training set."""
+        self._encoder.eval()
+        N_train = self._X_train_t.shape[0]
+        with torch.no_grad():
+            # encode full train set once, chunked for memory
+            chunks = []
+            for i in range(0, N_train, self.batch_size):
+                chunks.append(self._encoder(self._X_train_t[i:i + self.batch_size]))
+            train_emb = torch.cat(chunks, dim=0)  # (N_train, d)
+            y_train_one = (self._y_train_t == 1).float()  # (N_train,)
+
+            out = []
+            for i in range(0, X_t.shape[0], self.inference_batch):
+                e_q = self._encoder(X_t[i:i + self.inference_batch])
+                d2 = torch.cdist(e_q, train_emb, p=2.0) ** 2
+                w = torch.softmax(-d2, dim=1)
+                p1 = (w * y_train_one.unsqueeze(0)).sum(dim=1)
+                out.append(p1)
+            return torch.cat(out, dim=0)
+
+    def predict_proba(self, X) -> np.ndarray:
+        X = self._standardize(np.asarray(X, dtype=np.float32), fit=False)
+        X_t = torch.from_numpy(X).to(self.device)
+        with torch.no_grad():
+            p = self._predict_proba_torch(X_t).cpu().numpy()
+        return p.astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        model_dir = Path(model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'encoder_state': self._encoder.state_dict(),
+            'X_train': self._X_train_t.cpu().numpy(),
+            'y_train': self._y_train_t.cpu().numpy(),
+            'x_mean': self._x_mean,
+            'x_std': self._x_std,
+            'd_embed': self.d_embed,
+            'n_blocks': self.n_blocks,
+            'hidden_mult': self.hidden_mult,
+            'dropout': self.dropout,
+            'plr_freq': self.plr_freq,
+            'plr_sigma': self.plr_sigma,
+            'plr_d_emb': self.plr_d_emb,
+        }, str(model_dir / 'modernnca.pt'))
+        meta = {
+            'name': self.name,
+            'd_embed': self.d_embed,
+            'n_blocks': self.n_blocks,
+            'hidden_mult': self.hidden_mult,
+            'dropout': self.dropout,
+            'plr_freq': self.plr_freq,
+            'plr_sigma': self.plr_sigma,
+            'plr_d_emb': self.plr_d_emb,
+            'sns_rate': self.sns_rate,
+            'batch_size': self.batch_size,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            'epochs': self.epochs,
+            'patience': self.patience,
+            'seed': self.seed,
+        }
+        if extra:
+            meta.update(extra)
+        with open(model_dir / 'meta.json', 'w') as f:
+            json.dump(meta, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -14803,6 +15108,7 @@ TRAINERS = {
     'kernel_histgb_stack': KernelHistGBStackTrainer,
     'rocket_bagged_calibrated': ROCKETBaggedCalibratedTrainer,
     'torch_timesfm': TorchTimesFMTrainer,
+    'modernnca': ModernNCATrainer,
 }
 
 

@@ -1363,6 +1363,7 @@ SEARCH_SPACES: dict[str, dict] = {
     'l2_regularization':  (0.0, 3.0),
     'pos_class_weight':   (1.5, 4.0),
     'use_monotonic':      [True, False],
+    'anomaly_as_feature': [True, False],
     'random_state':       [42, 7, 1337],
 },
 # DAE + LR head (iter #1530). The autoencoder bottleneck width and noise
@@ -1480,6 +1481,21 @@ SEARCH_SPACES: dict[str, dict] = {
     'batch_size':      [256, 512, 1024],
     'inference_batch': [512, 1024, 2048],
     'random_state':    [42, 7, 1337],
+},
+    'modernnca': {
+    'd_embed':       [64, 128, 192, 256],
+    'n_blocks':      [1, 2, 3, 4],
+    'hidden_mult':   [1, 2, 3],
+    'dropout':       (0.0, 0.4),
+    'plr_freq':      [16, 24, 32, 48],
+    'plr_sigma':     (0.3, 2.0),
+    'plr_d_emb':     [8, 16, 24, 32],
+    'lr':            (1e-4, 5e-3),
+    'weight_decay':  (1e-6, 1e-3),
+    'sns_rate':      (0.05, 0.6),
+    'batch_size':    [512, 1024, 2048],
+    'epochs':        [30, 50, 75, 100],
+    'patience':      [5, 8, 12],
 },
 }
 
