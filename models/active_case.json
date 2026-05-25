@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_timesfm",
+  "trainer": "modernnca",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Iter #1721 default (pos_weight=1.5, channel_index=-1) remains best at 2/7 (W1 +67.6%, W5 +/-30% \u2014 first W5 break in 20 iters). Iter #1722 confirmed pos_weight \u22652.0 regresses to 0/7 by collapsing the threshold sweep, so train mode should sweep pos_weight \u2208 [1.0, 1.5] x channel_index \u2208 {-1, 0, 7, 8} x dropout/head_hidden. The W5 break is the structural lift; protect it by NOT raising pos_weight above 1.5.",
-  "claude_iter_id": 1722,
-  "designated_at": "2026-05-24T15:16:17"
+  "rationale": "Iter #1724 executed the 2026-05-25 ModernNCA brief: default HPs 0/7 wp but avg_ann +11.2% beats both baselines (random_topk -30.2%, rule_only -27.8%) by ~40pp, with W6 +54.9% ann / 31.7% WR / 41 trades and W7 +95.6% ann / 36.7% WR / 30 trades at thr=0.0 \u2014 the highest avg_ann of any 0/7 trainer in recent history. Every window produced trades (no flood on bear, no starvation on bull) but uniform WR collapse to 25-37% (<40% floor) indicates the soft-NN weights are too smooth. Train mode should sweep dropout\u2193\u2208[0.0,0.1] x sns_rate\u2193\u2208[0.05,0.15] (smaller candidate pool tightens neighbour weights) x d_embed\u2191\u2208[192,256] x n_blocks\u2208[2,3,4] x plr_sigma\u2208[0.5,1.5] \u2014 score sharpening is the single most valuable lift. W1 is the diagnostic window: it currently produces trades only at thr=0.0 (score collapse); the first HP combo that re-opens thr=0.3 trades on W1 with WR\u226540% is the ceiling-breaker.",
+  "claude_iter_id": 1723,
+  "designated_at": "2026-05-25T12:05:45"
 }
