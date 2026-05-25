@@ -1516,6 +1516,23 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':        [30, 50, 75, 100],
     'patience':      [5, 8, 12],
 },
+'torch_sundial': {
+    'channel_index':         [0, 1, 7, 8, 23],
+    'lookback':              [20],
+    'forecast_length':       [3, 5, 10],
+    'num_samples':           [8, 16, 32],
+    'hidden_dim':            [64, 128, 256],
+    'n_head_layers':         [1, 2, 3],
+    'dropout':               (0.05, 0.30),
+    'learning_rate':         (1e-4, 5e-3),
+    'weight_decay':          (1e-6, 1e-3),
+    'pos_weight':            (0.8, 1.5),
+    'use_tabular_features':  [True, False],
+    'inference_batch_size':  [128, 256, 512],
+    'batch_size':            [256, 512, 1024],
+    'n_epochs':              [30, 40, 60],
+    'seed':                  [1234, 42, 7],
+},
 }
 
 

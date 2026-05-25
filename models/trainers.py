@@ -15207,6 +15207,348 @@ class ModernNCATrainer(BaseTrainer):
             json.dump(meta, f, indent=2)
 
 
+# Iter #1757 — Sundial (Tsinghua THUML, ICML 2025 Oral, arXiv:2502.00816).
+# First flow-matching TS foundation model in the registry. The frozen
+# backbone runs in a SINGLE forward() (bypassing transformers' broken
+# generate() — Sundial was published against transformers==4.40.1 and
+# its prepare_inputs_for_generation hooks reference DynamicCache.seen_tokens
+# / get_usable_length / get_max_length which are gone in 4.43+). Direct
+# forward returns (B, num_samples, 720) trajectories per row; we summarise
+# them into 13 path statistics (mean, std, exceedance probs, IQR, MDD, skew)
+# and feed an MLP head jointly with the last-step tabular vector.
+_SUNDIAL_CACHE: dict = {}
+
+
+class _SundialPathStatHead(torch.nn.Module):
+    def __init__(self, n_stat_features: int, n_tab_features: int,
+                 hidden_dim: int = 128, n_layers: int = 2, dropout: float = 0.15):
+        super().__init__()
+        in_dim = n_stat_features + n_tab_features
+        layers = []
+        d = in_dim
+        for _ in range(n_layers):
+            layers += [torch.nn.Linear(d, hidden_dim), torch.nn.GELU(),
+                       torch.nn.Dropout(dropout)]
+            d = hidden_dim
+        layers.append(torch.nn.Linear(d, 1))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, stat_feats, tab_feats):
+        x = torch.cat([stat_feats, tab_feats], dim=-1)
+        return self.net(x).squeeze(-1)
+
+
+class TorchSundialTrainer(BaseTrainer):
+    """Frozen Sundial flow-matching backbone -> per-row path-stat MLP head.
+
+    Per row: pass last `lookback` steps of channel `channel_index` through
+    SundialForPrediction.forward(num_samples=K). Output is (B, K, 720)
+    sampled future patches; truncate to `forecast_length`, summarise into
+    13 distribution-shape statistics, concat with last-step tabular vector,
+    train MLP classifier head. Backbone is frozen and cached across windows.
+    """
+
+    name = 'torch_sundial'
+    consumes_sequences = True
+
+    def __init__(self,
+                 model_id: str = 'thuml/sundial-base-128m',
+                 model_dir: str = 'data/sundial_base_128m',
+                 channel_index: int = 8,
+                 lookback: int = 20,
+                 forecast_length: int = 5,
+                 num_samples: int = 16,
+                 hidden_dim: int = 128,
+                 n_head_layers: int = 2,
+                 dropout: float = 0.15,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 512,
+                 n_epochs: int = 40,
+                 pos_weight: float = 1.3,
+                 use_tabular_features: bool = True,
+                 inference_batch_size: int = 256,
+                 device: str = None,
+                 seed: int = 1234,
+                 **kwargs):
+        self.model_id = str(model_id)
+        self.model_dir = model_dir
+        self.channel_index = int(channel_index)
+        self.lookback = int(lookback)
+        self.forecast_length = int(forecast_length)
+        self.num_samples = int(num_samples)
+        self.hidden_dim = int(hidden_dim)
+        self.n_head_layers = int(n_head_layers)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.n_epochs = int(n_epochs)
+        self.pos_weight = float(pos_weight)
+        self.use_tabular_features = bool(use_tabular_features)
+        self.inference_batch_size = int(inference_batch_size)
+        self.seed = int(seed)
+        self._device = torch.device(device) if device else None
+        self._backbone = None
+        self._head = None
+        self._n_stat_features = 13
+        self._tab_dim = None
+        self._scaler_mean = None
+        self._scaler_std = None
+
+    def _resolve_device(self):
+        if self._device is not None:
+            return self._device
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def _load_backbone(self):
+        if self._backbone is not None:
+            return self._backbone
+        device = self._resolve_device()
+        key = (self.model_id, self.model_dir, str(device))
+        if key in _SUNDIAL_CACHE:
+            self._backbone = _SUNDIAL_CACHE[key]
+            return self._backbone
+        # Compat shims: Sundial's modeling code uses transformers<=4.42 cache API.
+        from transformers.cache_utils import DynamicCache, Cache
+        if not hasattr(DynamicCache, 'seen_tokens'):
+            DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+        if not hasattr(Cache, 'get_max_length'):
+            Cache.get_max_length = lambda self: None
+        if not hasattr(DynamicCache, 'get_usable_length'):
+            DynamicCache.get_usable_length = (
+                lambda self, new_seq_length=None, layer_idx=0:
+                self.get_seq_length(layer_idx)
+            )
+        from transformers import AutoModelForCausalLM
+        src = self.model_dir if (self.model_dir and os.path.isdir(self.model_dir)) \
+            else self.model_id
+        backbone = AutoModelForCausalLM.from_pretrained(
+            src, trust_remote_code=True).to(device).eval()
+        for p in backbone.parameters():
+            p.requires_grad_(False)
+        _SUNDIAL_CACHE[key] = backbone
+        self._backbone = backbone
+        return backbone
+
+    @torch.no_grad()
+    def _sample_paths(self, seqs: np.ndarray) -> np.ndarray:
+        """seqs: (N, lookback) -> (N, num_samples, forecast_length)."""
+        backbone = self._load_backbone()
+        device = self._resolve_device()
+        # Sundial's forward(revin=True) has a broken broadcast shape; do revin
+        # manually so we can pass revin=False inside.
+        out_chunks = []
+        n = seqs.shape[0]
+        bs = max(1, self.inference_batch_size)
+        for i in range(0, n, bs):
+            chunk = torch.from_numpy(seqs[i:i + bs]).float().to(device)
+            means = chunk.mean(1, keepdim=True)
+            stdev = chunk.std(1, keepdim=True, unbiased=False).clamp_min(1e-2)
+            chunk_n = (chunk - means) / stdev
+            out = backbone(input_ids=chunk_n, num_samples=self.num_samples,
+                           use_cache=False, return_dict=True, revin=False)
+            preds = out.logits  # (B, K, 720)
+            preds = preds * stdev.unsqueeze(1) + means.unsqueeze(1)
+            preds = preds[:, :, :self.forecast_length]
+            out_chunks.append(preds.detach().float().cpu().numpy())
+        return np.concatenate(out_chunks, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _path_stats(paths: np.ndarray) -> np.ndarray:
+        """paths: (N, K, T) -> (N, 13). Treat each sample's K-step path as a
+        candidate return trajectory; summarise distribution shape."""
+        path_mean = paths.mean(axis=(1, 2))
+        path_std = paths.std(axis=(1, 2))
+        last_mean = paths[:, :, -1].mean(axis=1)
+        last_std = paths[:, :, -1].std(axis=1)
+        cumret = paths.sum(axis=2)  # (N, K)
+        p_up = (cumret > 0).mean(axis=1).astype(np.float32)
+        p_strong_up = (cumret > 0.02).mean(axis=1).astype(np.float32)
+        p_strong_dn = (cumret < -0.02).mean(axis=1).astype(np.float32)
+        q25 = np.quantile(cumret, 0.25, axis=1)
+        q50 = np.quantile(cumret, 0.50, axis=1)
+        q75 = np.quantile(cumret, 0.75, axis=1)
+        iqr = q75 - q25
+        cum = np.cumsum(paths, axis=2)
+        running_max = np.maximum.accumulate(cum, axis=2)
+        drawdown = (cum - running_max).min(axis=2)
+        mdd_mean = drawdown.mean(axis=1)
+        sigma = cumret.std(axis=1) + 1e-9
+        skew = ((cumret - cumret.mean(axis=1, keepdims=True)) ** 3).mean(axis=1) / (sigma ** 3)
+        stats = np.stack([path_mean, path_std, last_mean, last_std,
+                          p_up, p_strong_up, p_strong_dn,
+                          q25, q50, q75, iqr, mdd_mean, skew], axis=-1).astype(np.float32)
+        return np.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_inputs(self, X_seq: np.ndarray):
+        """X_seq: (N, L, F) -> (stats (N, 13), tab (N, F or 0))."""
+        L = X_seq.shape[1]
+        F = X_seq.shape[2]
+        ci = self.channel_index if self.channel_index >= 0 else (F + self.channel_index)
+        ci = max(0, min(int(ci), F - 1))
+        take = min(self.lookback, L)
+        seqs = X_seq[:, -take:, ci].astype(np.float32)
+        seqs = np.nan_to_num(seqs, nan=0.0, posinf=0.0, neginf=0.0)
+        if take < self.lookback:
+            pad = np.zeros((seqs.shape[0], self.lookback - take), dtype=seqs.dtype)
+            seqs = np.concatenate([pad, seqs], axis=1)
+        paths = self._sample_paths(seqs)
+        stats = self._path_stats(paths)
+        if self.use_tabular_features:
+            tab = X_seq[:, -1, :].astype(np.float32)
+            tab = np.nan_to_num(tab, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            tab = np.zeros((X_seq.shape[0], 0), dtype=np.float32)
+        return stats, tab
+
+    def _fit_scaler(self, F):
+        self._scaler_mean = F.mean(axis=0).astype(np.float32)
+        self._scaler_std = (F.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_scaler(self, F):
+        return ((F - self._scaler_mean) / self._scaler_std).astype(np.float32)
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose=False,
+            pnl_train=None, pnl_val=None, dates_train=None, dates_val=None,
+            **kwargs):
+        X_tr = np.asarray(X_train, dtype=np.float32)
+        if X_tr.ndim != 3:
+            raise ValueError(
+                f'torch_sundial expects 3D sequence input (N, L, F); got shape '
+                f'{X_tr.shape}.')
+        X_va = np.asarray(X_val, dtype=np.float32) if X_val is not None else None
+        y_tr = np.asarray(y_train, dtype=np.float32).reshape(-1)
+        y_va = np.asarray(y_val, dtype=np.float32).reshape(-1) if y_val is not None else None
+
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        stat_tr, tab_tr = self._build_inputs(X_tr)
+        # Fit per-feature scaler on the concatenated [stat, tab] matrix so
+        # the MLP head sees comparable scales (path stats are O(1) but tab
+        # features are already RobustScaler'd by the gate).
+        F_tr = np.concatenate([stat_tr, tab_tr], axis=1)
+        self._fit_scaler(F_tr)
+        F_tr = self._apply_scaler(F_tr)
+        self._tab_dim = tab_tr.shape[1]
+
+        has_val = X_va is not None and y_va is not None and len(y_va) > 0
+        if has_val:
+            stat_va, tab_va = self._build_inputs(X_va)
+            F_va = self._apply_scaler(np.concatenate([stat_va, tab_va], axis=1))
+        else:
+            F_va = None
+
+        device = self._resolve_device()
+        self._head = _SundialPathStatHead(
+            n_stat_features=self._n_stat_features,
+            n_tab_features=self._tab_dim,
+            hidden_dim=self.hidden_dim,
+            n_layers=self.n_head_layers,
+            dropout=self.dropout,
+        ).to(device)
+        opt = torch.optim.AdamW(self._head.parameters(),
+                                lr=self.learning_rate,
+                                weight_decay=self.weight_decay)
+        pw = torch.tensor([self.pos_weight], dtype=torch.float32, device=device)
+        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pw)
+
+        stat_tr_t = torch.from_numpy(F_tr[:, :self._n_stat_features]).to(device)
+        tab_tr_t = torch.from_numpy(F_tr[:, self._n_stat_features:]).to(device)
+        y_tr_t = torch.from_numpy(y_tr).to(device)
+        if has_val:
+            stat_va_t = torch.from_numpy(F_va[:, :self._n_stat_features]).to(device)
+            tab_va_t = torch.from_numpy(F_va[:, self._n_stat_features:]).to(device)
+            y_va_t = torch.from_numpy(y_va).to(device)
+
+        n = stat_tr_t.shape[0]
+        best_val = float('inf')
+        best_state = None
+        patience, bad = 6, 0
+        for epoch in range(self.n_epochs):
+            self._head.train()
+            perm = torch.randperm(n, device=device)
+            for i in range(0, n, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                logits = self._head(stat_tr_t[idx], tab_tr_t[idx])
+                loss = loss_fn(logits, y_tr_t[idx])
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self._head.parameters(), 1.0)
+                opt.step()
+            if has_val:
+                self._head.eval()
+                with torch.no_grad():
+                    vloss = loss_fn(self._head(stat_va_t, tab_va_t), y_va_t).item()
+                if vloss < best_val - 1e-5:
+                    best_val = vloss
+                    best_state = {k: v.detach().clone()
+                                  for k, v in self._head.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+                    if bad >= patience:
+                        break
+        if best_state is not None:
+            self._head.load_state_dict(best_state)
+        self._head.eval()
+        return self
+
+    @torch.no_grad()
+    def predict_proba(self, X) -> np.ndarray:
+        if self._head is None:
+            raise RuntimeError('TorchSundialTrainer.predict_proba before fit')
+        X3 = np.asarray(X, dtype=np.float32)
+        if X3.ndim != 3:
+            raise ValueError(
+                f'torch_sundial.predict_proba expects 3D input; got {X3.shape}.')
+        stat, tab = self._build_inputs(X3)
+        F_te = self._apply_scaler(np.concatenate([stat, tab], axis=1))
+        device = self._resolve_device()
+        out = []
+        bs = max(self.batch_size, 1)
+        self._head.eval()
+        for i in range(0, F_te.shape[0], bs):
+            chunk = F_te[i:i + bs]
+            st = torch.from_numpy(chunk[:, :self._n_stat_features]).to(device)
+            tb = torch.from_numpy(chunk[:, self._n_stat_features:]).to(device)
+            p = torch.sigmoid(self._head(st, tb)).cpu().numpy().astype(np.float64)
+            out.append(p)
+        return np.concatenate(out, axis=0)
+
+    @property
+    def hyperparams(self):
+        return dict(
+            model_id=self.model_id, model_dir=self.model_dir,
+            channel_index=self.channel_index, lookback=self.lookback,
+            forecast_length=self.forecast_length, num_samples=self.num_samples,
+            hidden_dim=self.hidden_dim, n_head_layers=self.n_head_layers,
+            dropout=self.dropout, learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay, batch_size=self.batch_size,
+            n_epochs=self.n_epochs, pos_weight=self.pos_weight,
+            use_tabular_features=self.use_tabular_features,
+            inference_batch_size=self.inference_batch_size, seed=self.seed,
+        )
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        state_path = os.path.join(output_dir, 'sundial_head.pt')
+        torch.save({
+            'state_dict': self._head.state_dict() if self._head is not None else None,
+            'scaler_mean': self._scaler_mean,
+            'scaler_std': self._scaler_std,
+            'tab_dim': self._tab_dim,
+        }, state_path)
+        meta = dict(self.hyperparams, tab_dim=self._tab_dim)
+        if extra:
+            meta.update(extra)
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+        return {'state': state_path, 'meta': meta_path}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -15276,6 +15618,7 @@ TRAINERS = {
     'rocket_bagged_calibrated': ROCKETBaggedCalibratedTrainer,
     'torch_timesfm': TorchTimesFMTrainer,
     'modernnca': ModernNCATrainer,
+    'torch_sundial': TorchSundialTrainer,
 }
 
 

@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_seq_gru_abstain",
+  "trainer": "torch_sundial",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from exhausted modernnca to a structurally different family (NN ensemble + dual-layer abstention). Defaults hit 0/7 but beat both baselines on avg_ann (+4.9% vs -30%/-28%) and the new date_abstain_q\u00d7abstain_quantile\u00d7pos_class_weight knob space is unexplored \u2014 train mode should sweep it before declaring dead. W7 +111% ann shows latent signal.",
-  "claude_iter_id": 1756,
-  "designated_at": "2026-05-26T00:10:31"
+  "rationale": "Default channel_index=8 (ret_5d_xrank, a [0,1] cross-sectional rank) gave Sundial a non-TS-shaped input, collapsing scores to thr=0.0 on 6/7 windows. Train mode should sweep channel_index in {0, 1, 23} (atr_pct, volume_ratio, set_ret_5d_zscore_60d \u2014 real continuous TS) plus pos_weight in [0.8, 1.5] and use_tabular_features True/False before declaring dead. W1 sweep alive (thr=0.4 with +7.1% ann/33% WR) shows latent discrimination.",
+  "claude_iter_id": 1757,
+  "designated_at": "2026-05-26T06:27:53"
 }
