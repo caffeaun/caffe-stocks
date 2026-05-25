@@ -25,6 +25,15 @@ import os
 import sys
 import time
 
+# Pin to GPU 0. trainers.py:28 also sets this via setdefault, but
+# models.sequence_loader (imported below) triggers torch's CUDA init
+# first, locking visibility before trainers.py runs and defeating the
+# setdefault. Setting it here — the first executable line in the entry
+# point — is the earliest safe place. Honour an explicit override from
+# the caller if one was set (e.g. CUDA_VISIBLE_DEVICES=1 to share the box
+# with a long-running ollama session).
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+
 import numpy as np
 from sklearn.preprocessing import RobustScaler
 
