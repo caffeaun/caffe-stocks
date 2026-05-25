@@ -7505,21 +7505,36 @@ class TorchSeqGRUEnsembleTrainer(BaseTrainer):
 # τ-calibration on inner-val (not test) is critical for honesty — it's the
 # same split used for early stopping, so no test peeking.
 class TorchSeqGRUAbstainTrainer(BaseTrainer):
+    # Iter #1737 structural pivot from exhausted modernnca brief:
+    # the trainer's prior per-row epistemic abstention helps within a date but
+    # cannot kill an entire hostile day (W5: -12.7% set return, 31% breadth,
+    # 1/20 passes across last-20 iter cross-tab). Memory `feedback_day_abstain_anomaly_gated.md`
+    # and iter #1499 (xgb_rank_fusion abstain_min_q=0.3) both showed that a
+    # DATE-level abstention floor is the lever for breaking the W5 wall.
+    # This iteration adds a `date_abstain_q` mechanism: at fit time we record
+    # the train-date mean-prob distribution; at predict time, dates whose mean
+    # ensemble prob falls below the q-th quantile of train-date-means get ALL
+    # their rows hard-zeroed regardless of per-row uncertainty. The hook is
+    # `set_predict_context`, which the gate already calls (see return_gate.py
+    # L351). Defaults: q=0.30 (skip ~30% of low-confidence days), n_models=3
+    # and max_epochs=6 (time budget — 5*10 was borderline for 30-min wall).
     name = 'torch_seq_gru_abstain'
     consumes_sequences = True
 
     def __init__(self,
-                 n_models: int = 5,
+                 n_models: int = 3,
                  hidden_dim: int = 64,
                  dropout: float = 0.30,
                  learning_rate: float = 1.5e-3,
                  weight_decay: float = 1e-4,
                  batch_size: int = 512,
-                 max_epochs: int = 10,
+                 max_epochs: int = 6,
                  patience: int = 3,
                  pos_class_weight: float = 2.0,
                  abstain_quantile: float = 0.50,
-                 random_state: int = 42):
+                 date_abstain_q: float = 0.30,
+                 random_state: int = 42,
+                 **_):
         self._params = dict(
             n_models=int(n_models),
             hidden_dim=int(hidden_dim),
@@ -7531,13 +7546,16 @@ class TorchSeqGRUAbstainTrainer(BaseTrainer):
             patience=int(patience),
             pos_class_weight=float(pos_class_weight),
             abstain_quantile=float(abstain_quantile),
+            date_abstain_q=float(date_abstain_q),
             random_state=int(random_state),
         )
         self.nets = []
         self._best_epochs = []
         self._n_features = None
         self._seq_len = None
-        self._tau_std = None  # calibrated abstention threshold
+        self._tau_std = None  # calibrated per-row abstention threshold
+        self._date_mean_floor = None  # calibrated per-date mean-prob floor
+        self._predict_dates = None  # injected by set_predict_context
 
     def _build_net(self, n_features):
         import torch
@@ -7672,7 +7690,45 @@ class TorchSeqGRUAbstainTrainer(BaseTrainer):
         if verbose:
             print(f'  abstention τ (val std @ q={q:.2f}) = {self._tau_std:.4f} '
                   f'— {(1.0 - q) * 100:.0f}% of val rows would abstain')
+
+        # Calibrate the per-DATE mean-prob floor on TRAIN-set predictions.
+        # The gate's hostile-day failure mode (W5: 1/20 across last 20 iters)
+        # is that on deep-bear days every row's confidence is low but ranked
+        # the same — the gate still picks the top-K per date. Hard-killing
+        # those dates entirely is the only mechanism that survived (#1499
+        # rank_fusion abstain_min_q=0.3 broke W5).
+        Xt_t = torch.from_numpy(Xt).to(device)
+        tr_probs = []
+        with torch.no_grad():
+            for net in self.nets:
+                net.eval()
+                tr_probs.append(
+                    torch.sigmoid(net(Xt_t)).cpu().numpy().astype(np.float64))
+        P_tr = np.stack(tr_probs, axis=0).mean(axis=0)  # (N_train,)
+        if dates_train is not None and len(dates_train) == len(P_tr):
+            d_tr = np.asarray(dates_train)
+            uniq = np.unique(d_tr)
+            if len(uniq) >= 10:
+                date_means = np.array(
+                    [P_tr[d_tr == d].mean() for d in uniq], dtype=np.float64)
+                q_date = float(np.clip(p['date_abstain_q'], 0.0, 0.95))
+                if q_date > 0.0:
+                    self._date_mean_floor = float(np.quantile(date_means, q_date))
+                    if verbose:
+                        print(f'  date-abstain floor (train-date-mean @ '
+                              f'q={q_date:.2f}) = {self._date_mean_floor:.4f}')
+                else:
+                    self._date_mean_floor = None
+            else:
+                self._date_mean_floor = None
+        else:
+            self._date_mean_floor = None
         return self
+
+    def set_predict_context(self, dates):
+        """Receive test-set dates from return_gate before predict_proba so the
+        date-level mean-prob abstention can be applied per-date."""
+        self._predict_dates = np.asarray(dates) if dates is not None else None
 
     def predict_proba(self, X) -> np.ndarray:
         import torch
@@ -7703,6 +7759,22 @@ class TorchSeqGRUAbstainTrainer(BaseTrainer):
             # skips it for every sweep iteration.
             abstain_mask = p_std > self._tau_std
             score[abstain_mask] = -1e9
+
+        # Date-level abstention: dates whose mean-prob is below the train
+        # quantile floor get ALL their rows hard-zeroed. Targets hostile-day
+        # collapse (W5 bear regime) — the gate cannot rescue any row from
+        # a date the model itself thinks is low-quality.
+        if (self._date_mean_floor is not None
+                and self._predict_dates is not None
+                and len(self._predict_dates) == len(score)):
+            d_te = np.asarray(self._predict_dates)
+            for d in np.unique(d_te):
+                mask = (d_te == d)
+                if mask.sum() == 0:
+                    continue
+                day_mean = float(np.mean(p_mean[mask]))
+                if day_mean < self._date_mean_floor:
+                    score[mask] = -1e9
         return score
 
     @property
@@ -7731,6 +7803,7 @@ class TorchSeqGRUAbstainTrainer(BaseTrainer):
             'n_features': self._n_features,
             'seq_len': self._seq_len,
             'tau_std': self._tau_std,
+            'date_mean_floor': self._date_mean_floor,
             'member_paths': member_paths,
         }
         if extra:
@@ -7751,6 +7824,7 @@ class TorchSeqGRUAbstainTrainer(BaseTrainer):
         inst._n_features = meta.get('n_features')
         inst._seq_len = meta.get('seq_len')
         inst._tau_std = meta.get('tau_std')
+        inst._date_mean_floor = meta.get('date_mean_floor')
         inst.nets = []
         for mp in meta.get('member_paths', []):
             net = inst._build_net(inst._n_features)
@@ -12237,8 +12311,15 @@ class TabICLv2Trainer(BaseTrainer):
                  device: str = 'auto',
                  checkpoint_version: str = 'tabicl-classifier-v2-20260212.ckpt',
                  random_state: int = 42,
+                 use_modal: bool = False,
+                 modal_gpu: str = 'A100-40GB',
                  **_):
-        if not _HAS_TABICL:
+        # When use_modal=True we route fit+predict to scripts/modal_runner.py
+        # so the local 12 GB GPU is bypassed entirely. The tabicl package only
+        # needs to be importable for the local path.
+        self.use_modal = bool(use_modal)
+        self.modal_gpu = str(modal_gpu)
+        if not self.use_modal and not _HAS_TABICL:
             raise ImportError(
                 "tabicl not installed. `pip install tabicl` (Python >=3.10, "
                 "PyTorch>=2.1). CUDA strongly recommended; CPU works with n_jobs."
@@ -12288,11 +12369,38 @@ class TabICLv2Trainer(BaseTrainer):
         rng.shuffle(idx)
         return X[idx], y[idx]
 
+    def _modal_hp(self) -> dict:
+        return {
+            'n_estimators': self.n_estimators,
+            'softmax_temperature': self.softmax_temperature,
+            'average_logits': self.average_logits,
+            'norm_methods': self.norm_methods,
+            'feat_shuffle_method': self.feat_shuffle_method,
+            'class_shuffle_method': self.class_shuffle_method,
+            'outlier_threshold': self.outlier_threshold,
+            'batch_size': self.batch_size,
+            'use_amp': self.use_amp,
+            'use_fa3': self.use_fa3,
+            'kv_cache': self.kv_cache,
+            'offload_mode': self.offload_mode,
+            'checkpoint_version': self.checkpoint_version,
+        }
+
     def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
-        import gc
         X_tr = self._sanitize(X_tr)
         y_tr = np.asarray(y_tr).astype(np.int64).ravel()
         X_tr, y_tr = self._stratified_subsample(X_tr, y_tr)
+        # ICL model: fit() just stashes the support set; the actual forward
+        # pass is in predict_proba. When use_modal=True we never build a
+        # local TabICLClassifier — the support set ships to Modal at
+        # predict time and the remote function does both fit and predict.
+        self._X_train = X_tr
+        self._y_train = y_tr
+        if self.use_modal:
+            self._device = f'modal:{self.modal_gpu}'
+            self._model = 'modal'   # sentinel so predict_proba sees fit() ran
+            return self
+        import gc
         if self.requested_device == 'cpu':
             self._device = 'cpu'
         elif self.requested_device == 'cuda':
@@ -12322,14 +12430,45 @@ class TabICLv2Trainer(BaseTrainer):
             allow_auto_download=True,
         )
         self._model.fit(X_tr, y_tr)
-        self._X_train = X_tr
-        self._y_train = y_tr
         return self
+
+    def _predict_via_modal(self, X) -> np.ndarray:
+        import time
+        import modal
+        from scripts.modal_budget import (
+            check_budget, record_call, estimate_cost,
+        )
+        # Conservative pre-flight estimate: 60 s per call covers all
+        # n_estimators ∈ [1,4] sweeps without false-positive budget trips.
+        check_budget(estimated_duration_s=60.0, gpu=self.modal_gpu)
+        fn = modal.Function.lookup('caffe-stocks-modal', 'train_predict_tabicl')
+        t0 = time.monotonic()
+        try:
+            proba = fn.remote(
+                self._X_train, self._y_train, X, self._modal_hp(),
+                self.random_state,
+            )
+            duration = time.monotonic() - t0
+            record_call(
+                trainer=self.name, duration_s=duration, gpu=self.modal_gpu,
+                status='ok',
+            )
+        except Exception:
+            duration = time.monotonic() - t0
+            record_call(
+                trainer=self.name, duration_s=duration, gpu=self.modal_gpu,
+                status='error',
+            )
+            raise
+        proba = np.asarray(proba, dtype=np.float32)
+        return proba.ravel().astype(np.float32)
 
     def predict_proba(self, X) -> np.ndarray:
         if self._model is None:
             raise RuntimeError("TabICLv2Trainer: predict_proba called before fit()")
         X = self._sanitize(X)
+        if self.use_modal:
+            return self._predict_via_modal(X)
         if _HAS_TORCH and self._device == 'cuda':
             torch.cuda.empty_cache()
         n = X.shape[0]
@@ -14534,6 +14673,7 @@ class TorchTimesFMTrainer(BaseTrainer):
                  max_context: int = 512,
                  max_horizon: int = 64,
                  per_core_batch_size: int = 64,
+                 seq_stats_channels=None,
                  device: str = None,
                  random_state: int = 42,
                  **_):
@@ -14552,6 +14692,15 @@ class TorchTimesFMTrainer(BaseTrainer):
         self.max_context = int(max_context)
         self.max_horizon = int(max_horizon)
         self.per_core_batch_size = int(per_core_batch_size)
+        # seq_stats_channels: list of channel indices to compute per-row
+        # sequence summary stats over (mean, std, min, max, last-first delta).
+        # Provides cheap per-stock dispersion features to complement the
+        # regime-invariant TimesFM forecast on channel_index. None = disabled.
+        if seq_stats_channels is None or (isinstance(seq_stats_channels, (list, tuple))
+                                          and len(seq_stats_channels) == 0):
+            self.seq_stats_channels = None
+        else:
+            self.seq_stats_channels = [int(c) for c in seq_stats_channels]
         self.requested_device = device
         self.random_state = int(random_state)
         self._head = None
@@ -14613,12 +14762,29 @@ class TorchTimesFMTrainer(BaseTrainer):
             out_chunks.append(emb)
         return np.concatenate(out_chunks, axis=0)
 
-    @staticmethod
-    def _stack_features(X_3d, emb):
+    def _stack_features(self, X_3d, emb):
         last = X_3d[:, -1, :].astype(np.float32)
         last = np.nan_to_num(last, nan=0.0, posinf=0.0, neginf=0.0)
         emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
-        return np.concatenate([last, emb], axis=1)
+        parts = [last, emb]
+        if self.seq_stats_channels:
+            N, L, C = X_3d.shape
+            stat_blocks = []
+            for raw_idx in self.seq_stats_channels:
+                ci = raw_idx if raw_idx >= 0 else (C + raw_idx)
+                ci = max(0, min(int(ci), C - 1))
+                seq = X_3d[:, :, ci].astype(np.float32)
+                seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0)
+                # 5 stats per channel: mean, std, min, max, last-first delta
+                stat_blocks.append(seq.mean(axis=1, keepdims=True))
+                stat_blocks.append(seq.std(axis=1, keepdims=True))
+                stat_blocks.append(seq.min(axis=1, keepdims=True))
+                stat_blocks.append(seq.max(axis=1, keepdims=True))
+                stat_blocks.append((seq[:, -1] - seq[:, 0]).reshape(-1, 1))
+            stats = np.concatenate(stat_blocks, axis=1)
+            stats = np.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            parts.append(stats)
+        return np.concatenate(parts, axis=1)
 
     def _fit_scaler(self, F):
         self._scaler_mean = F.mean(axis=0).astype(np.float32)
@@ -14736,6 +14902,7 @@ class TorchTimesFMTrainer(BaseTrainer):
             inference_batch=self.inference_batch, patience=self.patience,
             max_context=self.max_context, max_horizon=self.max_horizon,
             per_core_batch_size=self.per_core_batch_size,
+            seq_stats_channels=self.seq_stats_channels,
             random_state=self.random_state,
         )
 

@@ -903,16 +903,19 @@ SEARCH_SPACES: dict[str, dict] = {
     # 0.50 abstains on the noisiest 50% of predictions. Same per-member
     # spaces as torch_seq_gru_ensemble; n_models capped at 7 for wall-time.
     'torch_seq_gru_abstain': {
-        'n_models':              [3, 5, 7],
+        'n_models':              [3, 5],
         'hidden_dim':            [32, 48, 64, 96],
         'dropout':               (0.10, 0.45),
         'learning_rate':         (5e-4, 3e-3),
         'weight_decay':          (1e-5, 1e-3),
         'batch_size':            [256, 512, 1024],
-        'max_epochs':            [8, 10, 12],
+        'max_epochs':            [6, 8, 10],
         'patience':              [3, 4],
         'pos_class_weight':      (1.0, 3.5),
         'abstain_quantile':      (0.30, 0.80),
+        # Iter #1737: per-date mean-prob abstention quantile. 0.0 disables.
+        # 0.40 cuts ~40% of low-confidence days entirely — bear-regime kill.
+        'date_abstain_q':        (0.0, 0.50),
     },
     # Iter #714 — single GRU + per-date XGB day-quality gate. GRU spaces are
     # identical to torch_seq_gru so prior single-GRU HP wins transfer. New
@@ -1331,6 +1334,9 @@ SEARCH_SPACES: dict[str, dict] = {
     'max_train_rows':       [8000, 12000, 15000],
     'test_chunk_size':      [1000, 2000, 4000],
     'offload_mode':         ['cpu', 'auto'],
+    # use_modal=True routes fit/predict through scripts/modal_runner.py
+    # (A100-40GB). Approved 2026-05-25 (ml-approval #1) under $30/mo cap.
+    'use_modal':            [False, True],
 },
     'torch_chronos2': {
     'seq_channel':     ['close', 'log_ret', 'zscore_close'],
@@ -1476,10 +1482,23 @@ SEARCH_SPACES: dict[str, dict] = {
     'dropout':         (0.0, 0.35),
     'learning_rate':   (1e-4, 5e-3),
     'weight_decay':    (1e-5, 1e-3),
-    'pos_weight':      [1.0, 1.5, 2.0, 2.5],
+    # pos_weight pinned <=1.5 (memory: iter #1722 collapsed at 2.0).
+    'pos_weight':      [1.0, 1.25, 1.5],
     'epochs':          [20, 30, 50],
     'batch_size':      [256, 512, 1024],
     'inference_batch': [512, 1024, 2048],
+    # seq_stats_channels — list-valued HP for per-stock dispersion injection
+    # (mean/std/min/max/last-first delta per listed channel). Each candidate
+    # is a fixed channel-list preset; train mode picks one.
+    # Channel ref: 0=atr_pct 1=volume_ratio 7=ret_1d_xrank 8=ret_5d_xrank
+    # 17=up_days_5d 18=atr_ratio_20_60 23=set_ret_5d_zscore_60d.
+    'seq_stats_channels': [
+        None,
+        [0, 1, 7, 8, 17],
+        [0, 1, 7, 8, 17, 18],
+        [7, 8, 17, 18],
+        [0, 1, 18, 23],
+    ],
     'random_state':    [42, 7, 1337],
 },
     'modernnca': {

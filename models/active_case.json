@@ -1,12 +1,12 @@
 {
-  "trainer": "modernnca",
+  "trainer": "torch_seq_gru_abstain",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep modernnca active for one more train-mode cycle. Today's claude iter #1736 nudged toward sharpening (dropout=0.05, sns_rate=0.10, d_embed=192, n_blocks=3) \u2014 it DID open thr=0.3 trades on the bear walls (W3 n=23, W5 n=32, first such opens since iter #1723) BUT picks at thr=0.3 ran 26-34% WR, regressing avg_ann to -20.4%. Train mode best so far is iter #1734 at +18.3% avg_ann with 1/7 wp (d_embed=256, n_blocks=1, hidden_mult=1, dropout=0.33, sns_rate=0.17, batch=1024, epochs=100, plr_freq=32, plr_sigma=1.23) \u2014 close to passing. Train mode should COMBINE iter #1734's WR-preserving config with iter #1736's bear-window sweep open: try d_embed=256 + n_blocks=2-3 + dropout~0.15-0.25 (mid, not extreme) + sns_rate~0.12-0.20 (mid) + plr_freq=32-48 + lr=0.001-0.003 + epochs=75-100. The W1 wall (90% fail-rate, always low_wr) is the diagnostic: any HP combo that gets W1 WR>=40% at thr>=0.0 with n>=20 has cracked modernnca's ceiling.",
-  "claude_iter_id": 1736,
-  "designated_at": "2026-05-25T18:05:34"
+  "rationale": "Pivot from exhausted modernnca to a structurally different family (NN ensemble + dual-layer abstention). Defaults hit 0/7 but beat both baselines on avg_ann (+4.9% vs -30%/-28%) and the new date_abstain_q\u00d7abstain_quantile\u00d7pos_class_weight knob space is unexplored \u2014 train mode should sweep it before declaring dead. W7 +111% ann shows latent signal.",
+  "claude_iter_id": 1756,
+  "designated_at": "2026-05-26T00:10:31"
 }
