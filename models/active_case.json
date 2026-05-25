@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Iter #1724 executed the 2026-05-25 ModernNCA brief: default HPs 0/7 wp but avg_ann +11.2% beats both baselines (random_topk -30.2%, rule_only -27.8%) by ~40pp, with W6 +54.9% ann / 31.7% WR / 41 trades and W7 +95.6% ann / 36.7% WR / 30 trades at thr=0.0 \u2014 the highest avg_ann of any 0/7 trainer in recent history. Every window produced trades (no flood on bear, no starvation on bull) but uniform WR collapse to 25-37% (<40% floor) indicates the soft-NN weights are too smooth. Train mode should sweep dropout\u2193\u2208[0.0,0.1] x sns_rate\u2193\u2208[0.05,0.15] (smaller candidate pool tightens neighbour weights) x d_embed\u2191\u2208[192,256] x n_blocks\u2208[2,3,4] x plr_sigma\u2208[0.5,1.5] \u2014 score sharpening is the single most valuable lift. W1 is the diagnostic window: it currently produces trades only at thr=0.0 (score collapse); the first HP combo that re-opens thr=0.3 trades on W1 with WR\u226540% is the ceiling-breaker.",
-  "claude_iter_id": 1723,
-  "designated_at": "2026-05-25T12:05:45"
+  "rationale": "Keep modernnca active for one more train-mode cycle. Today's claude iter #1736 nudged toward sharpening (dropout=0.05, sns_rate=0.10, d_embed=192, n_blocks=3) \u2014 it DID open thr=0.3 trades on the bear walls (W3 n=23, W5 n=32, first such opens since iter #1723) BUT picks at thr=0.3 ran 26-34% WR, regressing avg_ann to -20.4%. Train mode best so far is iter #1734 at +18.3% avg_ann with 1/7 wp (d_embed=256, n_blocks=1, hidden_mult=1, dropout=0.33, sns_rate=0.17, batch=1024, epochs=100, plr_freq=32, plr_sigma=1.23) \u2014 close to passing. Train mode should COMBINE iter #1734's WR-preserving config with iter #1736's bear-window sweep open: try d_embed=256 + n_blocks=2-3 + dropout~0.15-0.25 (mid, not extreme) + sns_rate~0.12-0.20 (mid) + plr_freq=32-48 + lr=0.001-0.003 + epochs=75-100. The W1 wall (90% fail-rate, always low_wr) is the diagnostic: any HP combo that gets W1 WR>=40% at thr>=0.0 with n>=20 has cracked modernnca's ceiling.",
+  "claude_iter_id": 1736,
+  "designated_at": "2026-05-25T18:05:34"
 }
