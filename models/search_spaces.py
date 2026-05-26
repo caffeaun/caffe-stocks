@@ -1460,7 +1460,11 @@ SEARCH_SPACES: dict[str, dict] = {
     'kab_kernel_C':               (0.5, 10.0),
     'kab_fusion_mode':            ['max', 'mean', 'rank_max', 'rank_min'],
     'stack_weight':               (0.2, 0.8),
-    'fusion_mode':                ['rank_mean', 'prob_mean', 'rank_max', 'rank_min'],
+    'fusion_mode':                ['regime_aware', 'rank_mean', 'prob_mean', 'rank_max', 'rank_min'],
+    'regime_breadth_col_idx':     [16, 41],
+    'regime_threshold':           (0.30, 0.55),
+    'regime_bear_stack_weight':   (0.50, 0.95),
+    'regime_bull_stack_weight':   (0.10, 0.55),
     'random_state':               [42, 7, 1337],
 },
 'rocket_bagged_calibrated': {

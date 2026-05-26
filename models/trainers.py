@@ -14031,7 +14031,18 @@ class KernelHistGBStackTrainer(BaseTrainer):
                  kab_fusion_mode: str = 'max',
                  # Stack-level.
                  stack_weight: float = 0.5,
-                 fusion_mode: str = 'rank_mean',
+                 fusion_mode: str = 'regime_aware',
+                 # Regime-aware fusion: choose stack weight per-row from input
+                 # breadth feature. Index points into the flattened 4F vector
+                 # = [last_*, mean_*, std_*, dev_*] in CURATED_FEATURES order;
+                 # 16 = last_market_breadth_above_sma20, 41 = mean_market_breadth_above_sma20.
+                 # Iter #1644 lesson: equal-weight rank-mean halved HistGB's
+                 # bear-window edge → HistGB-heavy under low breadth, KAB-
+                 # heavy under high breadth.
+                 regime_breadth_col_idx: int = 16,
+                 regime_threshold: float = 0.4,
+                 regime_bear_stack_weight: float = 0.85,
+                 regime_bull_stack_weight: float = 0.40,
                  random_state: int = 42,
                  **_):
         self._params = dict(
@@ -14053,6 +14064,10 @@ class KernelHistGBStackTrainer(BaseTrainer):
             kab_fusion_mode=str(kab_fusion_mode),
             stack_weight=float(stack_weight),
             fusion_mode=str(fusion_mode),
+            regime_breadth_col_idx=int(regime_breadth_col_idx),
+            regime_threshold=float(regime_threshold),
+            regime_bear_stack_weight=float(regime_bear_stack_weight),
+            regime_bull_stack_weight=float(regime_bull_stack_weight),
             random_state=int(random_state),
         )
         self.histgb_ = None
@@ -14110,18 +14125,43 @@ class KernelHistGBStackTrainer(BaseTrainer):
             ranks[order] = np.arange(n, dtype=np.float32) / max(n - 1, 1)
             return ranks
 
+        r_h = _rank01(p_h)
+        r_k = _rank01(p_k)
+
         if mode == 'rank_mean':
-            # Symmetric (default) rank-mean — both engines vote equally.
-            return (w * _rank01(p_h) + (1.0 - w) * _rank01(p_k)).astype(np.float32)
+            return (w * r_h + (1.0 - w) * r_k).astype(np.float32)
         if mode == 'prob_mean':
             return (w * p_h + (1.0 - w) * p_k).astype(np.float32)
         if mode == 'rank_max':
-            return np.maximum(_rank01(p_h), _rank01(p_k)).astype(np.float32)
+            return np.maximum(r_h, r_k).astype(np.float32)
         if mode == 'rank_min':
-            # Both-must-agree consensus — filters out single-engine FPs.
-            return np.minimum(_rank01(p_h), _rank01(p_k)).astype(np.float32)
+            return np.minimum(r_h, r_k).astype(np.float32)
+        if mode == 'regime_aware':
+            # Per-row stack-weight derived from the input row's breadth signal.
+            # Bear day (breadth low) → HistGB-heavy. Bull day → KAB-heavy.
+            Xa = np.asarray(X, dtype=np.float32)
+            if Xa.ndim == 3:
+                # (N, L, C): use last timestep's breadth column (raw curated index).
+                col_raw = int(self._params['regime_breadth_col_idx']) % Xa.shape[-1]
+                breadth = Xa[:, -1, col_raw]
+            else:
+                col = int(self._params['regime_breadth_col_idx'])
+                col = max(0, min(col, Xa.shape[-1] - 1))
+                breadth = Xa[:, col]
+            thr = float(self._params['regime_threshold'])
+            w_bear = float(self._params['regime_bear_stack_weight'])
+            w_bull = float(self._params['regime_bull_stack_weight'])
+            # Smooth (sigmoid) transition over a narrow band so neighbouring
+            # rows don't flip discretely between engines — keeps the per-date
+            # ranking stable.
+            band = 0.05
+            z = np.clip((breadth - thr) / max(band, 1e-6), -50.0, 50.0)
+            soft = 1.0 / (1.0 + np.exp(z))
+            w_per_row = (w_bear * soft + w_bull * (1.0 - soft)).astype(np.float32)
+            w_per_row = np.clip(w_per_row, 0.0, 1.0)
+            return (w_per_row * r_h + (1.0 - w_per_row) * r_k).astype(np.float32)
         # Default fallback: rank-mean
-        return (w * _rank01(p_h) + (1.0 - w) * _rank01(p_k)).astype(np.float32)
+        return (w * r_h + (1.0 - w) * r_k).astype(np.float32)
 
     def feature_importance(self):
         return None

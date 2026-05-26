@@ -1,12 +1,12 @@
 {
-  "trainer": "modernnca",
+  "trainer": "kernel_histgb_stack",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "modernnca hit 4/7 wp at iter #1755 (avg_ann +29.5%, wr 36.8%) and 4/7 again at #1754 (+11.0%/41.0%) \u2014 the strongest active family, matching the historical 4/7 ceiling set by histgb_monotonic #936. Train mode mid-sweep across k/hidden_dim/dropout/lr; keep refining to push toward 5-6/7. Sundial swept channel_index in {-1, 0, 7, 8, 23} across iters #1757/#1758 and ch0/ch23 train runs \u2014 best 1/7 across the entire HP cube, family exhausted on the path-stat-head architecture.",
-  "claude_iter_id": 1759,
-  "designated_at": "2026-05-26T18:17:24"
+  "rationale": "Just added fusion_mode='regime_aware' with 4 new HPs (regime_threshold, regime_bear/bull_stack_weight, regime_breadth_col_idx). First-shot defaults hit 2/7 with W1 +79.2% ann (thr=0.6) \u2014 strongest W1 in 20+ iters \u2014 but bear weights at 0.85 over-fired HistGB on transition/bear windows. Train mode should sweep the regime quadrant + stack_weight; modernnca sweep (the prior case) has 10 consecutive 0-1/7 train iterations and is exhausted.",
+  "claude_iter_id": 1767,
+  "designated_at": "2026-05-26T21:12:55"
 }
