@@ -6,8 +6,10 @@ builds a prompt via prompt_builder.py, invokes `claude -p` with WebSearch /
 WebFetch / Bash / Edit / Write tools, parses the structured JSON report
 from Claude's output, records it in the feedback DB.
 
-Hard wall-time: 30 min. After that the process is killed by `timeout`
-in scripts/ml_loop.sh.
+Hard wall-time: 90 min inner subprocess timeout (HARD_TIMEOUT below),
+with a 120 min outer kill by `timeout` in scripts/ml_loop.sh — the
+30 min gap lets the inner TimeoutExpired handler send a Telegram
+alert and exit cleanly before the outer SIGTERM lands.
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ LOCK_PATH = BASE / 'models' / '.ml-loop.lock'
 PROMPT_BUILDER = BASE / 'scripts' / 'prompt_builder.py'
 CLAUDE_BIN = Path(os.path.expanduser('~/.local/bin/claude'))
 LOG_DIR = BASE / 'logs'
-HARD_TIMEOUT = 1700  # leave 100s headroom under the cron timeout 1800s
+HARD_TIMEOUT = 5400  # 90 min inner subprocess; outer ml_loop.sh kill = 7200s (30 min headroom for Telegram alert + cleanup)
 
 
 def acquire_lock_with_priority(path: Path):

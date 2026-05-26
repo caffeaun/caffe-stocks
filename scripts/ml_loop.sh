@@ -15,7 +15,7 @@
 #   1  0   1 * *  bash ~/projects/caffe-stocks/scripts/ml_loop.sh panel
 #
 # Hard wall-times:
-#   claude:   30 min  (1800s)
+#   claude:   120 min (7200s) — outer kill; inner claude_mode HARD_TIMEOUT=5400s
 #   train:    55 min  (3300s) — must finish before next :30 fires
 #   research: 60 min  (3600s) — Claude wall is 55, +5 for ml_scaffold post-script
 
@@ -64,7 +64,7 @@ case "$MODE" in
 
     claude)
         log "starting"
-        timeout 1800 "$PY" scripts/claude_mode.py "$@" 2>&1 | tee -a "$LOG"
+        timeout 7200 "$PY" scripts/claude_mode.py "$@" 2>&1 | tee -a "$LOG"
         EX=${PIPESTATUS[0]}
         log "exit $EX"
         exit "$EX"
