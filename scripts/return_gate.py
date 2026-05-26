@@ -24,6 +24,8 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
+from typing import Optional
 
 # Pin to GPU 0. trainers.py:28 also sets this via setdefault, but
 # models.sequence_loader (imported below) triggers torch's CUDA init
@@ -76,6 +78,55 @@ SPLIT_DEFS = [
 MAX_DD = 0.20                  # 20% peak-to-trough per window
 MIN_TRADES_PER_WINDOW = 20     # ~1 trade per 6 trading days in 4-mo window
 MIN_WR = 0.40                  # roughly breakeven WR with avg_win ~5% / avg_loss ~3.5%
+
+# --- Regime-aware MIN_WR (opt-in via env var) ----------------------------
+# When RETURN_GATE_REGIME_AWARE=1, per-window MIN_WR is computed as
+#   max(MIN_WR_FLOOR, set_buy_hold_wr[window] + MIN_WR_MARGIN)
+# using the SET buy-and-hold win rate cached in data/baselines.json. This
+# fixes the asymmetry where a 41% trainer WR is "edge" in a bear regime
+# (SET wr=35%) but "noise" in a bull regime (SET wr=58%). Default OFF so
+# historical gate_passed values stay comparable; flip via the env var on
+# a per-run basis to A/B the regime-conditional version.
+REGIME_AWARE_GATE = os.environ.get('RETURN_GATE_REGIME_AWARE', '0') == '1'
+MIN_WR_FLOOR = 0.30            # anti-degenerate floor when SET wr is very low
+MIN_WR_MARGIN = 0.03           # require 3pp above SET buy-hold WR
+
+_BASELINES_PATH = Path(os.path.expanduser(
+    '~/projects/caffe-stocks/data/baselines.json'))
+
+
+def _set_wr_for_window(test_start: str, test_end: str) -> Optional[float]:
+    """Return SET buy-hold WR for the named test window, or None if the
+    baseline cache is missing/stale/unparseable."""
+    if not _BASELINES_PATH.exists():
+        return None
+    try:
+        with open(_BASELINES_PATH) as f:
+            doc = json.load(f)
+    except Exception:
+        return None
+    per_window = (doc.get('set_buy_hold') or {}).get('per_window') or []
+    key = f'{test_start}..{test_end}'
+    for w in per_window:
+        if w.get('test') == key:
+            try:
+                return float(w.get('win_rate'))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _min_wr_for_window(test_start: str, test_end: str) -> tuple[float, str]:
+    """Compute the per-window MIN_WR. Returns (threshold, source_label).
+    Falls back to the fixed MIN_WR when regime mode is off OR the baseline
+    cache lacks coverage for this window."""
+    if not REGIME_AWARE_GATE:
+        return MIN_WR, 'fixed'
+    set_wr = _set_wr_for_window(test_start, test_end)
+    if set_wr is None:
+        return MIN_WR, 'fixed (no baseline)'
+    adjusted = max(MIN_WR_FLOOR, set_wr + MIN_WR_MARGIN)
+    return adjusted, f'regime (SET wr={set_wr:.1%}+{MIN_WR_MARGIN:.0%})'
 # 7/7 was the original bar; 750 iterations across 42 trainer families produced
 # zero passes (best ever: 6/7), suggesting the bar is unreachable for this
 # universe × 10d horizon × 20-trade floor combination. Loosened to 6/7 so a
@@ -365,17 +416,19 @@ def evaluate_window(X_tab, y, dates, symbols, pnl, hold_days, agg_features,
     # Pick the one with best annualized return (regardless of pass/fail — we want to see)
     best_sim = max(sims, key=lambda s: (s['n_trades'] >= MIN_TRADES_PER_WINDOW, s['annualized_return']))
 
-    # Per-window pass criteria (v1: no ann_return floor here)
+    # Per-window pass criteria (v1: no ann_return floor here). MIN_WR is
+    # per-window when REGIME_AWARE_GATE is enabled — see _min_wr_for_window.
     n = best_sim['n_trades']
     dd = best_sim['max_drawdown']
     wr = best_sim['win_rate']
+    min_wr, min_wr_src = _min_wr_for_window(test_start, test_end)
     fails = []
     if dd > MAX_DD:
         fails.append(f'max_dd {dd:.1%} > {MAX_DD:.0%}')
     if n < MIN_TRADES_PER_WINDOW:
         fails.append(f'n_trades {n} < {MIN_TRADES_PER_WINDOW}')
-    if wr < MIN_WR:
-        fails.append(f'wr {wr:.1%} < {MIN_WR:.0%}')
+    if wr < min_wr:
+        fails.append(f'wr {wr:.1%} < {min_wr:.0%} [{min_wr_src}]')
 
     return {
         'passed': len(fails) == 0,
