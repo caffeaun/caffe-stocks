@@ -30,6 +30,34 @@ sys.path.insert(0, str(BASE))
 from scripts import feedback as fb
 from scripts.promote_panel import _engine_family
 
+BASELINES_PATH = BASE / 'data' / 'baselines.json'
+
+
+def _load_baselines() -> dict:
+    """Return the baselines dict, or {} if the file is missing/broken.
+    The leaderboard renders whatever keys it finds (random_topk, rule_only,
+    set_buy_hold, …) so future baselines need no code change here."""
+    if not BASELINES_PATH.exists():
+        return {}
+    try:
+        import json
+        with open(BASELINES_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _set_baseline_ann() -> float | None:
+    """The SET buy-and-hold avg_ann across 7 windows; used as the floor
+    for the ★ marker on trainer rows. None if unavailable."""
+    b = _load_baselines().get('set_buy_hold') or {}
+    if 'avg_annualized_return' not in b:
+        return None
+    try:
+        return float(b['avg_annualized_return'])
+    except (TypeError, ValueError):
+        return None
+
 
 def _fmt_pct(x: float | None, sign: bool = False) -> str:
     """Format a fractional value as a percentage string. Caps display at
@@ -56,9 +84,15 @@ def _row(rank, iter_id, mode, trainer, wr, ann, dd, n_tr, wp, date,
          family=None, gate=False) -> str:
     flag = '🏆' if gate else '  '
     fam = f'{family:16}' if family is not None else ''
+    # ★ if avg_ann beats the SET buy-and-hold avg_ann floor; else blank.
+    set_floor = _set_baseline_ann()
+    if ann is not None and set_floor is not None and float(ann) > set_floor:
+        beats = '★'
+    else:
+        beats = ' '
     return (f'{flag} {rank:>3}  #{iter_id:<4}  {mode:6}  '
             f'{trainer[:22]:22}  {fam}'
-            f'{_fmt_pct(wr):>6}  {_fmt_pct(ann, sign=True):>8}  '
+            f'{_fmt_pct(wr):>6}  {_fmt_pct(ann, sign=True):>8}{beats} '
             f'{_fmt_pct(dd):>6}  '
             f'{n_tr:>4}  {wp}/7  {_fmt_date(date)}')
 
@@ -189,8 +223,45 @@ def section_panel() -> list[str]:
     return out
 
 
+def section_baselines() -> list[str]:
+    """Render the non-trainer baselines (SET buy-hold, random_topk, rule_only)
+    as a floor block above the trainer sections. Anything that scores below
+    these isn't beating dumb strategies."""
+    b = _load_baselines()
+    out = ['', '=' * 110,
+           'BASELINES  (floors to beat — trainer ★ = avg_ann above SET buy-hold)',
+           '=' * 110]
+    rows = []
+    for key, label in (
+        ('set_buy_hold', 'SET buy & hold'),
+        ('random_topk',  'random top-K'),
+        ('rule_only',    'volume/RSI rule'),
+    ):
+        d = b.get(key)
+        if not isinstance(d, dict):
+            continue
+        rows.append((label, d))
+    if not rows:
+        out.append('   (baselines file missing — '
+                   'run scripts/compute_set_baseline.py)')
+        return out
+    out.append('     baseline                 wr      ann       dd     wp')
+    for label, d in rows:
+        wp = d.get('windows_passed', 0)
+        wt = d.get('windows_total', 7)
+        out.append(
+            f'     {label:22}  '
+            f'{_fmt_pct(d.get("avg_win_rate")):>6}  '
+            f'{_fmt_pct(d.get("avg_annualized_return"), sign=True):>8}  '
+            f'{_fmt_pct(d.get("avg_max_dd")):>6}  '
+            f'{wp}/{wt}'
+        )
+    return out
+
+
 def render(top: int, days: int) -> str:
     parts: list[str] = []
+    parts += section_baselines()
     parts += section_candidates(top)
     parts += section_near_passes(top)
     parts += section_best_per_family(days)

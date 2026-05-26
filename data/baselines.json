@@ -1,0 +1,285 @@
+{
+  "random_topk": {
+    "windows_passed": 1,
+    "windows_total": 7,
+    "avg_annualized_return": -0.30164180700084636,
+    "avg_win_rate": 0.3168610927477923,
+    "avg_max_dd": 0.15586959574805134,
+    "total_trades": 177,
+    "per_window": [
+      {
+        "window_idx": 1,
+        "n_trades": 22,
+        "win_rate": 0.3181818181818182,
+        "annualized_return": -0.2933406008617383,
+        "max_drawdown": 0.17751053008863865,
+        "passed": false
+      },
+      {
+        "window_idx": 2,
+        "n_trades": 21,
+        "win_rate": 0.2857142857142857,
+        "annualized_return": -0.19916004455383318,
+        "max_drawdown": 0.09911690589791369,
+        "passed": false
+      },
+      {
+        "window_idx": 3,
+        "n_trades": 25,
+        "win_rate": 0.28,
+        "annualized_return": -0.20825767619930402,
+        "max_drawdown": 0.18715504839312627,
+        "passed": false
+      },
+      {
+        "window_idx": 4,
+        "n_trades": 29,
+        "win_rate": 0.1724137931034483,
+        "annualized_return": -0.5642441784363467,
+        "max_drawdown": 0.23112960182208858,
+        "passed": false
+      },
+      {
+        "window_idx": 5,
+        "n_trades": 27,
+        "win_rate": 0.4074074074074074,
+        "annualized_return": -0.2519180398648193,
+        "max_drawdown": 0.07595027996279176,
+        "passed": true
+      },
+      {
+        "window_idx": 6,
+        "n_trades": 29,
+        "win_rate": 0.3793103448275862,
+        "annualized_return": -0.2860475719170692,
+        "max_drawdown": 0.21130768110805764,
+        "passed": false
+      },
+      {
+        "window_idx": 7,
+        "n_trades": 24,
+        "win_rate": 0.375,
+        "annualized_return": -0.30852453717281425,
+        "max_drawdown": 0.10891712296374273,
+        "passed": false
+      }
+    ]
+  },
+  "rule_only": {
+    "windows_passed": 0,
+    "windows_total": 7,
+    "avg_annualized_return": -0.27818923424513603,
+    "avg_win_rate": 0.2678421454399214,
+    "avg_max_dd": 0.22387376700023862,
+    "total_trades": 272,
+    "per_window": [
+      {
+        "window_idx": 1,
+        "n_trades": 34,
+        "win_rate": 0.38235294117647056,
+        "annualized_return": 0.20307699516915934,
+        "max_drawdown": 0.13549058979722334,
+        "passed": false
+      },
+      {
+        "window_idx": 2,
+        "n_trades": 38,
+        "win_rate": 0.3157894736842105,
+        "annualized_return": -0.35163607405366637,
+        "max_drawdown": 0.18590687333854478,
+        "passed": false
+      },
+      {
+        "window_idx": 3,
+        "n_trades": 38,
+        "win_rate": 0.3157894736842105,
+        "annualized_return": -0.17712783129951903,
+        "max_drawdown": 0.27329240959720247,
+        "passed": false
+      },
+      {
+        "window_idx": 4,
+        "n_trades": 37,
+        "win_rate": 0.1891891891891892,
+        "annualized_return": -0.5485475896425911,
+        "max_drawdown": 0.2689792907258082,
+        "passed": false
+      },
+      {
+        "window_idx": 5,
+        "n_trades": 50,
+        "win_rate": 0.16,
+        "annualized_return": -0.48518522183259116,
+        "max_drawdown": 0.2519505535165235,
+        "passed": false
+      },
+      {
+        "window_idx": 6,
+        "n_trades": 49,
+        "win_rate": 0.20408163265306123,
+        "annualized_return": -0.5327278705513486,
+        "max_drawdown": 0.33034202890499514,
+        "passed": false
+      },
+      {
+        "window_idx": 7,
+        "n_trades": 26,
+        "win_rate": 0.3076923076923077,
+        "annualized_return": -0.055177047505395094,
+        "max_drawdown": 0.12115462312137276,
+        "passed": false
+      }
+    ]
+  },
+  "regime_stats": [
+    {
+      "window": "2023-11-01..2024-02-28",
+      "set_return": 0.0627,
+      "set_vol_20d": 0.1151,
+      "breadth_above_sma20": 0.4743,
+      "foreign_flow_net": -47594.7,
+      "hostile": false
+    },
+    {
+      "window": "2024-01-01..2024-04-30",
+      "set_return": 0.0002,
+      "set_vol_20d": 0.1013,
+      "breadth_above_sma20": 0.4578,
+      "foreign_flow_net": -65412.5,
+      "hostile": false
+    },
+    {
+      "window": "2024-05-01..2024-08-31",
+      "set_return": -0.0695,
+      "set_vol_20d": 0.1382,
+      "breadth_above_sma20": 0.3747,
+      "foreign_flow_net": -59335.4,
+      "hostile": false
+    },
+    {
+      "window": "2024-09-01..2024-12-31",
+      "set_return": -0.0166,
+      "set_vol_20d": 0.1162,
+      "breadth_above_sma20": 0.4262,
+      "foreign_flow_net": -23192.2,
+      "hostile": false
+    },
+    {
+      "window": "2025-01-01..2025-04-30",
+      "set_return": -0.1273,
+      "set_vol_20d": 0.1912,
+      "breadth_above_sma20": 0.3171,
+      "foreign_flow_net": -54590.9,
+      "hostile": true
+    },
+    {
+      "window": "2025-05-01..2025-08-31",
+      "set_return": 0.0828,
+      "set_vol_20d": 0.1417,
+      "breadth_above_sma20": 0.5145,
+      "foreign_flow_net": -29696.4,
+      "hostile": false
+    },
+    {
+      "window": "2026-01-01..2026-05-17",
+      "set_return": 0.1543,
+      "set_vol_20d": 0.1528,
+      "breadth_above_sma20": 0.5371,
+      "foreign_flow_net": 58826.4,
+      "hostile": false
+    }
+  ],
+  "_metadata": {
+    "last_updated": "2026-05-17",
+    "note": "regime_stats added for window-level diagnosis",
+    "set_buy_hold_updated": "2026-05-26T10:18:17"
+  },
+  "set_buy_hold": {
+    "windows_passed": 4,
+    "windows_total": 7,
+    "avg_annualized_return": 0.0564,
+    "avg_win_rate": 0.4941,
+    "avg_max_dd": 0.1066,
+    "total_trades": 7,
+    "per_window": [
+      {
+        "window_idx": 1,
+        "test": "2023-11-01..2024-02-28",
+        "n_trading_days": 79,
+        "cum_return": 0.0015,
+        "annualized_return": 0.0049,
+        "win_rate": 0.4872,
+        "max_drawdown": 0.0544,
+        "n_trades": 1,
+        "passed": true
+      },
+      {
+        "window_idx": 2,
+        "test": "2024-01-01..2024-04-30",
+        "n_trading_days": 80,
+        "cum_return": -0.0431,
+        "annualized_return": -0.1312,
+        "win_rate": 0.4304,
+        "max_drawdown": 0.0715,
+        "n_trades": 1,
+        "passed": false
+      },
+      {
+        "window_idx": 3,
+        "test": "2024-05-01..2024-08-31",
+        "n_trading_days": 81,
+        "cum_return": -0.0031,
+        "annualized_return": -0.0096,
+        "win_rate": 0.5375,
+        "max_drawdown": 0.0786,
+        "n_trades": 1,
+        "passed": false
+      },
+      {
+        "window_idx": 4,
+        "test": "2024-09-01..2024-12-31",
+        "n_trading_days": 81,
+        "cum_return": 0.0344,
+        "annualized_return": 0.1124,
+        "win_rate": 0.4625,
+        "max_drawdown": 0.0869,
+        "n_trades": 1,
+        "passed": true
+      },
+      {
+        "window_idx": 5,
+        "test": "2025-01-01..2025-04-30",
+        "n_trading_days": 81,
+        "cum_return": -0.1323,
+        "annualized_return": -0.3605,
+        "win_rate": 0.4625,
+        "max_drawdown": 0.2274,
+        "n_trades": 1,
+        "passed": false
+      },
+      {
+        "window_idx": 6,
+        "test": "2025-05-01..2025-08-31",
+        "n_trading_days": 78,
+        "cum_return": 0.0314,
+        "annualized_return": 0.1064,
+        "win_rate": 0.4935,
+        "max_drawdown": 0.1291,
+        "n_trades": 1,
+        "passed": true
+      },
+      {
+        "window_idx": 7,
+        "test": "2026-01-01..2026-05-26",
+        "n_trading_days": 95,
+        "cum_return": 0.2114,
+        "annualized_return": 0.6721,
+        "win_rate": 0.5851,
+        "max_drawdown": 0.0982,
+        "n_trades": 1,
+        "passed": true
+      }
+    ],
+    "note": "Buy-and-hold ^SET.BK, close-to-close per window. win_rate = fraction of positive trading days. n_trades = 1 (held the whole window)."
+  }
+}
