@@ -265,7 +265,12 @@ GOAL: 50% gross annual return on a 10k THB base, repeatable, withdrawing the gai
 - Friction model in models/labels.py (COMMISSION_PCT)
 - Universe: any THB-denominated SET / mai / TDEX (ThaiDEX ETF) instrument tradable via BLS
 - Walk-forward gate: 7 calendar splits in scripts/return_gate.py
-- v1 per-window pass: max_dd <= 20%, n_trades >= 20, wr >= 40% (no per-window ann floor)
+- v1 per-window pass: max_dd <= 20%, n_trades >= 20, wr >= max(30%, SET_buy_hold_wr + 1pp)
+  (regime-aware floor since 2026-05-26; per-window SET WR is in data/baselines.json
+  `set_buy_hold.per_window`. Approximate per-window thresholds at the time of writing:
+  W1≈49.7%, W2≈44.0%, W3≈54.8%, W4≈47.2%, W5≈47.2%, W6≈50.4%, W7≈59.5%. The bar moves
+  with the market — target alpha above market WR, not the legacy 40% floor that SET
+  routinely clears. Set RETURN_GATE_REGIME_AWARE=0 to fall back to the fixed 40% floor.)
 - v1 model-level pass (becomes a candidate): AT LEAST 6 of 7 windows pass per-window
   AND avg annualized_return strictly beats the best prior candidate (or > 0 if none
   yet). The 6/7 bar replaces an earlier 7/7 bar that produced zero passes across 750
