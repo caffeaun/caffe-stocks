@@ -340,6 +340,18 @@ CURATED_FEATURES = [
     # over a trailing 60-day SET-index window is regime-invariant by
     # construction → comparable meaning across all 7 walk-forward splits.
     'set_ret_5d_zscore_60d',
+    # Per-stock raw daily return (1) — iter #1759
+    # Added so foundation-model trainers (torch_sundial / torch_timesfm)
+    # have a proper continuous per-stock time-series channel to consume.
+    # Iter #1757/#1758 swept channel_index over {0=atr_pct, 1=volume_ratio,
+    # 7=ret_1d_xrank (cross-sectional rank), 8=ret_5d_xrank, 23=set zscore}
+    # and all collapsed: ranks are uniform-distributed [0,1] (not a TS),
+    # and SET zscore is identical across all symbols on a given date so
+    # Sundial's sampled future-path stats become a per-DAY constant rather
+    # than a per-ROW signal. ret_1d (pct_change(1)) is the natural input
+    # for Sundial's revin → flow-matching backbone, near-Gaussian and
+    # zero-centered after the trainer's manual instance normalization.
+    'ret_1d',
 ]
 
 

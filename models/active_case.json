@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_sundial",
+  "trainer": "modernnca",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Default channel_index=8 (ret_5d_xrank, a [0,1] cross-sectional rank) gave Sundial a non-TS-shaped input, collapsing scores to thr=0.0 on 6/7 windows. Train mode should sweep channel_index in {0, 1, 23} (atr_pct, volume_ratio, set_ret_5d_zscore_60d \u2014 real continuous TS) plus pos_weight in [0.8, 1.5] and use_tabular_features True/False before declaring dead. W1 sweep alive (thr=0.4 with +7.1% ann/33% WR) shows latent discrimination.",
-  "claude_iter_id": 1757,
-  "designated_at": "2026-05-26T06:27:53"
+  "rationale": "modernnca hit 4/7 wp at iter #1755 (avg_ann +29.5%, wr 36.8%) and 4/7 again at #1754 (+11.0%/41.0%) \u2014 the strongest active family, matching the historical 4/7 ceiling set by histgb_monotonic #936. Train mode mid-sweep across k/hidden_dim/dropout/lr; keep refining to push toward 5-6/7. Sundial swept channel_index in {-1, 0, 7, 8, 23} across iters #1757/#1758 and ch0/ch23 train runs \u2014 best 1/7 across the entire HP cube, family exhausted on the path-stat-head architecture.",
+  "claude_iter_id": 1759,
+  "designated_at": "2026-05-26T18:17:24"
 }

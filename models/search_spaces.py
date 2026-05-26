@@ -1517,7 +1517,7 @@ SEARCH_SPACES: dict[str, dict] = {
     'patience':      [5, 8, 12],
 },
 'torch_sundial': {
-    'channel_index':         [0, 1, 7, 8, 23],
+    'channel_index':         [-1, 7, 8, 23],
     'lookback':              [20],
     'forecast_length':       [3, 5, 10],
     'num_samples':           [8, 16, 32],

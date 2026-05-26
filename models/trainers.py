@@ -15254,7 +15254,7 @@ class TorchSundialTrainer(BaseTrainer):
     def __init__(self,
                  model_id: str = 'thuml/sundial-base-128m',
                  model_dir: str = 'data/sundial_base_128m',
-                 channel_index: int = 8,
+                 channel_index: int = -1,
                  lookback: int = 20,
                  forecast_length: int = 5,
                  num_samples: int = 16,
