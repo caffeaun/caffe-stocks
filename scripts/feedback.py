@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,46 @@ from typing import Optional
 
 BASE_PATH = Path(os.path.expanduser('~/projects/caffe-stocks'))
 DB_PATH = BASE_PATH / 'data' / 'ml-feedback.db'
+
+_TELEGRAM_CONF_PATHS = (
+    BASE_PATH.parent / 'ops' / 'telegram' / 'telegram.conf',
+    Path.home() / 'kanoonth' / 'scripts' / 'telegram.conf',
+)
+
+
+def _maybe_telegram_warn(message: str) -> None:
+    """Best-effort Telegram alert. Swallows every exception — never lets
+    a telemetry failure block an iteration write. Mirrors the conf-loading
+    pattern from scripts/leaderboard.py:telegram()."""
+    try:
+        import urllib.parse
+        import urllib.request
+        bot_token = chat_id = None
+        for p in _TELEGRAM_CONF_PATHS:
+            if not p.exists():
+                continue
+            with open(p) as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith('TELEGRAM_BOT_TOKEN='):
+                        bot_token = s.split('=', 1)[1].strip().strip('"\'')
+                    elif s.startswith('TELEGRAM_CHAT_ID='):
+                        chat_id = s.split('=', 1)[1].strip().strip('"\'')
+            if bot_token and chat_id:
+                break
+        if not (bot_token and chat_id):
+            return
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id,
+            'text': message[:3900],
+            'disable_web_page_preview': 'true',
+        }).encode()
+        urllib.request.urlopen(
+            f'https://api.telegram.org/bot{bot_token}/sendMessage',
+            data=data, timeout=10,
+        )
+    except Exception:
+        pass
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS iterations (
@@ -126,6 +167,32 @@ def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
     """Append an iteration row + per-window detail. Returns iteration id."""
     init_db()
     agg = _aggregate(gate_result)
+
+    # Sanity check: catch the zero-aggregate bug class at write-time.
+    # Pattern: walk-forward DID produce windows (wp>0) but aggregates collapsed
+    # to zero — diagnostic of a schema mismatch between producer and _aggregate
+    # (the 2026-05 claude/train shape mismatch was the original cause). We
+    # warn + Telegram but still commit the row so the per-window data is
+    # preserved for later forensic recovery via backfill_zero_aggregates.py.
+    wp = int(gate_result.get('windows_passed', 0))
+    if (wp > 0 and agg['total_trades'] == 0
+            and agg['avg_win_rate'] == 0.0
+            and agg['avg_annualized_return'] == 0.0):
+        gr_keys = list(gate_result.keys())
+        results = gate_result.get('results') or []
+        r0_keys = list(results[0].keys()) if results else []
+        msg = (
+            f'⚠️ aggregate sanity failed: {trainer} (mode={mode}, '
+            f'wp={wp}/{gate_result.get("windows_total", 7)}) — '
+            f'wr=0% total_trades=0 avg_ann=0% despite wp>0. '
+            f'Likely a new gate_result schema. '
+            f'gate_result keys: {gr_keys}. result[0] keys: {r0_keys}. '
+            f'Recover via scripts/backfill_zero_aggregates.py once '
+            f'scripts/feedback.py:_aggregate handles the new shape.'
+        )
+        print(msg, file=sys.stderr)
+        _maybe_telegram_warn(msg)
+
     with get_conn() as conn:
         cur = conn.execute("""
             INSERT INTO iterations
@@ -220,18 +287,36 @@ def _aggregate(gate_result: dict) -> dict:
             return cast(sum(m.get(key, 0) or 0 for m in metrics))
         return cast(sum(m.get(key, 0) or 0 for m in metrics) / n)
 
+    tier_used: dict[str, str] = {}
+
     def pick(top_key: str, window_key: str, cast=float):
         top = gate_result.get(top_key)
         if top is not None and float(top) != 0.0:
+            tier_used[top_key] = 'top'
             return cast(top)
+        tier_used[top_key] = 'computed' if n > 0 else 'zero'
         return computed(window_key, cast=cast)
 
-    return {
+    out = {
         'avg_annualized_return': pick('avg_annualized_return', 'annualized_return'),
         'avg_win_rate':          pick('avg_win_rate', 'win_rate'),
         'avg_max_dd':            pick('avg_max_dd', 'max_drawdown'),
         'total_trades':          pick('total_trades', 'n_trades', cast=int),
     }
+    # Forensic trail — one line per call, lands in the same log path as the
+    # caller (claude-mode-*.log / ml-loop.log). Helps post-hoc analysis when
+    # an aggregate looks off; if a future producer drifts schema, the
+    # `tier_used` summary makes the misroute obvious.
+    print(
+        f'[feedback._aggregate] tiers='
+        f'avg_ann={tier_used["avg_annualized_return"]} '
+        f'avg_wr={tier_used["avg_win_rate"]} '
+        f'avg_max_dd={tier_used["avg_max_dd"]} '
+        f'total_trades={tier_used["total_trades"]} '
+        f'n_windows={n}',
+        file=sys.stderr,
+    )
+    return out
 
 
 # ---------------------- query helpers ----------------------
