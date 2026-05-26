@@ -1,12 +1,12 @@
 {
-  "trainer": "kernel_histgb_stack",
+  "trainer": "xgb_regime_blend",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Just added fusion_mode='regime_aware' with 4 new HPs (regime_threshold, regime_bear/bull_stack_weight, regime_breadth_col_idx). First-shot defaults hit 2/7 with W1 +79.2% ann (thr=0.6) \u2014 strongest W1 in 20+ iters \u2014 but bear weights at 0.85 over-fired HistGB on transition/bear windows. Train mode should sweep the regime quadrant + stack_weight; modernnca sweep (the prior case) has 10 consecutive 0-1/7 train iterations and is exhausted.",
-  "claude_iter_id": 1767,
-  "designated_at": "2026-05-26T21:12:55"
+  "rationale": "First-ever iteration of xgb_regime_blend (0 prior in DB across both modes). Defaults yielded 0/7 wp but with notable W2 +10.0% ann/42.9% WR (only 1pp short of 44% regime bar) and W1 +3.0% ann/41.7% WR. Low avg DD (9.8%) shows the regime routing is conservative, not blowing up \u2014 exactly the inductive bias the W5 wall needs. The 16-HP search space (bear_quantile, temperature, regime_feature_idx in {15,16,19,12}, magnitude_scale, base_weight, pos_class_weight + standard XGB quadrant) is structurally untouched and orthogonal to any prior sweep. W7 collapse to 17 trades suggests pos_class_weight needs to drop and/or temperature should soften \u2014 both are in the sweep space.",
+  "claude_iter_id": 1783,
+  "designated_at": "2026-05-27T00:11:00"
 }
