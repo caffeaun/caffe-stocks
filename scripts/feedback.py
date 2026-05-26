@@ -150,7 +150,7 @@ def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
         iter_id = cur.lastrowid
 
         for idx, r in enumerate(gate_result.get('results', []), 1):
-            best = r.get('best') or {}
+            m = _window_metrics(r)
             conn.execute("""
                 INSERT INTO iteration_windows
                 (iteration_id, window_idx, train_start, train_end, test_start, test_end,
@@ -161,15 +161,15 @@ def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
                 iter_id, idx,
                 *_split_period(r.get('train', '')),
                 *_split_period(r.get('test', '')),
-                best.get('threshold'),
-                best.get('n_trades'),
-                best.get('win_rate'),
-                best.get('avg_pnl'),
-                best.get('avg_win'),
-                best.get('avg_loss'),
-                best.get('annualized_return'),
-                best.get('max_drawdown'),
-                best.get('final_equity'),
+                m.get('threshold'),
+                m.get('n_trades'),
+                m.get('win_rate'),
+                m.get('avg_pnl'),
+                m.get('avg_win'),
+                m.get('avg_loss'),
+                m.get('annualized_return'),
+                m.get('max_drawdown'),
+                m.get('final_equity'),
             ))
         return iter_id
 
@@ -182,17 +182,55 @@ def _split_period(s: str) -> tuple[Optional[str], Optional[str]]:
     return a, b
 
 
+def _window_metrics(r: dict) -> dict:
+    """Per-window metric dict.
+
+    train_mode emits `{"best": {n_trades, win_rate, annualized_return, ...}}`
+    (the winning threshold from its sweep). claude_mode emits the same
+    fields flat on the result itself (it picks one threshold and reports
+    that). This helper accepts either shape.
+    """
+    if isinstance(r.get('best'), dict):
+        return r['best']
+    return r
+
+
 def _aggregate(gate_result: dict) -> dict:
-    valid = [r for r in gate_result.get('results', []) if 'best' in r]
-    if not valid:
-        return {'avg_annualized_return': 0.0, 'avg_win_rate': 0.0,
-                'avg_max_dd': 0.0, 'total_trades': 0}
-    bests = [r['best'] for r in valid]
+    """Aggregate per-window metrics into iteration-level averages.
+
+    Per-key fallback so both train_mode and claude_mode JSON shapes
+    work without prompt changes. For each field independently:
+      1. Use the top-level value on `gate_result` if it's present AND
+         non-zero (zeros are treated as "unfilled" — both producers
+         leave some aggregates at the default 0.0).
+      2. Else compute from per-window data, accepting either nested
+         `best` sub-dict (train_mode shape) or flat per-window keys
+         (claude_mode shape).
+      3. Else zero (truly empty).
+    """
+    results = gate_result.get('results', []) or []
+    metrics = [_window_metrics(r) for r in results]
+    metrics = [m for m in metrics if m]
+    n = len(metrics)
+
+    def computed(key: str, cast=float) -> float:
+        if n == 0:
+            return cast(0)
+        if cast is int:
+            return cast(sum(m.get(key, 0) or 0 for m in metrics))
+        return cast(sum(m.get(key, 0) or 0 for m in metrics) / n)
+
+    def pick(top_key: str, window_key: str, cast=float):
+        top = gate_result.get(top_key)
+        if top is not None and float(top) != 0.0:
+            return cast(top)
+        return computed(window_key, cast=cast)
+
     return {
-        'avg_annualized_return': float(sum(b.get('annualized_return', 0) for b in bests) / len(bests)),
-        'avg_win_rate':          float(sum(b.get('win_rate', 0) for b in bests) / len(bests)),
-        'avg_max_dd':            float(sum(b.get('max_drawdown', 0) for b in bests) / len(bests)),
-        'total_trades':          int(sum(b.get('n_trades', 0) for b in bests)),
+        'avg_annualized_return': pick('avg_annualized_return', 'annualized_return'),
+        'avg_win_rate':          pick('avg_win_rate', 'win_rate'),
+        'avg_max_dd':            pick('avg_max_dd', 'max_drawdown'),
+        'total_trades':          pick('total_trades', 'n_trades', cast=int),
     }
 
 
