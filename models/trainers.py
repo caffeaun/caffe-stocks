@@ -12441,7 +12441,7 @@ class TabICLv2Trainer(BaseTrainer):
         # Conservative pre-flight estimate: 60 s per call covers all
         # n_estimators ∈ [1,4] sweeps without false-positive budget trips.
         check_budget(estimated_duration_s=60.0, gpu=self.modal_gpu)
-        fn = modal.Function.lookup('caffe-stocks-modal', 'train_predict_tabicl')
+        fn = modal.Function.from_name('caffe-stocks-modal', 'train_predict_tabicl')
         t0 = time.monotonic()
         try:
             proba = fn.remote(

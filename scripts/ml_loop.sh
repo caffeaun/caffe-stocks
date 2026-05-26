@@ -41,6 +41,18 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$MODE] $*" | tee -a "$LOG"; }
 cd "$BASE"
 export PYTHONPATH="$BASE"
 
+# Source per-trainer token files. Each is sourceable shell (KEY=value lines)
+# and only exports keys that aren't already set (so an outer env wins).
+for ENVFILE in "$BASE/.env.tabfpn" "$BASE/.env.tabpfn"; do
+    [ -f "$ENVFILE" ] || continue
+    while IFS='=' read -r k v; do
+        [ -z "$k" ] && continue
+        case "$k" in \#*) continue ;; esac
+        eval ": \${$k:=$v}"
+        export "$k"
+    done < "$ENVFILE"
+done
+
 case "$MODE" in
     train)
         log "starting (args: $*)"
