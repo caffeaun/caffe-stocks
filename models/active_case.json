@@ -1,12 +1,12 @@
 {
-  "trainer": "xgb_regime_blend",
+  "trainer": "anomaly_gated_histgb",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First-ever iteration of xgb_regime_blend (0 prior in DB across both modes). Defaults yielded 0/7 wp but with notable W2 +10.0% ann/42.9% WR (only 1pp short of 44% regime bar) and W1 +3.0% ann/41.7% WR. Low avg DD (9.8%) shows the regime routing is conservative, not blowing up \u2014 exactly the inductive bias the W5 wall needs. The 16-HP search space (bear_quantile, temperature, regime_feature_idx in {15,16,19,12}, magnitude_scale, base_weight, pos_class_weight + standard XGB quadrant) is structurally untouched and orthogonal to any prior sweep. W7 collapse to 17 trades suggests pos_class_weight needs to drop and/or temperature should soften \u2014 both are in the sweep space.",
-  "claude_iter_id": 1783,
-  "designated_at": "2026-05-27T00:11:00"
+  "rationale": "Pivot from xgb_regime_blend (8 train iter, best 2/7 wp, recent runs flat/negative ann). anomaly_gated_histgb has best wp=5 of any family in last 200 iter (n=46 train) and is the only registered trainer with date-level density-based abstention (Isolation Forest day-mean) \u2014 the mechanism Part A failure_pattern points to (W4 hostile / W5 deep bear, both fail 55-90% across trainer families regardless of architecture). 16 HPs in the search space (gate_threshold, gating_alpha, day_abstain_q, anomaly_as_feature \u00d7 HistGB quadrant + IF knobs) are wide-open for train mode to sweep; prior best at iter #1675 (4/7) was BEFORE the 2026-05-26 regime-aware MIN_WR gate change, so a fresh sweep against the harder bar is warranted.",
+  "claude_iter_id": 1814,
+  "designated_at": "2026-05-27T06:12:35"
 }
