@@ -80,8 +80,23 @@ def _fmt_date(s: str | None) -> str:
     return str(s)[:10]
 
 
+def _vault_status(iter_id: int) -> str:
+    """Return vault status for an iteration: '✓' / '✗' / '—' (not evaluated)."""
+    try:
+        with fb.get_conn() as conn:
+            row = conn.execute(
+                "SELECT vault_passed FROM vault_results WHERE iteration_id = ?",
+                (iter_id,),
+            ).fetchone()
+    except Exception:
+        return '—'
+    if not row:
+        return '—'
+    return '✓' if row[0] else '✗'
+
+
 def _row(rank, iter_id, mode, trainer, wr, ann, dd, n_tr, wp, date,
-         family=None, gate=False) -> str:
+         family=None, gate=False, show_vault=False) -> str:
     flag = '🏆' if gate else '  '
     fam = f'{family:16}' if family is not None else ''
     # ★ if avg_ann beats the SET buy-and-hold avg_ann floor; else blank.
@@ -90,11 +105,12 @@ def _row(rank, iter_id, mode, trainer, wr, ann, dd, n_tr, wp, date,
         beats = '★'
     else:
         beats = ' '
+    vault_col = f'  {_vault_status(iter_id)}' if show_vault else ''
     return (f'{flag} {rank:>3}  #{iter_id:<4}  {mode:6}  '
             f'{trainer[:22]:22}  {fam}'
             f'{_fmt_pct(wr):>6}  {_fmt_pct(ann, sign=True):>8}{beats} '
             f'{_fmt_pct(dd):>6}  '
-            f'{n_tr:>4}  {wp}/7  {_fmt_date(date)}')
+            f'{n_tr:>4}  {wp}/7  {_fmt_date(date)}{vault_col}')
 
 
 def section_candidates(top: int) -> list[str]:
@@ -115,12 +131,13 @@ def section_candidates(top: int) -> list[str]:
         out.append('   (none yet — no iteration has cleared the 6/7 gate)')
         return out
     out.append('     #     iter  mode    trainer                  '
-               '   wr      ann       dd     n_tr  wp   date')
+               '   wr      ann       dd     n_tr  wp   date        vault')
     for i, r in enumerate(rows, 1):
         out.append(_row(i, r['id'], r['mode'], r['trainer'],
                         r['avg_win_rate'], r['avg_annualized_return'],
                         r['avg_max_dd'], r['total_trades'],
-                        r['windows_passed'], r['finished_at'], gate=True))
+                        r['windows_passed'], r['finished_at'],
+                        gate=True, show_vault=True))
     return out
 
 

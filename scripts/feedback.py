@@ -144,6 +144,24 @@ def init_db():
     """Idempotent schema creation."""
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # Idempotent ALTER for the Bayesian-gate column (Phase 1E, 2026-05-27).
+        # Stored alongside windows_passed; the deterministic column still
+        # drives gate_passed promotion until the A/B comparison concludes.
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(iterations)"
+        ).fetchall()}
+        if 'bayes_windows_passed' not in cols:
+            conn.execute(
+                'ALTER TABLE iterations ADD COLUMN '
+                'bayes_windows_passed INTEGER DEFAULT NULL'
+            )
+        if 'bayes_windows_passed' not in {r[1] for r in conn.execute(
+                "PRAGMA table_info(iteration_windows)"
+        ).fetchall()}:
+            conn.execute(
+                'ALTER TABLE iteration_windows ADD COLUMN '
+                'bayes_passed INTEGER DEFAULT NULL'
+            )
 
 
 def _git_sha() -> Optional[str]:
@@ -199,8 +217,9 @@ def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
             (started_at, finished_at, mode, trainer, hyperparams, code_changes,
              hypothesis, backbone, git_sha, gate_passed, windows_passed,
              windows_total, avg_annualized_return, avg_win_rate, avg_max_dd,
-             total_trades, model_dir, elapsed_seconds, full_result, lessons)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             total_trades, model_dir, elapsed_seconds, full_result, lessons,
+             bayes_windows_passed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             started_at, finished_at, mode, trainer,
             json.dumps(hyperparams, default=str),
@@ -213,17 +232,19 @@ def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
             agg['avg_max_dd'], agg['total_trades'],
             str(model_dir), int(elapsed_seconds),
             json.dumps(gate_result, default=str), lessons,
+            agg.get('bayes_windows_passed'),
         ))
         iter_id = cur.lastrowid
 
         for idx, r in enumerate(gate_result.get('results', []), 1):
             m = _window_metrics(r)
+            bp = r.get('bayes_passed')
             conn.execute("""
                 INSERT INTO iteration_windows
                 (iteration_id, window_idx, train_start, train_end, test_start, test_end,
                  threshold, n_trades, win_rate, avg_pnl, avg_win, avg_loss,
-                 annualized_return, max_drawdown, final_equity)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 annualized_return, max_drawdown, final_equity, bayes_passed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 iter_id, idx,
                 *_split_period(r.get('train', '')),
@@ -237,6 +258,7 @@ def record_iteration(*, mode: str, trainer: str, hyperparams: dict,
                 m.get('annualized_return'),
                 m.get('max_drawdown'),
                 m.get('final_equity'),
+                int(bool(bp)) if bp is not None else None,
             ))
         return iter_id
 
@@ -297,11 +319,21 @@ def _aggregate(gate_result: dict) -> dict:
         tier_used[top_key] = 'computed' if n > 0 else 'zero'
         return computed(window_key, cast=cast)
 
+    # Bayesian-gate count is summed directly from per-window `bayes_passed`.
+    # None when the producer didn't emit it (legacy iters / minimal claude
+    # shape). Stored alongside deterministic windows_passed for A/B analysis.
+    bayes_flags = [r.get('bayes_passed') for r in results]
+    if any(b is not None for b in bayes_flags):
+        bayes_wp = sum(1 for b in bayes_flags if b)
+    else:
+        bayes_wp = None
+
     out = {
         'avg_annualized_return': pick('avg_annualized_return', 'annualized_return'),
         'avg_win_rate':          pick('avg_win_rate', 'win_rate'),
         'avg_max_dd':            pick('avg_max_dd', 'max_drawdown'),
         'total_trades':          pick('total_trades', 'n_trades', cast=int),
+        'bayes_windows_passed':  bayes_wp,
     }
     # Forensic trail — one line per call, lands in the same log path as the
     # caller (claude-mode-*.log / ml-loop.log). Helps post-hoc analysis when

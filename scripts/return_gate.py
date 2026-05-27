@@ -47,20 +47,14 @@ from models.trainers import get_trainer, TRAINERS
 
 BASE_PATH = os.path.expanduser('~/projects/caffe-stocks')
 
-# Walk-forward calendar splits. Train/test pairs covering 2023-05 → 2026-04.
-# Each test window is 4–6 months. We annualize per-window so the goal is
+# Walk-forward calendar splits. Train/test pairs covering 2023-05 → 2026-03.
+# Each test window is 4 months. We annualize per-window so the goal is
 # evaluated consistently regardless of window length.
-def _rolling_recent_split() -> tuple:
-    """W7: 6 mo train ending 2025-12-31; test from 2026-01-01 to today.
-
-    Test_end is computed at module load so the recent window naturally
-    rolls forward as data ingests. Functionally a monthly rolling
-    cross-validation slice — every iteration sees the freshest regime
-    instead of a fixed 2025-09..2026-02 slice that gets stale.
-    """
-    from datetime import date as _date
-    return ('2025-07-01', '2025-12-31', '2026-01-01', _date.today().isoformat())
-
+#
+# W7 was previously rolling (test_end = today) but that meant every iter
+# *mutated* its own test window — so it could not be a held-out signal.
+# W7 is now fixed at 2026-03-31. Data after that lives in VAULT_SPLIT below
+# and is never read by claude_mode / train_mode — only by scripts/vault_eval.py.
 
 SPLIT_DEFS = [
     # (train_start, train_end,        test_start, test_end)
@@ -70,8 +64,23 @@ SPLIT_DEFS = [
     ('2024-03-01', '2024-08-31', '2024-09-01', '2024-12-31'),  # W4
     ('2024-07-01', '2024-12-31', '2025-01-01', '2025-04-30'),  # W5
     ('2024-11-01', '2025-04-30', '2025-05-01', '2025-08-31'),  # W6
-    _rolling_recent_split(),                                    # W7 — rolling recent
+    ('2025-07-01', '2025-12-31', '2026-01-01', '2026-03-31'),  # W7 — frozen 2026-05-27
 ]
+
+
+def _vault_split() -> tuple:
+    """VAULT: training data from 6 months ending at W7 test_end (overlaps
+    train windows the trainers already see — no leakage); test from
+    2026-04-01 to today. This is the held-out validation surface.
+
+    NEVER read by SPLIT_DEFS or by claude_mode / train_mode. Only
+    scripts/vault_eval.py reads it, run weekly via cron.
+    """
+    from datetime import date as _date
+    return ('2025-10-01', '2026-03-31', '2026-04-01', _date.today().isoformat())
+
+
+VAULT_SPLIT = _vault_split()
 
 # v1 gate (whitepaper §9). Per-window has no ann_return floor — the absolute
 # bar moved to the model level (avg ann beats best prior candidate).
@@ -93,6 +102,21 @@ MIN_WR = 0.40                  # roughly breakeven WR with avg_win ~5% / avg_los
 REGIME_AWARE_GATE = os.environ.get('RETURN_GATE_REGIME_AWARE', '1') == '1'
 MIN_WR_FLOOR = 0.30            # anti-degenerate floor when SET wr is very low
 MIN_WR_MARGIN = 0.01           # require 1pp above SET buy-hold WR
+
+# --- Bayesian gate (advisory only — runs alongside the deterministic gate
+# from 2026-05-27 onwards). Each per-window result stores both `det_passed`
+# and `bayes_passed`; only `det_passed` controls promotion until we have
+# 4-6 weeks of A/B data to decide whether to switch.
+#
+# WR: posterior P(p > min_wr | wins, n) using Jeffreys prior Beta(0.5, 0.5).
+#     Pass when posterior probability is at least MIN_WR_BAYES_PROB.
+# DD: bootstrap the trade-order permutation 1000x, take 90th-percentile MDD;
+#     pass when that upper bound is below MAX_DD.
+# Both correct for the small-n problem (~20 trades/window) where a single
+# lucky/unlucky trade swings the deterministic metric across the threshold.
+MIN_WR_BAYES_PROB = 0.70
+DD_BOOTSTRAP_ITERS = 1000
+DD_BOOTSTRAP_TAIL = 0.90       # 90th-percentile DD must clear the MAX_DD cap
 
 _BASELINES_PATH = Path(os.path.expanduser(
     '~/projects/caffe-stocks/data/baselines.json'))
@@ -117,6 +141,50 @@ def _set_wr_for_window(test_start: str, test_end: str) -> Optional[float]:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _bayes_wr_pass(wins: int, n: int, threshold: float,
+                   prob: float = MIN_WR_BAYES_PROB) -> tuple[bool, float]:
+    """Return (passed, posterior_prob). Jeffreys-prior Beta-Binomial:
+    posterior is Beta(wins + 0.5, n - wins + 0.5); pass iff P(p > threshold)
+    is at least `prob`. Degenerate cases (n=0) return (False, 0)."""
+    if n <= 0:
+        return False, 0.0
+    try:
+        from scipy.stats import beta as _beta
+        post = _beta(wins + 0.5, max(1e-9, n - wins) + 0.5)
+        p = float(post.sf(threshold))
+    except Exception:
+        # Fallback: deterministic if scipy not available
+        p = 1.0 if (wins / n) > threshold else 0.0
+    return p >= prob, p
+
+
+def _bayes_dd_pass(trade_pnls, max_open: int, threshold: float,
+                   iters: int = DD_BOOTSTRAP_ITERS,
+                   tail: float = DD_BOOTSTRAP_TAIL) -> tuple[bool, float]:
+    """Bootstrap the max-drawdown distribution by permuting trade entry order
+    `iters` times. Return (passed, tail_dd) where tail_dd is the upper-tail
+    percentile (default 90th). Pass iff tail_dd <= threshold.
+
+    Order matters for MDD — different entry orders give different drawdowns
+    even for the same trade set. Permutation bootstrap gives a distribution
+    we can put a confidence bound on instead of trusting a single ordering."""
+    pnls = np.asarray(trade_pnls, dtype=np.float64)
+    n = len(pnls)
+    if n == 0:
+        return False, 0.0
+    rng = np.random.default_rng(0)  # deterministic for reproducibility
+    contribs_base = pnls / float(max(1, max_open))
+    tail_dds = np.empty(iters, dtype=np.float64)
+    for i in range(iters):
+        perm = rng.permutation(n)
+        eq = np.cumprod(1.0 + contribs_base[perm])
+        peak = np.maximum.accumulate(eq)
+        dd = (peak - eq) / np.where(peak > 0, peak, 1.0)
+        tail_dds[i] = float(dd.max()) if len(dd) > 0 else 0.0
+    tail_dd = float(np.quantile(tail_dds, tail))
+    return tail_dd <= threshold, tail_dd
 
 
 def _min_wr_for_window(test_start: str, test_end: str) -> tuple[float, str]:
@@ -433,9 +501,25 @@ def evaluate_window(X_tab, y, dates, symbols, pnl, hold_days, agg_features,
     if wr < min_wr:
         fails.append(f'wr {wr:.1%} < {min_wr:.0%} [{min_wr_src}]')
 
+    # Bayesian gate — advisory only. Stored alongside deterministic so the
+    # leaderboard / feedback DB has both columns for a future A/B comparison.
+    wins = int(round(wr * n))
+    bayes_wr_pass, bayes_wr_prob = _bayes_wr_pass(wins, n, min_wr)
+    bayes_dd_pass, bayes_dd_tail = _bayes_dd_pass(
+        [t['pnl'] for t in best_sim.get('trades', [])],
+        MAX_OPEN_POSITIONS, MAX_DD,
+    )
+    bayes_n_pass = n >= MIN_TRADES_PER_WINDOW
+    bayes_passed = bayes_wr_pass and bayes_dd_pass and bayes_n_pass
+
     return {
         'passed': len(fails) == 0,
         'fails': fails,
+        'bayes_passed': bayes_passed,
+        'bayes_wr_pass': bayes_wr_pass,
+        'bayes_wr_prob': bayes_wr_prob,
+        'bayes_dd_pass': bayes_dd_pass,
+        'bayes_dd_tail': bayes_dd_tail,
         'train': f'{train_start}..{train_end}',
         'test': f'{test_start}..{test_end}',
         'n_train': int(train_mask.sum()),
