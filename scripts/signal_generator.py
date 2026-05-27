@@ -54,21 +54,44 @@ def _system_active() -> bool:
         return True
 
 
+# Phase 4 (2026-05-27): opt-in vault gate. Set
+# SIGNAL_REQUIRE_VAULT_PASS=1 to require each panel rank's iteration to
+# have vault_results.vault_passed = 1 before it can produce signals.
+# Default OFF (current behavior) until vault_results accumulates real
+# passes — see scripts/vault_eval.py and the foreign_net_monthly_pctrank
+# data-freshness note in the Phase 1 commit log.
+REQUIRE_VAULT_PASS = os.environ.get('SIGNAL_REQUIRE_VAULT_PASS', '0') == '1'
+
+
 def load_panel_models() -> list[dict]:
     """Return [{rank, trainer, scorer, scaler, features}] for each panel
     member whose artifact dir exists. Empty list when panel is unpopulated.
+
+    When REQUIRE_VAULT_PASS is set, the SQL filters to panel ranks whose
+    iteration_id has vault_results.vault_passed = 1.
     """
     if not FB_DB_PATH.exists():
         return []
     conn = sqlite3.connect(FB_DB_PATH)
     try:
-        rows = conn.execute("""
-            SELECT pp.rank, pp.iteration_id, it.trainer, it.avg_win_rate,
-                   it.avg_annualized_return
-            FROM production_panel pp
-            JOIN iterations it ON it.id = pp.iteration_id
-            ORDER BY pp.rank
-        """).fetchall()
+        if REQUIRE_VAULT_PASS:
+            rows = conn.execute("""
+                SELECT pp.rank, pp.iteration_id, it.trainer, it.avg_win_rate,
+                       it.avg_annualized_return
+                FROM production_panel pp
+                JOIN iterations it ON it.id = pp.iteration_id
+                JOIN vault_results vr ON vr.iteration_id = pp.iteration_id
+                WHERE vr.vault_passed = 1
+                ORDER BY pp.rank
+            """).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT pp.rank, pp.iteration_id, it.trainer, it.avg_win_rate,
+                       it.avg_annualized_return
+                FROM production_panel pp
+                JOIN iterations it ON it.id = pp.iteration_id
+                ORDER BY pp.rank
+            """).fetchall()
     finally:
         conn.close()
 
@@ -268,6 +291,15 @@ def _enrich_with_price(signals: list[dict], latest_date: str) -> list[dict]:
 def format_telegram(signals: list[dict], latest_date: str, n_symbols: int,
                      panel: list[dict], rule_pass: set[str]) -> str:
     if not panel:
+        if REQUIRE_VAULT_PASS:
+            return (
+                f'📊 *Signal Scan — {latest_date}*\n'
+                f'No validated model — every panel rank is missing a '
+                f'vault_passed=1 row in vault_results. '
+                f'SIGNAL_REQUIRE_VAULT_PASS=1 is enforcing held-out '
+                f'validation. Run `scripts/vault_eval.py` once vault data '
+                f'is fresh; signals will resume automatically.'
+            )
         return (f'📊 *Signal Scan — {latest_date}*\n'
                 f'Panel empty — run `scripts/promote_panel.py` to populate.')
 
