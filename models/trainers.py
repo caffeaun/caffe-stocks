@@ -14386,6 +14386,7 @@ class ROCKETBaggedCalibratedTrainer(BaseTrainer):
                  pos_class_weight: float = 1.5,
                  calibrate: str = 'isotonic',
                  per_date_zscore: bool = True,
+                 score_norm_mode: str = 'rank',
                  chunk_size: int = 4096,
                  random_state: int = 42,
                  **_):
@@ -14399,6 +14400,7 @@ class ROCKETBaggedCalibratedTrainer(BaseTrainer):
             pos_class_weight=float(pos_class_weight),
             calibrate=str(calibrate),
             per_date_zscore=bool(per_date_zscore),
+            score_norm_mode=str(score_norm_mode),
             chunk_size=int(chunk_size),
             random_state=int(random_state),
         )
@@ -14579,9 +14581,18 @@ class ROCKETBaggedCalibratedTrainer(BaseTrainer):
         # Optional isotonic calibration
         if self._iso is not None:
             p_raw = self._iso.transform(p_raw)
-        # Optional per-date z-score normalization (then sigmoid)
-        if (self._params['per_date_zscore'] and self._predict_dates is not None
-                and len(self._predict_dates) == len(p_raw)):
+        # Per-date score normalization. Default mode='rank' converts raw probs
+        # into percentile rank within each date — guarantees uniform [0, 1]
+        # distribution per date, breaking the score-collapse failure mode where
+        # all rows share near-identical raw probs and the threshold sweep
+        # degenerates to thr=0.0 (taking the worst-best-of-day picks).
+        # mode='zscore' preserves the legacy sigmoid-of-z behaviour for
+        # back-compat; mode='none' skips per-date normalization entirely.
+        mode = self._params.get('score_norm_mode', 'rank')
+        use_per_date = (self._params['per_date_zscore']
+                        and self._predict_dates is not None
+                        and len(self._predict_dates) == len(p_raw))
+        if use_per_date and mode != 'none':
             out = np.empty_like(p_raw, dtype=np.float32)
             dates_arr = np.asarray(self._predict_dates)
             for d in np.unique(dates_arr):
@@ -14590,13 +14601,16 @@ class ROCKETBaggedCalibratedTrainer(BaseTrainer):
                 if len(vals) <= 1:
                     out[mask] = 0.5
                     continue
+                if mode == 'rank':
+                    order = np.argsort(np.argsort(vals))
+                    out[mask] = ((order + 1) / (len(vals) + 1)).astype(np.float32)
+                    continue
                 mu = float(np.mean(vals))
                 sd = float(np.std(vals))
                 if sd < 1e-9:
                     out[mask] = 0.5
                     continue
                 z = (vals - mu) / sd
-                # map z back to [0, 1] via logistic with tau=1.0
                 out[mask] = (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
             return out
         return np.asarray(p_raw, dtype=np.float32)

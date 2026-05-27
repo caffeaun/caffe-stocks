@@ -1477,6 +1477,7 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_class_weight':         (1.0, 3.0),
     'calibrate':                ['isotonic', 'none'],
     'per_date_zscore':          [True, False],
+    'score_norm_mode':          ['rank', 'zscore', 'none'],
     'random_state':             [42, 7, 1337, 2024],
 },
 'torch_timesfm': {

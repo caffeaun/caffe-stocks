@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from anomaly_gated_histgb (8 train-mode HP iters #1822-1829, ceiling 2/7 wp, W6/W7 both 0/20 across last 20 runs). label_spreading is the first transductive trainer in the 68-trainer registry \u2014 at iter #1830 default HP it unlocked W7 (\u2713 42.9% WR, +42.7% ann, first W7 pass in 20+ iters), W6 within 6pp WR of the floor (+49.5% ann), and avg_ann +15.9% beats the recent anomaly_gated_histgb HP-sweep band. 12 HPs span graph density (n_neighbors), manifold/prior mix (prior_weight, alpha), and HistGB anchor knobs \u2014 wide open for train-mode to sweep.",
-  "claude_iter_id": 1830,
-  "designated_at": "2026-05-27T09:11:19"
+  "rationale": "Keep label_spreading active. Iters #1838-#1845 spread wp 0-2 with avg_ann band -27% to +74% \u2014 the HP landscape is still varied (not saturated). label_spreading remains the only trainer in 1846 iters to break W7 transductively; rocket_bagged_calibrated dropped to 0/7 here so it's not a stronger base. Score_norm_mode HP is added to rocket but it needs more structural work (e.g., a temperature on rank) before it deserves a train-mode sweep.",
+  "claude_iter_id": 1846,
+  "designated_at": "2026-05-27T12:24:56"
 }
