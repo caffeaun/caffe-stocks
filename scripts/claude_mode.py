@@ -202,21 +202,41 @@ def detect_brief_deviation(report: dict) -> Optional[str]:
     registry_key = m2.group(1)
 
     picked = report.get('trainer', '')
+
+    # Phase 3C archive check: any pick of an archived trainer is a
+    # deviation regardless of brief alignment.
+    try:
+        from models.trainers_archive import is_archived, archive_notice
+        if is_archived(picked):
+            return f'archived trainer pick: {archive_notice(picked)}'
+    except Exception:
+        pass
+
     if picked == registry_key:
         return None  # following the order
 
-    # Trainer differs — check if exhaustion claim is legitimate
+    # Trainer differs — check if exhaustion claim is legitimate.
+    # Phase 3A bumped thresholds to (≥5 attempts, best wp <5) + AMP
+    # (best wp ≥4 forces ablation, no pivot allowed regardless of attempts).
     claims_exhausted = bool(report.get('exhausted_brief'))
     fb.init_db()
     with fb.get_conn() as conn:
         rows = conn.execute(
             "SELECT windows_passed FROM iterations "
-            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 5",
+            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 10",
             (registry_key,),
         ).fetchall()
     attempts = len(rows)
     best_wp = max((r['windows_passed'] for r in rows), default=0)
-    db_exhausted = attempts >= 2 and best_wp < 3
+    amp_locked = best_wp >= 4
+    db_exhausted = attempts >= 5 and best_wp < 5
+
+    if amp_locked:
+        return (
+            f'trainer={picked!r} != brief.registry_key={registry_key!r}; '
+            f'AMP locked (best_wp={best_wp} ≥4 — ablation required, pivot '
+            f'forbidden)'
+        )
 
     if claims_exhausted and db_exhausted:
         return None  # legitimate pivot — brief is dead
@@ -224,7 +244,7 @@ def detect_brief_deviation(report: dict) -> Optional[str]:
     return (
         f'trainer={picked!r} != brief.registry_key={registry_key!r}; '
         f'exhausted_brief={claims_exhausted}, DB attempts={attempts}, '
-        f'best_wp={best_wp} (needs ≥2 attempts AND best wp<3)'
+        f'best_wp={best_wp} (needs ≥5 attempts AND best wp<5)'
     )
 
 

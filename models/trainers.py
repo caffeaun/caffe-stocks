@@ -15816,11 +15816,24 @@ class LabelSpreadingTrainer(BaseTrainer):
         return inst
 
 
+# Archived trainers (Phase 3C, 2026-05-27) — see models/trainers_archive.py
+# Classes still defined in this file (reversible archive), but excluded from
+# the active TRAINERS dict so the brief generator + HP sampler can't pick
+# them. Restore by moving the entry back into TRAINERS and re-adding its
+# HP space in models/search_spaces.py.
+_TRAINERS_ARCHIVED_CLASSES = {
+    'xgboost': XGBoostTrainer,
+    'xgb_regime_blend': XGBoostRegimeBlendTrainer,
+    'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
+    'label_spreading': LabelSpreadingTrainer,
+    'torch_itransformer': TorchITransformerTrainer,
+}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
     'lightgbm_ranker': LightGBMRankerTrainer,
-    'xgboost': XGBoostTrainer,
     'xgb_regressor': XGBoostRegressorTrainer,
     'bagged_xgb_regressor': BaggedXGBRegressorTrainer,
     'xgb_huber_regressor': XGBoostHuberRegressorTrainer,
@@ -15845,7 +15858,6 @@ TRAINERS = {
     'xgb_meta_label_regime': XGBoostMetaLabelingRegimeTrainer,
     'xgb_mcdropout_classifier': XGBoostMCDropoutClassifierTrainer,
     'xgb_rank_fusion': XGBoostRankFusionTrainer,
-    'xgb_regime_blend': XGBoostRegimeBlendTrainer,
     'xgb_recency_consensus': XGBoostRecencyConsensusTrainer,
     'xgb_day_quality_consensus': XGBoostDayQualityConsensusTrainer,
     'torch_attentive_mlp': TorchAttentiveMLPTrainer,
@@ -15858,7 +15870,6 @@ TRAINERS = {
     'logistic_elastic_net': LogisticElasticNetTrainer,
     'knn_classifier': KNNClassifierTrainer,
     'qda_classifier': QDAClassifierTrainer,
-    'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
     'xgb_iso_calibrated': XGBoostIsotonicCalibratedTrainer,
     'kernel_logreg': KernelLogRegTrainer,
     'gaussian_process_classifier': GaussianProcessClassifierTrainer,
@@ -15869,7 +15880,6 @@ TRAINERS = {
     'tabm_lcb': TabMLCBClassifierTrainer,
     'histgb_monotonic': HistGBMonotonicTrainer,
     'histgb_monotonic_bagged': HistGBMonotonicBaggedTrainer,
-    'torch_itransformer': TorchITransformerTrainer,
     'torch_tabnet': TorchTabNetTrainer,
     'torch_mamba': TorchMambaTrainer,
     'torch_patchtst': TorchPatchTSTTrainer,
@@ -15886,11 +15896,13 @@ TRAINERS = {
     'torch_timesfm': TorchTimesFMTrainer,
     'modernnca': ModernNCATrainer,
     'torch_sundial': TorchSundialTrainer,
-    'label_spreading': LabelSpreadingTrainer,
 }
 
 
 def get_trainer(name: str, **kwargs) -> BaseTrainer:
+    if name in _TRAINERS_ARCHIVED_CLASSES:
+        from models.trainers_archive import archive_notice
+        raise ValueError(archive_notice(name))
     if name not in TRAINERS:
         raise ValueError(
             f'Unknown trainer {name!r}. Choices: {list(TRAINERS)}')

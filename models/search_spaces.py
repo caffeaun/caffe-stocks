@@ -1555,8 +1555,24 @@ SEARCH_SPACES: dict[str, dict] = {
 }
 
 
+def _archived_trainers() -> set[str]:
+    """Names archived by Phase 3C (2026-05-27). Returned as a set so we can
+    filter the search-space surface without deleting their entries from
+    SEARCH_SPACES (the data stays in source for easy restoration).
+    Imported lazily to avoid a circular dep with models.trainers_archive."""
+    try:
+        from models.trainers_archive import TRAINERS_ARCHIVED
+        return set(TRAINERS_ARCHIVED.keys())
+    except Exception:
+        return set()
+
+
 def sample(trainer: str, rng: np.random.RandomState | None = None) -> dict:
     """Draw one configuration for a given trainer."""
+    if trainer in _archived_trainers():
+        raise ValueError(
+            f'Trainer {trainer!r} is archived (Phase 3C). '
+            f'See models/trainers_archive.py for resurrection criteria.')
     if trainer not in SEARCH_SPACES:
         raise ValueError(f'No search space defined for {trainer!r}. '
                          f'Add one in models/search_spaces.py.')
@@ -1579,4 +1595,6 @@ def sample(trainer: str, rng: np.random.RandomState | None = None) -> dict:
 
 
 def list_trainers() -> list[str]:
-    return sorted(SEARCH_SPACES.keys())
+    """Active trainer list — excludes Phase 3C archived names."""
+    archived = _archived_trainers()
+    return sorted(k for k in SEARCH_SPACES.keys() if k not in archived)
