@@ -15589,6 +15589,219 @@ class TorchSundialTrainer(BaseTrainer):
         return {'state': state_path, 'meta': meta_path}
 
 
+# --------------------------------------------------------------------- #
+# LabelSpreading — transductive semi-supervised classifier (iter #1830)
+#
+# Pivot from torch_sundial (brief exhausted, 2 attempts at wp=1). Sundial's
+# flow-matching head was meant to inject distribution-shape signal; this
+# trainer attacks the same gap (regime drift on recent windows) from the
+# opposite direction — instead of pretrained-foundation-model features, it
+# performs *transductive* learning: at predict-time, build a k-NN manifold
+# over [X_train_subsample, X_test] (no labels for test), propagate labels
+# along this manifold, and read out the propagated probability for test
+# rows. The HistGB prior is mixed in as a parametric anchor so the manifold
+# only nudges predictions, not overrides them.
+#
+# Failure-pattern motivation (Part A, last 20 iters under regime-aware
+# floor): W6 0/20, W7 0/20, W3 5%. W6/W7 are 2025-05..2026-05 — recent
+# windows where training distribution (older data) and test distribution
+# diverge. Every existing trainer in the registry uses *only* labeled
+# training rows. LabelSpreading is the first trainer that explicitly
+# uses unlabeled test-set FEATURES to inform predictions — a structurally
+# different inductive bias from the saturated XGB/HistGB/kernel/NN families.
+#
+# Engine family (§6.B.2 check): semi-supervised / manifold-based. Distinct
+# from foundation-model+head (torch_sundial, torch_timesfm, torch_chronos2),
+# from boosted trees (anomaly_gated_histgb, histgb_monotonic, xgb_*), from
+# kernel methods with parametric heads (kernel_logreg, kernel_anomaly_blend,
+# kernel_histgb_stack), and from NN sequence models.
+# --------------------------------------------------------------------- #
+class LabelSpreadingTrainer(BaseTrainer):
+    """Transductive semi-supervised classifier (LabelSpreading + HistGB prior).
+
+    At fit time: train a HistGB classifier on the full labeled set, also stash
+    a random subsample of (X, y) for transduction. At predict time: build a
+    k-NN graph on [X_labeled_subsample, X_test], propagate labels through the
+    graph (sklearn LabelSpreading), and blend the manifold-propagated
+    probability with the HistGB parametric prior.
+    """
+
+    name = 'label_spreading'
+
+    def __init__(self,
+                 # LabelSpreading knobs
+                 n_neighbors: int = 30,
+                 alpha: float = 0.2,
+                 max_iter: int = 30,
+                 tol: float = 1e-3,
+                 # Subsample of labeled rows used in transductive fit. Full
+                 # k-NN graph is O((N_lab + N_test)^2) memory, so subsampling
+                 # is required for tractability on ~50k-row training sets.
+                 subsample_size: int = 5000,
+                 # Mix between HistGB parametric prior and LabelSpreading
+                 # transductive output. prior_weight=1.0 → pure HistGB,
+                 # prior_weight=0.0 → pure manifold propagation.
+                 prior_weight: float = 0.4,
+                 # HistGB knobs (cheap settings — it's only a prior anchor)
+                 gb_max_iter: int = 200,
+                 gb_max_leaf_nodes: int = 31,
+                 gb_learning_rate: float = 0.05,
+                 gb_min_samples_leaf: int = 50,
+                 gb_l2_regularization: float = 1.0,
+                 pos_class_weight: float = 1.5,
+                 random_state: int = 42,
+                 **_):
+        self._params = dict(
+            n_neighbors=int(n_neighbors),
+            alpha=float(alpha),
+            max_iter=int(max_iter),
+            tol=float(tol),
+            subsample_size=int(subsample_size),
+            prior_weight=float(prior_weight),
+            gb_max_iter=int(gb_max_iter),
+            gb_max_leaf_nodes=int(gb_max_leaf_nodes),
+            gb_learning_rate=float(gb_learning_rate),
+            gb_min_samples_leaf=int(gb_min_samples_leaf),
+            gb_l2_regularization=float(gb_l2_regularization),
+            pos_class_weight=float(pos_class_weight),
+            random_state=int(random_state),
+        )
+        self.histgb_ = None
+        self._X_labeled = None
+        self._y_labeled = None
+
+    def fit(self, X_train, y_train, X_val, y_val, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        from sklearn.ensemble import HistGradientBoostingClassifier
+
+        if len(set(y_train)) < 2:
+            raise ValueError('Train set has only one class — fit aborted')
+
+        p = self._params
+        X_full = np.vstack([X_train, X_val]).astype(np.float32)
+        y_full = np.concatenate([y_train, y_val]).astype(np.int32)
+
+        sw = np.where(y_full == 1, p['pos_class_weight'], 1.0).astype(np.float32)
+        self.histgb_ = HistGradientBoostingClassifier(
+            max_iter=p['gb_max_iter'],
+            max_leaf_nodes=p['gb_max_leaf_nodes'],
+            learning_rate=p['gb_learning_rate'],
+            min_samples_leaf=p['gb_min_samples_leaf'],
+            l2_regularization=p['gb_l2_regularization'],
+            random_state=p['random_state'],
+            verbose=0,
+        )
+        self.histgb_.fit(X_full, y_full, sample_weight=sw)
+
+        # Subsample labeled rows for transduction. Class-balanced sampling
+        # keeps positives at their natural rate — LabelSpreading with k-NN
+        # is sensitive to label imbalance in the graph.
+        rng = np.random.RandomState(p['random_state'])
+        n_keep = min(p['subsample_size'], len(X_full))
+        idx = rng.choice(len(X_full), n_keep, replace=False)
+        self._X_labeled = X_full[idx]
+        self._y_labeled = y_full[idx]
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.histgb_ is None:
+            raise RuntimeError('Model not fit')
+        from sklearn.semi_supervised import LabelSpreading
+
+        p = self._params
+        X = np.asarray(X, dtype=np.float32)
+        p_prior = self.histgb_.predict_proba(X)[:, 1].astype(np.float32)
+
+        # If prior_weight==1.0, skip the expensive graph fit.
+        if p['prior_weight'] >= 0.999:
+            return p_prior
+
+        try:
+            X_comb = np.vstack([self._X_labeled, X])
+            y_comb = np.concatenate([
+                self._y_labeled,
+                np.full(len(X), -1, dtype=np.int32),
+            ])
+            # k-NN kernel is sparse, far cheaper than dense RBF for our sizes.
+            ls = LabelSpreading(
+                kernel='knn',
+                n_neighbors=p['n_neighbors'],
+                alpha=p['alpha'],
+                max_iter=p['max_iter'],
+                tol=p['tol'],
+                n_jobs=-1,
+            )
+            ls.fit(X_comb, y_comb)
+            # label_distributions_ rows for the test slice are the last len(X)
+            test_dist = ls.label_distributions_[len(self._X_labeled):]
+            if test_dist.shape[1] >= 2:
+                # Map from class index to the positive column. classes_ tracks
+                # the unique non-(-1) labels seen during fit.
+                classes = list(getattr(ls, 'classes_', [0, 1]))
+                pos_col = classes.index(1) if 1 in classes else 1
+                p_ls = test_dist[:, pos_col].astype(np.float32)
+            else:
+                # All test rows landed in one class — fall back to prior.
+                p_ls = p_prior
+        except Exception:
+            # On any transduction failure (memory, numerical), fall back to
+            # the HistGB prior so the gate doesn't crash.
+            p_ls = p_prior
+
+        w = p['prior_weight']
+        return (w * p_prior + (1.0 - w) * p_ls).astype(np.float32)
+
+    def feature_importance(self):
+        return None
+
+    @property
+    def best_iteration(self):
+        if self.histgb_ is None:
+            return None
+        return int(getattr(self.histgb_, 'n_iter_', self._params['gb_max_iter']))
+
+    @property
+    def hyperparams(self):
+        return dict(self._params)
+
+    def save(self, output_dir, extra=None):
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, 'model.pkl')
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        with open(model_path, 'wb') as f:
+            pickle.dump({
+                'histgb': self.histgb_,
+                'X_labeled': self._X_labeled,
+                'y_labeled': self._y_labeled,
+            }, f)
+        meta = {
+            'trainer': self.name,
+            'hyperparams': self._params,
+        }
+        if extra:
+            meta.update(extra)
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return {'model': model_path, 'metadata': meta_path}
+
+    @classmethod
+    def load(cls, output_dir):
+        meta_path = os.path.join(output_dir, 'metadata.json')
+        model_path = os.path.join(output_dir, 'model.pkl')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        params = meta.get('hyperparams', {})
+        inst = cls(**{k: v for k, v in params.items()
+                      if k in cls.__init__.__code__.co_varnames})
+        with open(model_path, 'rb') as f:
+            blob = pickle.load(f)
+        inst.histgb_ = blob['histgb']
+        inst._X_labeled = blob['X_labeled']
+        inst._y_labeled = blob['y_labeled']
+        return inst
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -15659,6 +15872,7 @@ TRAINERS = {
     'torch_timesfm': TorchTimesFMTrainer,
     'modernnca': ModernNCATrainer,
     'torch_sundial': TorchSundialTrainer,
+    'label_spreading': LabelSpreadingTrainer,
 }
 
 

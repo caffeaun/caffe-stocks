@@ -1537,6 +1537,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'n_epochs':              [30, 40, 60],
     'seed':                  [1234, 42, 7],
 },
+'label_spreading': {
+    'n_neighbors':          [10, 20, 30, 50, 80],
+    'alpha':                (0.05, 0.4),
+    'max_iter':             [20, 30, 50],
+    'subsample_size':       [3000, 5000, 7500],
+    'prior_weight':         (0.2, 0.8),
+    'gb_max_iter':          [150, 250, 400],
+    'gb_max_leaf_nodes':    [15, 31, 63],
+    'gb_learning_rate':     (0.02, 0.10),
+    'gb_min_samples_leaf':  [30, 50, 80],
+    'gb_l2_regularization': (0.5, 3.0),
+    'pos_class_weight':     (1.0, 3.0),
+    'random_state':         [42, 7, 1337],
+},
 }
 
 

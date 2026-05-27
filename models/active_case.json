@@ -1,12 +1,12 @@
 {
-  "trainer": "anomaly_gated_histgb",
+  "trainer": "label_spreading",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from xgb_regime_blend (8 train iter, best 2/7 wp, recent runs flat/negative ann). anomaly_gated_histgb has best wp=5 of any family in last 200 iter (n=46 train) and is the only registered trainer with date-level density-based abstention (Isolation Forest day-mean) \u2014 the mechanism Part A failure_pattern points to (W4 hostile / W5 deep bear, both fail 55-90% across trainer families regardless of architecture). 16 HPs in the search space (gate_threshold, gating_alpha, day_abstain_q, anomaly_as_feature \u00d7 HistGB quadrant + IF knobs) are wide-open for train mode to sweep; prior best at iter #1675 (4/7) was BEFORE the 2026-05-26 regime-aware MIN_WR gate change, so a fresh sweep against the harder bar is warranted.",
-  "claude_iter_id": 1814,
-  "designated_at": "2026-05-27T06:12:35"
+  "rationale": "Pivot from anomaly_gated_histgb (8 train-mode HP iters #1822-1829, ceiling 2/7 wp, W6/W7 both 0/20 across last 20 runs). label_spreading is the first transductive trainer in the 68-trainer registry \u2014 at iter #1830 default HP it unlocked W7 (\u2713 42.9% WR, +42.7% ann, first W7 pass in 20+ iters), W6 within 6pp WR of the floor (+49.5% ann), and avg_ann +15.9% beats the recent anomaly_gated_histgb HP-sweep band. 12 HPs span graph density (n_neighbors), manifold/prior mix (prior_weight, alpha), and HistGB anchor knobs \u2014 wide open for train-mode to sweep.",
+  "claude_iter_id": 1830,
+  "designated_at": "2026-05-27T09:11:19"
 }
