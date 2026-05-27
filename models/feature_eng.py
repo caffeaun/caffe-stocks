@@ -3,6 +3,8 @@
 Single source of truth for deriving features from candles data.
 Used by: lstm_trainer.py, backtest_lstm.py, model_gate.py, lstm_trader.py
 """
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -355,10 +357,97 @@ CURATED_FEATURES = [
 ]
 
 
+# Global macro features (Phase 2, 2026-05-27). Populated by
+# scripts/fetch_macro.py into data/ml-feedback.db macro_daily. NOT added
+# to CURATED_FEATURES (intentionally) — that would force a re-promotion
+# of the production panel since `models/panel/rank{1,2,3}/scaler.pkl`
+# was fit on the 25-feature CURATED. Macro is opt-in per iter via
+# `prepare_data(df, features=CURATED_FEATURES + MACRO_FEATURES)`;
+# AMP-driven HP ablations can add macro one feature at a time without
+# breaking the panel.
+#
+# Per symbol we expose 3 derived features:
+#   {col}_z60         60-day z-score (regime-invariant)
+#   {col}_ret_5d      5-day return
+#   {col}_above_sma20 binary (close vs 20-day SMA)
+#
+# Symbols cover: VIX (risk-off), USD/THB (currency coupling), gold, oil,
+# US 10Y yield, Singapore STI (ASEAN regional regime).
+MACRO_SYMBOLS = ['vix', 'usd_thb', 'gold', 'oil', 'us_10y', 'sti']
+MACRO_FEATURES = [
+    f'{sym}_{suffix}'
+    for sym in MACRO_SYMBOLS
+    for suffix in ('z60', 'ret_5d', 'above_sma20')
+]
+
+
+def attach_macro_features(df, db_path: str | None = None):
+    """Join macro_daily (date-indexed) onto df by `timestamp`, computing
+    z60 / ret_5d / above_sma20 derivatives per symbol.
+
+    Uses `.shift(1)` on each macro series so date D's macro value is the
+    macro CLOSE on D-1 (NYC EOD, before next-morning BKK open) — no
+    look-ahead. Rows where macro_daily has no entry for D-1 get NaN.
+
+    Mutates df in place AND returns it for chaining. Caller must add
+    MACRO_FEATURES to its feature list explicitly — this helper does
+    not modify CURATED_FEATURES.
+    """
+    import sqlite3
+    import pandas as pd
+
+    if db_path is None:
+        db_path = os.path.expanduser('~/projects/caffe-stocks/data/ml-feedback.db')
+    try:
+        with sqlite3.connect(db_path) as conn:
+            macro = pd.read_sql_query(
+                'SELECT * FROM macro_daily ORDER BY date', conn,
+                parse_dates=['date'],
+            )
+    except Exception:
+        # Table missing or DB unreadable — skip macro entirely; caller's
+        # MIN_COVERAGE filter in get_available_features will drop the
+        # macro feature names so existing trainers see no change.
+        return df
+
+    if macro.empty:
+        return df
+
+    macro['date'] = macro['date'].dt.strftime('%Y-%m-%d')
+    macro = macro.set_index('date').sort_index()
+
+    for sym in MACRO_SYMBOLS:
+        if sym not in macro.columns:
+            continue
+        s = macro[sym].astype(float)
+        # Forward-fill NaNs first (US holidays don't align with Thai
+        # market days — Memorial Day, Thanksgiving, etc. leave gaps).
+        # Then shift by 1 to enforce no-look-ahead: date D's macro is
+        # the LAST AVAILABLE close strictly before D.
+        s = s.ffill().shift(1)
+        sma20 = s.rolling(20, min_periods=10).mean()
+        std60 = s.rolling(60, min_periods=20).std()
+        mean60 = s.rolling(60, min_periods=20).mean()
+        z60 = (s - mean60) / std60.replace(0.0, np.nan)
+        ret5 = s.pct_change(5)
+        above = (s > sma20).astype(float).where(s.notna() & sma20.notna())
+
+        # df.timestamp is the stock date; map via dict for speed
+        z60_map = z60.to_dict()
+        ret5_map = ret5.to_dict()
+        above_map = above.to_dict()
+        ts = df['timestamp'].astype(str)
+        df[f'{sym}_z60'] = ts.map(z60_map).astype(float)
+        df[f'{sym}_ret_5d'] = ts.map(ret5_map).astype(float)
+        df[f'{sym}_above_sma20'] = ts.map(above_map).astype(float)
+
+    return df
+
+
 def get_available_features(df):
     """Return curated features with sufficient coverage.
 
-    Uses CURATED_FEATURES (23 non-redundant features) instead of auto-detecting
+    Uses CURATED_FEATURES (25 non-redundant features) instead of auto-detecting
     all 65+ features. This reduces noise from correlated features (e.g., rsi +
     rsi_pctrank + rsi_xrank) while covering all signal types needed for
     walk-forward generalization.
