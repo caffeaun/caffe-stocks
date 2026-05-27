@@ -36,6 +36,22 @@ if [ $MARKET_EXIT -ne 0 ]; then
 fi
 [ -n "$MARKET_OUTPUT" ] && log "Market data: $MARKET_OUTPUT"
 
+# Backfill foreign_flows_monthly from daily foreign_flows. The monthly
+# XLS import is a manual SET-publication workflow with a ~1-month lag;
+# this aggregates daily into monthly so the feature_eng monthly-pctrank
+# feature stays fresh and prepare_data doesn't drop recent rows. Cheap
+# (<1s), idempotent.
+log "Backfilling foreign_flows_monthly from daily aggregate"
+set +e
+BACKFILL_OUTPUT=$("$PYTHON" "$HOME/projects/caffe-stocks/scripts/backfill_foreign_monthly.py" 2>&1)
+BACKFILL_EXIT=$?
+set -e
+if [ $BACKFILL_EXIT -ne 0 ]; then
+    log "WARNING: backfill_foreign_monthly.py failed (exit $BACKFILL_EXIT): $BACKFILL_OUTPUT"
+else
+    log "Backfill: $BACKFILL_OUTPUT"
+fi
+
 # Run compute_indicators.py, capture output and exit code
 set +e
 OUTPUT=$("$PYTHON" "$SCRIPT" 2>&1)
