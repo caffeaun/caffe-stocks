@@ -113,18 +113,47 @@ def _brief_directive() -> str:
             f'false` in the JSON output.\n\n'
         )
 
-    # Exhaustion check: count claude-mode iters using this registry_key
+    # Exhaustion check: count claude-mode iters using this registry_key.
+    # Bumped 2026-05-27 from (≥2 attempts, best wp <3) → (≥5 attempts,
+    # best wp <5) so the brief gets a real depth-search before Claude is
+    # allowed to pivot. Last-20-iter trace showed Claude pivoting in 2
+    # iters, leaving 14 different trainers across the most recent 20 —
+    # breadth-search by curiosity, not depth-search of a winning family.
     fb.init_db()
     with fb.get_conn() as conn:
         rows = conn.execute(
             "SELECT id, windows_passed FROM iterations "
-            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 5",
+            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 10",
             (registry_key,),
         ).fetchall()
     attempts = len(rows)
     best_wp = max((r['windows_passed'] for r in rows), default=0)
-    EXHAUSTED_MIN_ATTEMPTS = 2
-    EXHAUSTED_WP_THRESHOLD = 3
+    EXHAUSTED_MIN_ATTEMPTS = 5
+    EXHAUSTED_WP_THRESHOLD = 5
+    # AMP (Ablation Must Precede Pivot): if any prior attempt of this
+    # registry_key got close to passing, force HP ablation even if other
+    # exhaustion conditions look exhausted. A 4/7 result is the strongest
+    # signal of latent potential; lock the family until depth-searched.
+    AMP_BEST_WP = 4
+
+    if best_wp >= AMP_BEST_WP:
+        return (
+            '==================================================================\n'
+            'BRIEF DIRECTIVE — ABLATION MUST PRECEDE PIVOT (AMP)\n'
+            '==================================================================\n'
+            f'The brief recommends `{registry_key}` ({technique}). A prior '
+            f'attempt reached windows_passed={best_wp} ({attempts} attempts '
+            f'total) — strong enough to demand depth-search before any pivot. '
+            f'You MUST execute this trainer this iteration with an HP '
+            f'ablation (one or two parameters changed from the best prior '
+            f'config, NOT a new family). In your JSON output:\n'
+            f'  - Set `trainer: "{registry_key}"`\n'
+            f'  - Set `exhausted_brief: false`\n'
+            f'  - Hypothesis must name the SPECIFIC HP being ablated and '
+            f'cite the prior iter whose result you are extending.\n'
+            f'  - Pivoting to a different trainer or family will be rejected '
+            f'at parse time (git revert + deviation log).\n\n'
+        )
 
     if attempts >= EXHAUSTED_MIN_ATTEMPTS and best_wp < EXHAUSTED_WP_THRESHOLD:
         return (
