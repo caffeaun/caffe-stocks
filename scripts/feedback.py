@@ -155,7 +155,7 @@ def init_db():
                 'ALTER TABLE iterations ADD COLUMN '
                 'bayes_windows_passed INTEGER DEFAULT NULL'
             )
-        if 'bayes_windows_passed' not in {r[1] for r in conn.execute(
+        if 'bayes_passed' not in {r[1] for r in conn.execute(
                 "PRAGMA table_info(iteration_windows)"
         ).fetchall()}:
             conn.execute(
