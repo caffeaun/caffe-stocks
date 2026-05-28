@@ -15830,6 +15830,210 @@ _TRAINERS_ARCHIVED_CLASSES = {
 }
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+import os
+import json
+from typing import List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _SplineLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, init_scale: float = 0.1, **kw):
+        self.init_scale = init_scale
+        super().__init__(in_features, out_features, bias=False, **kw)
+
+    def reset_parameters(self):
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=self.init_scale)
+
+
+class _RadialBasisFunction(nn.Module):
+    def __init__(self, grid_min: float = -2.0, grid_max: float = 2.0, num_grids: int = 8,
+                 denominator: float = None):
+        super().__init__()
+        grid = torch.linspace(grid_min, grid_max, num_grids)
+        self.grid = nn.Parameter(grid, requires_grad=False)
+        self.denominator = denominator or (grid_max - grid_min) / max(num_grids - 1, 1)
+
+    def forward(self, x):
+        return torch.exp(-((x[..., None] - self.grid) / self.denominator) ** 2)
+
+
+class _FastKANLayer(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, grid_min: float = -2.0,
+                 grid_max: float = 2.0, num_grids: int = 8, use_base_update: bool = True,
+                 use_layernorm: bool = True, spline_weight_init_scale: float = 0.1):
+        super().__init__()
+        self.layernorm = nn.LayerNorm(input_dim) if use_layernorm else nn.Identity()
+        self.rbf = _RadialBasisFunction(grid_min, grid_max, num_grids)
+        self.spline_linear = _SplineLinear(input_dim * num_grids, output_dim, spline_weight_init_scale)
+        self.use_base_update = use_base_update
+        if use_base_update:
+            self.base_linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        spline_basis = self.rbf(self.layernorm(x))
+        out = self.spline_linear(spline_basis.view(*spline_basis.shape[:-2], -1))
+        if self.use_base_update:
+            out = out + self.base_linear(F.silu(x))
+        return out
+
+
+class _FastKAN(nn.Module):
+    def __init__(self, layers_hidden: List[int], grid_min: float = -2.0,
+                 grid_max: float = 2.0, num_grids: int = 8, use_base_update: bool = True,
+                 spline_weight_init_scale: float = 0.1, dropout: float = 0.0):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            _FastKANLayer(in_d, out_d, grid_min, grid_max, num_grids,
+                          use_base_update, True, spline_weight_init_scale)
+            for in_d, out_d in zip(layers_hidden[:-1], layers_hidden[1:])
+        ])
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = self.dropout(x)
+        return x
+
+
+class TorchFastKANTrainer(BaseTrainer):
+    """FastKAN (Gaussian-RBF Kolmogorov-Arnold Network) — flat tabular binary classifier."""
+    name = 'torch_fastkan'
+    consumes_sequences = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden_dims = list(kwargs.get('hidden_dims', [64, 32]))
+        self.num_grids = int(kwargs.get('num_grids', 8))
+        self.grid_min = float(kwargs.get('grid_min', -2.0))
+        self.grid_max = float(kwargs.get('grid_max', 2.0))
+        self.learning_rate = float(kwargs.get('learning_rate', 1e-3))
+        self.weight_decay = float(kwargs.get('weight_decay', 1e-4))
+        self.n_epochs = int(kwargs.get('n_epochs', 60))
+        self.batch_size = int(kwargs.get('batch_size', 512))
+        self.pos_weight = float(kwargs.get('pos_weight', 1.5))
+        self.patience = int(kwargs.get('patience', 8))
+        self.dropout = float(kwargs.get('dropout', 0.0))
+        self.spline_init = float(kwargs.get('spline_weight_init_scale', 0.1))
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.feature_mean = None
+        self.feature_std = None
+        self.input_dims = None
+
+    def _standardize(self, X, fit: bool = False):
+        X = np.asarray(X, dtype=np.float32)
+        if fit:
+            self.feature_mean = np.nanmean(X, axis=0, keepdims=True).astype(np.float32)
+            self.feature_std = (np.nanstd(X, axis=0, keepdims=True) + 1e-6).astype(np.float32)
+        X = (X - self.feature_mean) / self.feature_std
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        X_tr = self._standardize(X_tr, fit=True)
+        X_val = self._standardize(X_val, fit=False)
+        y_tr = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        y_val = np.asarray(y_val, dtype=np.float32).reshape(-1)
+
+        self.input_dims = X_tr.shape[1]
+        layers = [self.input_dims] + list(self.hidden_dims) + [1]
+        self.model = _FastKAN(
+            layers, grid_min=self.grid_min, grid_max=self.grid_max,
+            num_grids=self.num_grids, spline_weight_init_scale=self.spline_init,
+            dropout=self.dropout,
+        ).to(self.device)
+
+        opt = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate,
+                                weight_decay=self.weight_decay)
+        pos_w = torch.tensor(self.pos_weight, device=self.device, dtype=torch.float32)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+
+        X_tr_t = torch.from_numpy(X_tr).to(self.device)
+        y_tr_t = torch.from_numpy(y_tr).to(self.device)
+        X_val_t = torch.from_numpy(X_val).to(self.device)
+        y_val_t = torch.from_numpy(y_val).to(self.device)
+
+        N = X_tr.shape[0]
+        best_loss = float('inf')
+        best_state = None
+        wait = 0
+
+        for epoch in range(self.n_epochs):
+            self.model.train()
+            perm = torch.randperm(N, device=self.device)
+            for i in range(0, N, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                logits = self.model(X_tr_t[idx]).squeeze(-1)
+                loss = loss_fn(logits, y_tr_t[idx])
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+
+            self.model.eval()
+            with torch.no_grad():
+                val_logits = self.model(X_val_t).squeeze(-1)
+                val_loss = loss_fn(val_logits, y_val_t).item()
+            if val_loss < best_loss - 1e-5:
+                best_loss = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                wait = 0
+            else:
+                wait += 1
+                if wait >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    @torch.no_grad()
+    def predict_proba(self, X) -> np.ndarray:
+        X = self._standardize(X, fit=False)
+        self.model.eval()
+        X_t = torch.from_numpy(X).to(self.device)
+        bs = 4096
+        outs = []
+        for i in range(0, X_t.size(0), bs):
+            logits = self.model(X_t[i:i + bs]).squeeze(-1)
+            outs.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(outs, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(), os.path.join(model_dir, 'fastkan.pt'))
+        if self.feature_mean is not None:
+            np.savez(os.path.join(model_dir, 'scaler.npz'),
+                     mean=self.feature_mean, std=self.feature_std)
+        meta = {
+            'name': self.name,
+            'hidden_dims': self.hidden_dims,
+            'num_grids': self.num_grids,
+            'grid_min': self.grid_min,
+            'grid_max': self.grid_max,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'n_epochs': self.n_epochs,
+            'batch_size': self.batch_size,
+            'pos_weight': self.pos_weight,
+            'patience': self.patience,
+            'dropout': self.dropout,
+            'spline_weight_init_scale': self.spline_init,
+            'input_dims': self.input_dims,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -15896,6 +16100,7 @@ TRAINERS = {
     'torch_timesfm': TorchTimesFMTrainer,
     'modernnca': ModernNCATrainer,
     'torch_sundial': TorchSundialTrainer,
+    'torch_fastkan': TorchFastKANTrainer,
 }
 
 

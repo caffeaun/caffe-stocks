@@ -1552,6 +1552,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_class_weight':     (1.0, 3.0),
     'random_state':         [42, 7, 1337],
 },
+    'torch_fastkan': {
+    'hidden_dims':              [[64, 32], [128, 64], [128, 64, 32], [256, 128]],
+    'num_grids':                [4, 8, 12, 16],
+    'grid_min':                 (-3.0, -1.5),
+    'grid_max':                 (1.5, 3.0),
+    'learning_rate':            (3e-4, 3e-3),
+    'weight_decay':             (1e-5, 1e-3),
+    'n_epochs':                 [40, 60, 100],
+    'batch_size':               [256, 512, 1024],
+    'pos_weight':               (1.0, 2.5),
+    'patience':                 [5, 8, 12],
+    'dropout':                  (0.0, 0.3),
+    'spline_weight_init_scale': (0.05, 0.2),
+},
 }
 
 
