@@ -1,12 +1,12 @@
 {
-  "trainer": "label_spreading",
+  "trainer": "histgb_monotonic",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep label_spreading active. Iters #1838-#1845 spread wp 0-2 with avg_ann band -27% to +74% \u2014 the HP landscape is still varied (not saturated). label_spreading remains the only trainer in 1846 iters to break W7 transductively; rocket_bagged_calibrated dropped to 0/7 here so it's not a stronger base. Score_norm_mode HP is added to rocket but it needs more structural work (e.g., a temperature on rank) before it deserves a train-mode sweep.",
-  "claude_iter_id": 1846,
-  "designated_at": "2026-05-27T12:24:56"
+  "rationale": "Temporary redirect (2026-05-28): prior active_case pointed to 'label_spreading' which was archived in Phase 3C (best_wp=2 over 26 iters). Setting active_case to histgb_monotonic — the sole gate-passer — so train_mode at :30 has a valid trainer to sweep until the next claude_mode firing rewrites this file.",
+  "claude_iter_id": 1218,
+  "designated_at": "2026-05-28T15:00:00"
 }

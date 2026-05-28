@@ -35,7 +35,7 @@ from scripts.return_gate import (
 # default to this sentinel and resolve it after parsing — if it's still the
 # sentinel we're free to consult models/active_case.json.
 _TRAINER_SENTINEL = '__from_active_case__'
-_FALLBACK_TRAINER = 'xgboost'
+_FALLBACK_TRAINER = 'histgb_monotonic'  # was 'xgboost' (Phase 3C archived)
 
 
 LOCK_PATH = BASE / 'models' / '.ml-loop.lock'
