@@ -1,12 +1,12 @@
 {
-  "trainer": "histgb_monotonic",
+  "trainer": "torch_fastkan",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Temporary redirect (2026-05-28): prior active_case pointed to 'label_spreading' which was archived in Phase 3C (best_wp=2 over 26 iters). Setting active_case to histgb_monotonic — the sole gate-passer — so train_mode at :30 has a valid trainer to sweep until the next claude_mode firing rewrites this file.",
-  "claude_iter_id": 1218,
-  "designated_at": "2026-05-28T15:00:00"
+  "rationale": "FastKAN default-HP gate is 0/7 BUT alive: W6 ann +92.3% (WR 37% short of 50% floor), W7 ann +65.0% WR 57.9% (n=19 \u2014 one trade short), W1 hidden thr=0.4 WR 47.1% n=17. Sweep pos_weight (1.8-2.5) to lift WR, num_grids down to 4 to curb overfit on heavy-tailed features, spline_init down to 0.05-0.08 \u2014 three orthogonal levers any of which could break W6/W7 to pass and unlock the family.",
+  "claude_iter_id": 1952,
+  "designated_at": "2026-05-29T12:04:49"
 }
