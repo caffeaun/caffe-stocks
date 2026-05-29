@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Iter #1953's pos_weight=2.0 + num_grids=4 + spline_init=0.05 bundle regressed +12%\u2192-17% ann and collapsed thresholds (W1 \u22650.5 produced 0 trades). FastKAN's W6/W7 fat-tail signal is still alive at lighter HPs \u2014 train mode should sweep ONE lever at a time, pinning pos_weight \u2264 1.5, num_grids \u2208 {6,8,10,12}, spline_init \u2208 [0.08, 0.15]. Keep FastKAN active to exhaust the lighter-touch space before declaring the family dead.",
-  "claude_iter_id": 1953,
-  "designated_at": "2026-05-29T18:05:18"
+  "rationale": "iter #1954 dropout=0.10 single-lever nudge cracked W7 (first FastKAN W7 PASS, n=21/47.6% WR/+91% ann) and lifted avg ann +12%\u2192+25% over #1952 default, vindicating the spline-edge slot. Train mode should sweep dropout\u2208[0.05,0.25] \u00d7 learning_rate \u00d7 weight_decay around this pinned (pw=1.5, ng=8, spline_init=0.1) bundle to widen the W6/W2 thresholds without re-touching the levers that broke #1953.",
+  "claude_iter_id": 1954,
+  "designated_at": "2026-05-30T00:04:15"
 }
