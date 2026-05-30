@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_fastkan",
+  "trainer": "torch_itransformer",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "iter #1954 dropout=0.10 single-lever nudge cracked W7 (first FastKAN W7 PASS, n=21/47.6% WR/+91% ann) and lifted avg ann +12%\u2192+25% over #1952 default, vindicating the spline-edge slot. Train mode should sweep dropout\u2208[0.05,0.25] \u00d7 learning_rate \u00d7 weight_decay around this pinned (pw=1.5, ng=8, spline_init=0.1) bundle to widen the W6/W2 thresholds without re-touching the levers that broke #1953.",
-  "claude_iter_id": 1954,
-  "designated_at": "2026-05-30T00:04:15"
+  "rationale": "Brief 2026-05-30 mandated torch_itransformer; this iter ran default HPs but exhausted wall-time before stdout flush. Two prior claude attempts (#1061/#1072) and 20 train-mode sweeps all collapsed the threshold sweep to thr=0.0 \u2014 score dispersion is the bottleneck. Train mode should target dropout\u2208[0.25,0.40] \u00d7 pos_weight\u2208[1.2,1.8] (per brief's FreTS/TimesFM warning to keep pos_weight \u22641.8) to force WR-positive ranking before opening dim/depth, and confirm whether the variate-axis bias can break the W1/W4/W5 wall on a clean run.",
+  "claude_iter_id": 1971,
+  "designated_at": "2026-05-30T12:30:32"
 }
