@@ -11093,11 +11093,11 @@ class TorchITransformerTrainer(BaseTrainer):
     """
 
     name = 'torch_itransformer'
-    consumes_sequences = False
+    consumes_sequences = True
 
     def __init__(self, dim=128, depth=3, heads=4, dim_head=32, dropout=0.1,
                  learning_rate=1e-3, weight_decay=1e-4, batch_size=512,
-                 epochs=40, patience=8, pos_weight=None, device=None, **kwargs):
+                 epochs=12, patience=4, pos_weight=1.5, device=None, **kwargs):
         self.dim = int(dim)
         self.depth = int(depth)
         self.heads = int(heads)
@@ -15826,7 +15826,6 @@ _TRAINERS_ARCHIVED_CLASSES = {
     'xgb_regime_blend': XGBoostRegimeBlendTrainer,
     'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
     'label_spreading': LabelSpreadingTrainer,
-    'torch_itransformer': TorchITransformerTrainer,
 }
 
 
@@ -16101,6 +16100,7 @@ TRAINERS = {
     'modernnca': ModernNCATrainer,
     'torch_sundial': TorchSundialTrainer,
     'torch_fastkan': TorchFastKANTrainer,
+    'torch_itransformer': TorchITransformerTrainer,
 }
 
 

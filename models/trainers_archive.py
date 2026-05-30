@@ -42,7 +42,6 @@ TRAINERS_ARCHIVED = {
     'xgb_regime_blend': 'XGBoostRegimeBlendTrainer',
     'gaussian_nb': 'GaussianNaiveBayesClassifierTrainer',
     'label_spreading': 'LabelSpreadingTrainer',
-    'torch_itransformer': 'TorchITransformerTrainer',
 }
 
 
