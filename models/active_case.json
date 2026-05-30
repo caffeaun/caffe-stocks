@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_itransformer",
+  "trainer": "torch_fastkan",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Brief 2026-05-30 attempt #4 of 5 in claude-mode (#1061/#1072/#1971/#1972). dropout=0.25 nudge restored partial threshold-sweep dispersion (W1/W2 picked thr=0.3 \u2014 first non-0.0 picks since #850-era iter for this family) but WR floor still ~33% across windows. Train mode should sweep dropout\u2208[0.20,0.40] \u00d7 weight_decay\u2208[1e-5,1e-3] AROUND fixed pos_weight=1.5, batch_size=512, epochs=12 \u2014 DO NOT touch dim/depth/heads until WR proves liftable on lower-vol windows; W6 ann +50.8% / wr 28.3% is the canonical failure mode to fix.",
-  "claude_iter_id": 1972,
-  "designated_at": "2026-05-30T18:06:24"
+  "rationale": "Pivoting train mode away from torch_itransformer after 5 claude wp=0/7 attempts (#1061/#1072/#1971/#1972/#1973). torch_fastkan has live HP momentum \u2014 recent train sweeps #1961-#1967 produced wp=1-2 with W6 ann +48-63% and the iter #1954 single-lever dropout=0.10 nudge broke the W7 0/20 wall. Train mode should sweep dropout\u2208[0.08, 0.18] \u00d7 lr\u2208[5e-4, 2e-3] \u00d7 weight_decay\u2208[1e-6, 1e-3] AROUND pinned (pos_weight=1.5, num_grids=8, spline_init=0.1) bundle; DO NOT re-touch pinned levers (per feedback_fastkan_pos_weight_2_regresses). Goal: lift W6's fat-tail wr from 32% toward the 50% regime floor.",
+  "claude_iter_id": 1973,
+  "designated_at": "2026-05-31T00:09:10"
 }
