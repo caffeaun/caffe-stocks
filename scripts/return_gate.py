@@ -266,7 +266,7 @@ def _within(dates, start, end):
 
 
 def simulate_window(scores, dates, symbols, pnl, hold_days, threshold,
-                    max_open=MAX_OPEN_POSITIONS):
+                    max_open=MAX_OPEN_POSITIONS, max_trades=None):
     """Walk through test set chronologically as a top-K multi-position trader.
 
     Implements whitepaper §9 ("Take top-K predictions where p ≥ threshold")
@@ -296,6 +296,12 @@ def simulate_window(scores, dates, symbols, pnl, hold_days, threshold,
     open_positions = []
 
     for i in range(len(s_dates)):
+        # First-N chronological cap (vault-only; gate passes max_trades=None).
+        # The candidate stream is ordered (date asc, score desc), so the first
+        # `max_trades` appended are the chronologically-earliest trades, ties
+        # broken by conviction. Stop entering once the cap is hit.
+        if max_trades is not None and len(trades) >= max_trades:
+            break
         d = s_dates[i]
         # Free up any positions whose exit_date is strictly before today
         open_positions = [(ed, sm) for (ed, sm) in open_positions if ed >= d]
@@ -410,7 +416,8 @@ def _scale_3d_per_feature(X_train, X_test):
 
 def evaluate_window(X_tab, y, dates, symbols, pnl, hold_days, agg_features,
                      train_start, train_end, test_start, test_end,
-                     model_type, trainer_kwargs, verbose=False, X_seq=None):
+                     model_type, trainer_kwargs, verbose=False, X_seq=None,
+                     max_trades=None, min_trades=MIN_TRADES_PER_WINDOW):
     """Train fresh model on [train_start, train_end], evaluate on [test_start, test_end].
     Tries each threshold in SCORE_THRESHOLDS and returns the best result.
 
@@ -478,14 +485,16 @@ def evaluate_window(X_tab, y, dates, symbols, pnl, hold_days, agg_features,
     test_pnl = pnl[test_mask]
     test_hold = hold_days[test_mask]
 
-    # Try each threshold, pick best annualized return that meets the floor
+    # Try each threshold, pick best annualized return that meets the floor.
+    # max_trades caps trades per window (vault-only; None for the gate).
     sims = []
     for thr in SCORE_THRESHOLDS:
-        sim = simulate_window(test_scores, test_dates, test_symbols, test_pnl, test_hold, thr)
+        sim = simulate_window(test_scores, test_dates, test_symbols, test_pnl,
+                              test_hold, thr, max_trades=max_trades)
         sims.append(sim)
 
     # Pick the one with best annualized return (regardless of pass/fail — we want to see)
-    best_sim = max(sims, key=lambda s: (s['n_trades'] >= MIN_TRADES_PER_WINDOW, s['annualized_return']))
+    best_sim = max(sims, key=lambda s: (s['n_trades'] >= min_trades, s['annualized_return']))
 
     # Per-window pass criteria (v1: no ann_return floor here). MIN_WR is
     # per-window when REGIME_AWARE_GATE is enabled — see _min_wr_for_window.
@@ -496,8 +505,8 @@ def evaluate_window(X_tab, y, dates, symbols, pnl, hold_days, agg_features,
     fails = []
     if dd > MAX_DD:
         fails.append(f'max_dd {dd:.1%} > {MAX_DD:.0%}')
-    if n < MIN_TRADES_PER_WINDOW:
-        fails.append(f'n_trades {n} < {MIN_TRADES_PER_WINDOW}')
+    if n < min_trades:
+        fails.append(f'n_trades {n} < {min_trades}')
     if wr < min_wr:
         fails.append(f'wr {wr:.1%} < {min_wr:.0%} [{min_wr_src}]')
 

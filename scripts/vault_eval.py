@@ -33,6 +33,11 @@ from scripts.return_gate import (
 
 DB_PATH = os.path.expanduser('~/projects/caffe-stocks/data/ml-feedback.db')
 
+# Trade cap for the vault (operator decision 2026-05-30): "20 is a max, not a
+# min." The held-out window is shorter than a gate window so it can't reach
+# 20 trades; we judge the first 20 chronologically instead of demanding ≥20.
+VAULT_MAX_TRADES = 20
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vault_results (
   iteration_id INTEGER PRIMARY KEY,
@@ -73,10 +78,17 @@ def _evaluate_one(iter_id, trainer, hyperparams, data):
     tr_s, tr_e, te_s, te_e = VAULT_SPLIT
     print(f'[iter {iter_id}] {trainer}  train={tr_s}..{tr_e}  test={te_s}..{te_e}')
     t0 = time.time()
+    # Vault uses 20 as a CAP, not a floor (operator decision 2026-05-30):
+    # the held-out window is shorter than a gate window and physically can't
+    # produce 20 trades, so requiring ≥20 rejected every model. Instead take
+    # the first 20 trades chronologically and judge WR/DD/ann on those.
+    # min_trades=1 is an evaluability check ("did it trade at all"), not a
+    # statistical floor. The gate keeps MIN_TRADES_PER_WINDOW=20 unchanged.
     r = evaluate_window(
         X_tab, y, dates, symbols, pnl, hold_days, agg_features,
         tr_s, tr_e, te_s, te_e,
         trainer, hyperparams, verbose=False, X_seq=X,
+        max_trades=VAULT_MAX_TRADES, min_trades=1,
     )
     elapsed = time.time() - t0
     if 'best' in r:
