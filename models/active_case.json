@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_fastkan",
+  "trainer": "torch_ttm",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivoting train mode away from torch_itransformer after 5 claude wp=0/7 attempts (#1061/#1072/#1971/#1972/#1973). torch_fastkan has live HP momentum \u2014 recent train sweeps #1961-#1967 produced wp=1-2 with W6 ann +48-63% and the iter #1954 single-lever dropout=0.10 nudge broke the W7 0/20 wall. Train mode should sweep dropout\u2208[0.08, 0.18] \u00d7 lr\u2208[5e-4, 2e-3] \u00d7 weight_decay\u2208[1e-6, 1e-3] AROUND pinned (pos_weight=1.5, num_grids=8, spline_init=0.1) bundle; DO NOT re-touch pinned levers (per feedback_fastkan_pos_weight_2_regresses). Goal: lift W6's fat-tail wr from 32% toward the 50% regime floor.",
-  "claude_iter_id": 1973,
-  "designated_at": "2026-05-31T00:09:10"
+  "rationale": "Pivoting from torch_fastkan after train mode hit a wall (iters #1996-#2003: 1\u00d7wp=1, 7\u00d7wp=0 \u2014 no new windows unlocked). torch_ttm is fresh: default-HP first shot shows W7 alone strong (WR 52.9% / ann +19.1% / DD 7.0%, just below n=20 floor) and threshold-sweep ALIVE on W1 (0.0\u20130.7 tested, all wr<30%) meaning the head's score distribution has dispersion but the embedding doesn't separate bear-regime winners. Train mode should sweep ttm_prediction_length \u2208 {24, 48, 96} (24 forces filter-discard; native 48 likely preserves more), dropout \u2208 [0.05, 0.35], lr \u2208 [3e-4, 3e-3], head_hidden \u2208 {64, 128, 256}. pos_weight pinned \u2264 1.5 (per feedback_timesfm_pos_weight_2_regresses); DO NOT sweep above.",
+  "claude_iter_id": 2004,
+  "designated_at": "2026-05-31T06:25:29"
 }
