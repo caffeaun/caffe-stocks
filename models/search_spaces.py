@@ -1597,7 +1597,16 @@ def sample(trainer: str, rng: np.random.RandomState | None = None) -> dict:
     cfg = {}
     for key, val in space.items():
         if isinstance(val, list):
-            cfg[key] = type(val[0])(rng.choice(val))
+            # Index-select instead of rng.choice(val): when the options are
+            # themselves sequences (e.g. hidden_dims=[[64,32],[128,64,32]]),
+            # rng.choice tries to build an ndarray and dies with
+            # "inhomogeneous shape" on ragged sublists. Indexing the Python
+            # list sidesteps numpy entirely and returns the native object.
+            choice = val[int(rng.randint(len(val)))]
+            if isinstance(choice, (list, tuple)):
+                cfg[key] = list(choice)
+            else:
+                cfg[key] = type(val[0])(choice)
         elif isinstance(val, tuple) and len(val) == 2:
             lo, hi = val
             if isinstance(lo, int) and isinstance(hi, int):
