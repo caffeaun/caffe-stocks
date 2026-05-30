@@ -16134,9 +16134,11 @@ class TorchTTMTrainer(BaseTrainer):
         return 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def _load_backbone(self, num_channels):
+        device = self._resolve_device()
+        self._device = device
         key = (self.model_id, self.ttm_context_length,
                self.ttm_prediction_length, self.force_return,
-               self.use_pretrained, num_channels)
+               self.use_pretrained, num_channels, device)
         if key in _TTM_CACHE:
             return _TTM_CACHE[key]
         from tsfm_public.toolkit.get_model import get_model
@@ -16152,10 +16154,8 @@ class TorchTTMTrainer(BaseTrainer):
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-        device = self._resolve_device()
         model.to(device)
         _TTM_CACHE[key] = model
-        self._device = device
         return model
 
     def _select_channels(self, X_3d):
@@ -16202,7 +16202,8 @@ class TorchTTMTrainer(BaseTrainer):
         with torch.no_grad():
             for i in range(0, N, bs):
                 xb = torch.from_numpy(X_sel[i:i + bs]).to(self._device)
-                out = model(past_values=xb, return_dict=True)
+                freq = torch.zeros(xb.shape[0], dtype=torch.long, device=self._device)
+                out = model(past_values=xb, freq_token=freq, return_dict=True)
                 # prediction_outputs: (B, prediction_length, num_channels)
                 preds = out.prediction_outputs.detach()
                 # Pool over the forecast horizon → (B, num_channels).
