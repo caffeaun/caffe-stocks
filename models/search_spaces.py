@@ -1567,6 +1567,22 @@ SEARCH_SPACES: dict[str, dict] = {
     'dropout':                  (0.0, 0.3),
     'spline_weight_init_scale': (0.05, 0.2),
 },
+    'torch_ttm': {
+    'ttm_context_length':  [512, 1024],
+    'ttm_prediction_length': [24, 48, 96],
+    'force_return':        ['zeropad', 'rolling'],
+    'head_hidden':         [64, 128, 256],
+    'dropout':             (0.0, 0.4),
+    'learning_rate':       (1e-4, 5e-3),
+    'weight_decay':        (1e-5, 1e-3),
+    'pos_weight':          (1.0, 1.8),
+    'epochs':              [15, 25, 40],
+    'batch_size':          [256, 512, 1024],
+    'patience':            [3, 5, 7],
+    'grad_clip':           (0.5, 2.0),
+    'use_pretrained':      [True, False],
+    'include_last_row':    [True, False],
+},
 }
 
 
