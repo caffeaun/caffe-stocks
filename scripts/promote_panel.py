@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Promote the top-3 candidates to the paper-trade panel.
+"""Promote the top-K candidates to the paper-trade panel.
 
-The whitepaper-defined panel is "the 3 currently-paper-trading models"
-(docs/ml-loop.md §promotion). Strict eligibility is `gate_passed = 1` —
-but until that bar is met, we use the top-3 by `avg_win_rate` among
-iterations whose trainer is still in the current registry as a working
-proxy. This keeps the daily signal scan productive while the loop
-iterates toward genuinely gate-passing candidates.
+The panel is the set of currently-paper-trading models — K=10 since
+2026-05-30 (was 3; see feedback.PANEL_MAX_RANKS). Strict eligibility is
+`gate_passed = 1` — but until that bar is met, we use the top-K by
+`avg_win_rate` among iterations whose trainer is still in the current
+registry as a working proxy. This keeps the daily signal scan productive
+while the loop iterates toward genuinely gate-passing candidates.
 
 What this does:
-  1. Selects 3 distinct (trainer, hyperparams) iterations, ranked by
-     avg_win_rate desc, tiebroken by avg_max_dd asc.
+  1. Selects K distinct-engine-family (trainer, hyperparams) iterations,
+     ranked by avg_win_rate desc, tiebroken by avg_max_dd asc.
   2. For each, re-fits the trainer on the FULL dataset (no held-out
      split — production model). Saves to models/panel/rank{N}/.
   3. Updates production_panel rows so signal_generator.py finds them.
@@ -110,15 +110,16 @@ def _engine_family(trainer: str) -> str:
     return ENGINE_FAMILY.get(trainer, trainer)
 
 
-def select_top_candidates(k: int = 3, days: int = 30) -> list[dict]:
+def select_top_candidates(k: int = 10, days: int = 30) -> list[dict]:
     """Top-k by WR, **one per engine family**, current-registry only,
     gate_passed not required.
 
-    Diversity matters more than marginal WR: 3 distinct engine families
-    produce uncorrelated drawdowns. 3 from the same family (e.g. three
+    Diversity matters more than marginal WR: k distinct engine families
+    produce uncorrelated drawdowns. k from the same family (e.g. several
     XGB rankers, even with different sub-keys) ride the same regime
     failure into the ground together. So dedupe on engine family from
-    ENGINE_FAMILY, not on the registry key.
+    ENGINE_FAMILY, not on the registry key. (35 families are currently
+    active, so k=10 fills cleanly without relaxing the one-per-family rule.)
     """
     fb.init_db()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
@@ -196,7 +197,7 @@ def fit_and_save(candidate: dict, X_tab: np.ndarray, y: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--k', type=int, default=3)
+    parser.add_argument('--k', type=int, default=10)
     parser.add_argument('--days', type=int, default=30)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()

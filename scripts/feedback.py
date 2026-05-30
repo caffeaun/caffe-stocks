@@ -21,6 +21,12 @@ from typing import Optional
 BASE_PATH = Path(os.path.expanduser('~/projects/caffe-stocks'))
 DB_PATH = BASE_PATH / 'data' / 'ml-feedback.db'
 
+# Paper-trade panel size — number of models trading in parallel (one
+# portfolio per rank). Raised 3 → 10 on 2026-05-30 per operator request.
+# Must stay in sync with the CHECK constraint in SCHEMA below and the
+# paper_portfolios CHECK in migrations/_2026_05_11_paper_trade_schema.py.
+PANEL_MAX_RANKS = 10
+
 _TELEGRAM_CONF_PATHS = (
     BASE_PATH.parent / 'ops' / 'telegram' / 'telegram.conf',
     Path.home() / 'kanoonth' / 'scripts' / 'telegram.conf',
@@ -108,7 +114,7 @@ CREATE TABLE IF NOT EXISTS iteration_windows (
 );
 
 CREATE TABLE IF NOT EXISTS production_panel (
-    rank INTEGER PRIMARY KEY CHECK(rank IN (1, 2, 3)),
+    rank INTEGER PRIMARY KEY CHECK(rank BETWEEN 1 AND 10),
     iteration_id INTEGER NOT NULL REFERENCES iterations(id),
     promoted_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
@@ -162,6 +168,32 @@ def init_db():
                 'ALTER TABLE iteration_windows ADD COLUMN '
                 'bayes_passed INTEGER DEFAULT NULL'
             )
+        # Widen production_panel rank CHECK 3 → 10 (2026-05-30). SQLite can't
+        # ALTER a CHECK, so rebuild the table preserving existing rows. Guarded
+        # on the old constraint text so it runs exactly once. production_panel
+        # is rewritten weekly by promote_panel, so even a row loss would self-
+        # heal — but we preserve rows to be safe.
+        pp_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='production_panel'"
+        ).fetchone()
+        if pp_sql and 'rank IN (1, 2, 3)' in pp_sql[0]:
+            conn.executescript("""
+                CREATE TABLE production_panel_new (
+                    rank INTEGER PRIMARY KEY CHECK(rank BETWEEN 1 AND 10),
+                    iteration_id INTEGER NOT NULL REFERENCES iterations(id),
+                    promoted_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    UNIQUE(iteration_id)
+                );
+                INSERT INTO production_panel_new
+                    SELECT rank, iteration_id, promoted_at, expires_at
+                    FROM production_panel;
+                DROP TABLE production_panel;
+                ALTER TABLE production_panel_new RENAME TO production_panel;
+            """)
+            print('[feedback.init_db] migrated production_panel CHECK '
+                  '3 → 10 ranks', file=sys.stderr)
 
 
 def _git_sha() -> Optional[str]:
@@ -386,13 +418,15 @@ def get_promotion_panel() -> list[dict]:
 
 
 def set_panel(iteration_ids: list[int]) -> list[dict]:
-    """Replace the production panel with up to 3 iteration ids (rank by order).
-    Pure DB writer — eligibility / dedupe policy belongs in the caller
-    (see promotion.py). Pass [] to clear the panel.
+    """Replace the production panel with up to PANEL_MAX_RANKS iteration ids
+    (rank by order). Pure DB writer — eligibility / dedupe policy belongs in
+    the caller (see promotion.py). Pass [] to clear the panel.
     """
     init_db()
-    if len(iteration_ids) > 3:
-        raise ValueError(f'panel holds at most 3 entries, got {len(iteration_ids)}')
+    if len(iteration_ids) > PANEL_MAX_RANKS:
+        raise ValueError(
+            f'panel holds at most {PANEL_MAX_RANKS} entries, '
+            f'got {len(iteration_ids)}')
     now = datetime.now().isoformat()
     expires = (datetime.now() + timedelta(days=30)).isoformat()
     with get_conn() as conn:
