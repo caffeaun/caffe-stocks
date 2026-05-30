@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Brief 2026-05-30 mandated torch_itransformer; this iter ran default HPs but exhausted wall-time before stdout flush. Two prior claude attempts (#1061/#1072) and 20 train-mode sweeps all collapsed the threshold sweep to thr=0.0 \u2014 score dispersion is the bottleneck. Train mode should target dropout\u2208[0.25,0.40] \u00d7 pos_weight\u2208[1.2,1.8] (per brief's FreTS/TimesFM warning to keep pos_weight \u22641.8) to force WR-positive ranking before opening dim/depth, and confirm whether the variate-axis bias can break the W1/W4/W5 wall on a clean run.",
-  "claude_iter_id": 1971,
-  "designated_at": "2026-05-30T12:30:32"
+  "rationale": "Brief 2026-05-30 attempt #4 of 5 in claude-mode (#1061/#1072/#1971/#1972). dropout=0.25 nudge restored partial threshold-sweep dispersion (W1/W2 picked thr=0.3 \u2014 first non-0.0 picks since #850-era iter for this family) but WR floor still ~33% across windows. Train mode should sweep dropout\u2208[0.20,0.40] \u00d7 weight_decay\u2208[1e-5,1e-3] AROUND fixed pos_weight=1.5, batch_size=512, epochs=12 \u2014 DO NOT touch dim/depth/heads until WR proves liftable on lower-vol windows; W6 ann +50.8% / wr 28.3% is the canonical failure mode to fix.",
+  "claude_iter_id": 1972,
+  "designated_at": "2026-05-30T18:06:24"
 }
