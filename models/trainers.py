@@ -16079,7 +16079,7 @@ class TorchTTMTrainer(BaseTrainer):
     def __init__(self,
                  model_id: str = 'ibm-granite/granite-timeseries-ttm-r2',
                  ttm_context_length: int = 512,
-                 ttm_prediction_length: int = 24,
+                 ttm_prediction_length: int = 96,
                  force_return: str = 'zeropad',
                  channel_indices=None,
                  head_hidden: int = 128,
