@@ -16158,11 +16158,22 @@ class TorchTTMTrainer(BaseTrainer):
         _TTM_CACHE[key] = model
         return model
 
+    # Curated continuous single-stock channels for TTM forecasting.
+    # iter #2004 first-16 default mixed cross-sectional rank channels
+    # (ret_1d_xrank etc., uniform [0,1]) with continuous magnitudes, which the
+    # MLP-Mixer forecasts can't separate by stock within a bear regime. These
+    # 7 indices map to CURATED_FEATURES: atr_pct, volume_ratio,
+    # intraday_range_3d, bb_position, stock_vs_sector_ret, close_vs_low_3d,
+    # ret_1d — all continuous, all single-stock-relevant.
+    _DEFAULT_CHANNELS = (0, 1, 3, 4, 10, 11, 24)
+
     def _select_channels(self, X_3d):
         N, L, F = X_3d.shape
         if self.channel_indices is None:
-            k = min(F, 16)
-            return X_3d[:, :, :k].astype(np.float32)
+            idx = [c for c in self._DEFAULT_CHANNELS if c < F]
+            if not idx:
+                idx = list(range(min(F, 7)))
+            return X_3d[:, :, idx].astype(np.float32)
         idx = [c if c >= 0 else (F + c) for c in self.channel_indices]
         idx = [max(0, min(int(c), F - 1)) for c in idx]
         return X_3d[:, :, idx].astype(np.float32)
@@ -16193,25 +16204,38 @@ class TorchTTMTrainer(BaseTrainer):
         X_sel = self._select_channels(X_3d)
         X_sel = np.nan_to_num(X_sel, nan=0.0, posinf=0.0, neginf=0.0)
         X_sel = self._apply_channel_scaler(X_sel)
-        X_sel = self._pad_context(X_sel)
-        N, L, C = X_sel.shape
+        X_padded = self._pad_context(X_sel)
+        N, L, C = X_padded.shape
         self._num_channels_used = C
         model = self._load_backbone(C)
+        # Capture the last observed scaled value per row/channel — needed for
+        # forecast-delta features. Use the un-padded tail so padding zeros
+        # don't masquerade as observations.
+        last_obs = X_sel[:, -1, :]
         out_chunks = []
         bs = self.inference_batch
         with torch.no_grad():
             for i in range(0, N, bs):
-                xb = torch.from_numpy(X_sel[i:i + bs]).to(self._device)
+                xb = torch.from_numpy(X_padded[i:i + bs]).to(self._device)
                 freq = torch.zeros(xb.shape[0], dtype=torch.long, device=self._device)
                 out = model(past_values=xb, freq_token=freq, return_dict=True)
-                # prediction_outputs: (B, prediction_length, num_channels)
+                # prediction_outputs: (B, prediction_length, num_channels).
+                # iter #2004 used only (mean, last) — two stats per channel
+                # produced near-identical embeddings across stocks in bear
+                # regimes (W2/W3/W5/W6 all collapsed to thr=0.0 flood). Stack
+                # forecast-delta (predicted change vs history), slope
+                # (trajectory direction), and std (forecast volatility) for
+                # five discriminative stats per channel.
                 preds = out.prediction_outputs.detach()
-                # Pool over the forecast horizon → (B, num_channels).
                 pooled = preds.mean(dim=1)
-                # Also retain forecast last-step → (B, num_channels) for shape signal.
+                first = preds[:, 0, :]
                 last = preds[:, -1, :]
-                feat = torch.cat([pooled, last], dim=1).cpu().numpy()
-                out_chunks.append(feat)
+                std = preds.std(dim=1)
+                last_obs_t = torch.from_numpy(last_obs[i:i + bs]).to(self._device)
+                delta = pooled - last_obs_t
+                slope = (last - first) / max(self.ttm_prediction_length - 1, 1)
+                feat = torch.cat([pooled, last, delta, slope, std], dim=1)
+                out_chunks.append(feat.cpu().numpy())
         return np.concatenate(out_chunks, axis=0)
 
     def _stack_features(self, X_3d, emb):

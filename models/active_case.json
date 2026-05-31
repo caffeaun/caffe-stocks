@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivoting from torch_fastkan after train mode hit a wall (iters #1996-#2003: 1\u00d7wp=1, 7\u00d7wp=0 \u2014 no new windows unlocked). torch_ttm is fresh: default-HP first shot shows W7 alone strong (WR 52.9% / ann +19.1% / DD 7.0%, just below n=20 floor) and threshold-sweep ALIVE on W1 (0.0\u20130.7 tested, all wr<30%) meaning the head's score distribution has dispersion but the embedding doesn't separate bear-regime winners. Train mode should sweep ttm_prediction_length \u2208 {24, 48, 96} (24 forces filter-discard; native 48 likely preserves more), dropout \u2208 [0.05, 0.35], lr \u2208 [3e-4, 3e-3], head_hidden \u2208 {64, 128, 256}. pos_weight pinned \u2264 1.5 (per feedback_timesfm_pos_weight_2_regresses); DO NOT sweep above.",
-  "claude_iter_id": 2004,
-  "designated_at": "2026-05-31T06:25:29"
+  "rationale": "Keep torch_ttm \u2014 rich-encoder structural change (5 stats \u00d7 7 curated channels) delivered first W2 pass (54.2% WR, +6.3% ann) and unlocked W1 score-dispersion (thr 0.0-0.7 alive at +80.3% ann, fails only on DD 21.6% vs 20% cap). avg_ann improved -24% \u2192 -7%. Train mode should now sweep ttm_prediction_length \u2208 {48, 96} (native 48 likely sharper than 24 which forces filter-discard), dropout \u2208 [0.05, 0.35], lr \u2208 [3e-4, 3e-3], head_hidden \u2208 {64, 128, 256} against the new rich-encoder baseline. Pos_weight stays pinned \u2264 1.5 per [[timesfm-pos-weight-2-regresses]]; channel_indices stays at the curated 7-channel default.",
+  "claude_iter_id": 2005,
+  "designated_at": "2026-05-31T12:11:05"
 }
