@@ -16394,6 +16394,358 @@ class TorchTTMTrainer(BaseTrainer):
         return {'model_pt': str(out / 'model.pt')}
 
 
+_TOTO2_CACHE = {}
+
+
+class _Toto2Head(nn.Module):
+    def __init__(self, in_dim, hidden, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+class TorchToto2Trainer(BaseTrainer):
+    """Frozen Datadog Toto 2.0 backbone -> MLP classifier head.
+
+    Decoder-only causal-attention TS foundation model with proportional
+    factorized attention (alternating time-axis x variate-axis blocks).
+    Freeze the backbone, run a short-horizon multivariate forecast over
+    L=20 sequence-loader windows (left-zero-padded to context_length=512
+    with target_mask=True only on the real-data tail), then feed
+    per-variate quantile statistics + forecast-shape stats to a small MLP
+    classification head. Counterpart to torch_ttm: TTM is pure
+    MLP-Mixer (zero attention); Toto2 is attention-only (no mixer).
+    """
+
+    name = 'torch_toto2'
+    consumes_sequences = True
+
+    _DEFAULT_CHANNELS = (0, 1, 3, 4, 10, 11, 24)
+
+    def __init__(self,
+                 model_id: str = 'Datadog/Toto-2.0-22m',
+                 context_length: int = 512,
+                 horizon: int = 64,
+                 decode_block_size: int = 256,
+                 channel_indices=None,
+                 head_hidden: int = 128,
+                 dropout: float = 0.15,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 pos_weight: float = 1.5,
+                 epochs: int = 25,
+                 batch_size: int = 256,
+                 inference_batch: int = 64,
+                 patience: int = 5,
+                 grad_clip: float = 1.0,
+                 use_pretrained: bool = True,
+                 include_last_row: bool = True,
+                 has_missing_values: bool = False,
+                 device: str = None,
+                 random_state: int = 42,
+                 **_):
+        self.model_id = str(model_id)
+        self.context_length = int(context_length)
+        self.horizon = int(horizon)
+        self.decode_block_size = int(decode_block_size) if decode_block_size else None
+        if channel_indices is None or len(channel_indices) == 0:
+            self.channel_indices = None
+        else:
+            self.channel_indices = [int(c) for c in channel_indices]
+        self.head_hidden = int(head_hidden)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.pos_weight = float(pos_weight)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.inference_batch = int(inference_batch)
+        self.patience = int(patience)
+        self.grad_clip = float(grad_clip)
+        self.use_pretrained = bool(use_pretrained)
+        self.include_last_row = bool(include_last_row)
+        self.has_missing_values = bool(has_missing_values)
+        self.requested_device = device
+        self.random_state = int(random_state)
+        self._head = None
+        self._scaler_mean = None
+        self._scaler_std = None
+        self._chan_mean = None
+        self._chan_std = None
+        self._in_dim = None
+        self._device = None
+        self._num_channels_used = None
+
+    def _resolve_device(self):
+        if self.requested_device:
+            return self.requested_device
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _load_backbone(self):
+        key = (self.model_id, self.use_pretrained)
+        if key in _TOTO2_CACHE:
+            backbone = _TOTO2_CACHE[key]
+            self._device = next(backbone.parameters()).device
+            return backbone
+        from toto2 import Toto2Model
+        if self.use_pretrained:
+            model = Toto2Model.from_pretrained(self.model_id)
+        else:
+            ref = Toto2Model.from_pretrained(self.model_id)
+            model = Toto2Model(ref.config)
+            del ref
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        device = self._resolve_device()
+        model.to(device)
+        _TOTO2_CACHE[key] = model
+        self._device = torch.device(device) if isinstance(device, str) else device
+        return model
+
+    def _select_channels(self, X_3d):
+        N, L, F = X_3d.shape
+        if self.channel_indices is None:
+            idx = [c for c in self._DEFAULT_CHANNELS if c < F]
+            if not idx:
+                idx = list(range(min(F, 7)))
+            return X_3d[:, :, idx].astype(np.float32)
+        idx = [c if c >= 0 else (F + c) for c in self.channel_indices]
+        idx = [max(0, min(int(c), F - 1)) for c in idx]
+        return X_3d[:, :, idx].astype(np.float32)
+
+    def _fit_channel_scaler(self, X_sel):
+        flat = X_sel.reshape(-1, X_sel.shape[2])
+        self._chan_mean = flat.mean(axis=0).astype(np.float32)
+        self._chan_std = (flat.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_channel_scaler(self, X_sel):
+        return ((X_sel - self._chan_mean) / self._chan_std).astype(np.float32)
+
+    def _pad_context(self, X_sel):
+        N, L, C = X_sel.shape
+        target = self.context_length
+        if L == target:
+            return X_sel, L
+        if L > target:
+            return X_sel[:, -target:, :], target
+        pad = np.zeros((N, target - L, C), dtype=np.float32)
+        return np.concatenate([pad, X_sel], axis=1), L
+
+    def _encode(self, X_3d):
+        X_sel = self._select_channels(X_3d)
+        X_sel = np.nan_to_num(X_sel, nan=0.0, posinf=0.0, neginf=0.0)
+        X_sel = self._apply_channel_scaler(X_sel)
+        X_padded, real_len = self._pad_context(X_sel)
+        N, L, C = X_padded.shape
+        self._num_channels_used = C
+        model = self._load_backbone()
+        device = self._device
+
+        # Toto wants channels-first (B, n_variates, time). (N, L, C) -> (N, C, L).
+        X_chf = np.transpose(X_padded, (0, 2, 1)).astype(np.float32)
+
+        out_chunks = []
+        bs = self.inference_batch
+        with torch.no_grad():
+            for i in range(0, N, bs):
+                xb = torch.from_numpy(X_chf[i:i + bs]).to(device)
+                B = xb.shape[0]
+                mask = torch.zeros((B, C, L), dtype=torch.bool, device=device)
+                if real_len > 0:
+                    mask[:, :, -real_len:] = True
+                series_ids = torch.zeros((B, C), dtype=torch.long, device=device)
+                quantiles = model.forecast(
+                    {'target': xb, 'target_mask': mask, 'series_ids': series_ids},
+                    horizon=self.horizon,
+                    decode_block_size=self.decode_block_size,
+                    has_missing_values=self.has_missing_values,
+                )
+                # quantiles shape: (Q=9, B, C, H). Permute to (B, C, H, Q).
+                q = quantiles.permute(1, 2, 3, 0)
+                feat_mean = q.mean(dim=-1)                         # (B, C, H)
+                feat_std = q.std(dim=-1) + 1e-6                    # (B, C, H)
+                last_obs = xb[:, :, -1:].expand(-1, -1, self.horizon)
+                delta = feat_mean - last_obs
+                slope = feat_mean[:, :, -1] - feat_mean[:, :, 0]   # (B, C)
+                first_step = feat_mean[:, :, 0]                    # (B, C)
+                last_step = feat_mean[:, :, -1]                    # (B, C)
+                feat = torch.cat([
+                    feat_mean.flatten(1),
+                    feat_std.flatten(1),
+                    delta.flatten(1),
+                    slope,
+                    first_step,
+                    last_step,
+                ], dim=1).cpu().numpy()
+                out_chunks.append(feat)
+        return np.concatenate(out_chunks, axis=0)
+
+    def _stack_features(self, X_3d, emb):
+        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+        parts = [emb]
+        if self.include_last_row:
+            last = X_3d[:, -1, :].astype(np.float32)
+            last = np.nan_to_num(last, nan=0.0, posinf=0.0, neginf=0.0)
+            parts.append(last)
+        return np.concatenate(parts, axis=1)
+
+    def _fit_scaler(self, F):
+        self._scaler_mean = F.mean(axis=0).astype(np.float32)
+        self._scaler_std = (F.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_scaler(self, F):
+        return ((F - self._scaler_mean) / self._scaler_std).astype(np.float32)
+
+    def fit(self, X_train, y_train, X_val=None, y_val=None, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        X_tr_3d = np.asarray(X_train, dtype=np.float32)
+        if X_tr_3d.ndim != 3:
+            raise ValueError(
+                f'torch_toto2 expects 3D sequence input (N, L, F); '
+                f'got shape {X_tr_3d.shape}.')
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        X_sel_tr = self._select_channels(X_tr_3d)
+        X_sel_tr = np.nan_to_num(X_sel_tr, nan=0.0, posinf=0.0, neginf=0.0)
+        self._fit_channel_scaler(X_sel_tr)
+
+        emb_tr = self._encode(X_tr_3d)
+        F_tr = self._stack_features(X_tr_3d, emb_tr)
+        self._fit_scaler(F_tr)
+        F_tr = self._apply_scaler(F_tr)
+        self._in_dim = int(F_tr.shape[1])
+
+        has_val = (X_val is not None) and (y_val is not None) and len(y_val) > 0
+        if has_val:
+            X_val_3d = np.asarray(X_val, dtype=np.float32)
+            emb_val = self._encode(X_val_3d)
+            F_val = self._apply_scaler(self._stack_features(X_val_3d, emb_val))
+        else:
+            F_val = None
+
+        y_tr = np.asarray(y_train, dtype=np.float32).ravel()
+
+        device = self._device or self._resolve_device()
+        self._head = _Toto2Head(self._in_dim, self.head_hidden, self.dropout).to(device)
+
+        pos_w = torch.tensor([self.pos_weight], device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        opt = optim.AdamW(self._head.parameters(),
+                          lr=self.learning_rate,
+                          weight_decay=self.weight_decay)
+
+        ds_tr = TensorDataset(torch.from_numpy(F_tr), torch.from_numpy(y_tr))
+        dl_tr = DataLoader(ds_tr, batch_size=self.batch_size,
+                           shuffle=True, drop_last=False)
+
+        if has_val:
+            y_val_arr = np.asarray(y_val, dtype=np.float32).ravel()
+            ds_va = TensorDataset(torch.from_numpy(F_val), torch.from_numpy(y_val_arr))
+            dl_va = DataLoader(ds_va, batch_size=self.batch_size, shuffle=False)
+
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        for _ in range(self.epochs):
+            self._head.train()
+            for xb, yb in dl_tr:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad()
+                logits = self._head(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._head.parameters(), self.grad_clip)
+                opt.step()
+
+            if has_val:
+                self._head.eval()
+                losses = []
+                with torch.no_grad():
+                    for xb, yb in dl_va:
+                        xb = xb.to(device, non_blocking=True)
+                        yb = yb.to(device, non_blocking=True)
+                        logits = self._head(xb)
+                        losses.append(loss_fn(logits, yb).item())
+                val_loss = float(np.mean(losses)) if losses else float('inf')
+                if val_loss < best_val - 1e-5:
+                    best_val = val_loss
+                    bad = 0
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self._head.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+
+        if best_state is not None:
+            self._head.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X):
+        X_3d = np.asarray(X, dtype=np.float32)
+        if X_3d.ndim != 3:
+            raise ValueError(
+                f'torch_toto2.predict_proba expects 3D input (N, L, F); '
+                f'got shape {X_3d.shape}.')
+        emb = self._encode(X_3d)
+        F = self._apply_scaler(self._stack_features(X_3d, emb))
+        device = self._device or self._resolve_device()
+        self._head.eval()
+        chunks = []
+        bs = self.batch_size
+        with torch.no_grad():
+            for i in range(0, len(F), bs):
+                xb = torch.from_numpy(F[i:i + bs]).to(device)
+                logits = self._head(xb)
+                chunks.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(chunks)
+
+    def save(self, output_dir, extra=None):
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'head_state_dict': self._head.state_dict() if self._head is not None else None,
+            'scaler_mean': self._scaler_mean,
+            'scaler_std': self._scaler_std,
+            'chan_mean': self._chan_mean,
+            'chan_std': self._chan_std,
+            'in_dim': self._in_dim,
+            'num_channels_used': self._num_channels_used,
+            'hparams': {
+                'model_id': self.model_id,
+                'context_length': self.context_length,
+                'horizon': self.horizon,
+                'decode_block_size': self.decode_block_size,
+                'channel_indices': self.channel_indices,
+                'head_hidden': self.head_hidden,
+                'dropout': self.dropout,
+                'pos_weight': self.pos_weight,
+                'use_pretrained': self.use_pretrained,
+                'include_last_row': self.include_last_row,
+                'has_missing_values': self.has_missing_values,
+            },
+        }, out / 'model.pt')
+        if extra:
+            (out / 'extra.json').write_text(json.dumps(extra, default=str, indent=2))
+        return {'model_pt': str(out / 'model.pt')}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -16463,6 +16815,7 @@ TRAINERS = {
     'torch_fastkan': TorchFastKANTrainer,
     'torch_itransformer': TorchITransformerTrainer,
     'torch_ttm': TorchTTMTrainer,
+    'torch_toto2': TorchToto2Trainer,
 }
 
 

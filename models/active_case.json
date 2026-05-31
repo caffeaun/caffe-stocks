@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_ttm",
+  "trainer": "torch_toto2",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pred_len=96 (native TTM-R2 horizon) lifted avg_ann -7.0% -> +5.4% and turned W3/W4/W5 around (W5: -61% -> +34% ann). Lost W2 pass but the score-collapse pattern (thr=0.0 universal) is the real wall. Train mode should sweep around new pred_len=96 baseline: dropout (0.05-0.20), head_hidden (128, 256), pos_weight (1.2-1.5), epochs (25, 40) to recover W2 and crack the calibration wall.",
-  "claude_iter_id": 2006,
-  "designated_at": "2026-05-31T18:07:12"
+  "rationale": "Pivot to torch_toto2: default HP first-shot already breaks the W4 0/20 wall AND keeps the W2 threshold sweep alive at thr=0.55 (rare for TS-foundation wrappers). avg_ann +9.5% beats every torch_ttm iter and both baselines. Train mode should sweep horizon \u2208 {32, 64, 96}, channel_indices (default 7-curated vs [7,8] per-stock dispersion vs [7,8,9,10,11,12,13,14] 8-channel bundle), head_hidden, dropout (0.05\u20130.30), lr (3e-4\u20133e-3) while holding pos_weight \u2264 1.5 per timesfm-pos-weight-2-regresses.",
+  "claude_iter_id": 2008,
+  "designated_at": "2026-06-01T06:17:52"
 }
