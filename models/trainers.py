@@ -16746,6 +16746,373 @@ class TorchToto2Trainer(BaseTrainer):
         return {'model_pt': str(out / 'model.pt')}
 
 
+# --------------------------------------------------------------------- #
+# Mantis-8M (Vision-Transformer contrastive TSFM, classification-native)
+# --------------------------------------------------------------------- #
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+_MANTIS_CACHE: dict = {}
+
+
+class _MantisHead(nn.Module):
+    def __init__(self, in_dim, hidden, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+class TorchMantisTrainer(BaseTrainer):
+    """Frozen Mantis-8M ViT contrastive TSFM backbone -> MLP classifier head.
+
+    Mantis (arXiv 2502.15637) is a Vision-Transformer foundation model
+    pre-trained with a contrastive instance-discrimination objective on
+    ~7M time series *specifically* for classification. Unlike every
+    forecast-pretrained TSFM in the registry (Chronos2 / TimesFM /
+    Sundial / TimeMoE / TTM-R2 / Toto-2.0), Mantis's backbone is
+    discriminatively aligned out-of-the-box. We freeze the backbone,
+    select a subset of curated continuous channels from the
+    (N, L=20, F=96) sequence window, interpolate the L=20 axis up to
+    Mantis's pretraining length (default 512), encode each channel as a
+    univariate sequence via MantisTrainer.transform(), concatenate the
+    per-channel 256-D embeddings, optionally append the last raw row,
+    and train a small MLP head with BCEWithLogitsLoss + pos_weight.
+    """
+
+    name = 'torch_mantis'
+    consumes_sequences = True
+
+    def __init__(self,
+                 model_id: str = 'paris-noah/Mantis-8M',
+                 model_class: str = 'MantisV1',
+                 target_length: int = 512,
+                 channel_indices=None,
+                 multivariate_mode: str = 'per_channel',
+                 head_hidden: int = 128,
+                 dropout: float = 0.15,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 pos_weight: float = 1.5,
+                 epochs: int = 25,
+                 batch_size: int = 256,
+                 inference_batch: int = 128,
+                 patience: int = 5,
+                 grad_clip: float = 1.0,
+                 use_pretrained: bool = True,
+                 include_last_row: bool = True,
+                 device: str = None,
+                 random_state: int = 42,
+                 **_):
+        self.model_id = str(model_id)
+        self.model_class = str(model_class)
+        self.target_length = int(target_length)
+        if channel_indices is None or len(channel_indices) == 0:
+            self.channel_indices = None
+        else:
+            self.channel_indices = [int(c) for c in channel_indices]
+        self.multivariate_mode = str(multivariate_mode)
+        self.head_hidden = int(head_hidden)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.pos_weight = float(pos_weight)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.inference_batch = int(inference_batch)
+        self.patience = int(patience)
+        self.grad_clip = float(grad_clip)
+        self.use_pretrained = bool(use_pretrained)
+        self.include_last_row = bool(include_last_row)
+        self.requested_device = device
+        self.random_state = int(random_state)
+        self._head = None
+        self._scaler_mean = None
+        self._scaler_std = None
+        self._chan_mean = None
+        self._chan_std = None
+        self._in_dim = None
+        self._device = None
+        self._num_channels_used = None
+        self._emb_dim_per_channel = None
+
+    def _resolve_device(self):
+        if self.requested_device:
+            return self.requested_device
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _import_model_class(self):
+        from mantis import architecture as _arch
+        for cand in (self.model_class, 'MantisV1', 'Mantis8M', 'MantisV2'):
+            if hasattr(_arch, cand):
+                return getattr(_arch, cand)
+        raise ImportError(
+            f'No usable Mantis model class found in mantis.architecture; '
+            f'tried {self.model_class}, MantisV1, Mantis8M, MantisV2.')
+
+    def _load_backbone(self):
+        key = (self.model_id, self.model_class, self.use_pretrained)
+        if key in _MANTIS_CACHE:
+            backbone = _MANTIS_CACHE[key]
+            try:
+                self._device = next(backbone.parameters()).device
+            except StopIteration:
+                self._device = torch.device(self._resolve_device())
+            return backbone
+        cls = self._import_model_class()
+        device = self._resolve_device()
+        net = cls(seq_len=self.target_length, device=device)
+        if self.use_pretrained:
+            net = net.from_pretrained(self.model_id)
+        try:
+            net.eval()
+        except AttributeError:
+            pass
+        for p in net.parameters():
+            p.requires_grad_(False)
+        _MANTIS_CACHE[key] = net
+        self._device = torch.device(device)
+        return net
+
+    def _select_channels(self, X_3d):
+        N, L, F_ = X_3d.shape
+        if self.channel_indices is None:
+            k = min(F_, 8)
+            return X_3d[:, :, :k].astype(np.float32)
+        idx = [c if c >= 0 else (F_ + c) for c in self.channel_indices]
+        idx = [max(0, min(int(c), F_ - 1)) for c in idx]
+        return X_3d[:, :, idx].astype(np.float32)
+
+    def _fit_channel_scaler(self, X_sel):
+        flat = X_sel.reshape(-1, X_sel.shape[2])
+        self._chan_mean = flat.mean(axis=0).astype(np.float32)
+        self._chan_std = (flat.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_channel_scaler(self, X_sel):
+        return ((X_sel - self._chan_mean) / self._chan_std).astype(np.float32)
+
+    def _interpolate_to_target(self, X_chf):
+        # X_chf: (N, C, L_in) -> (N, C, target_length) via linear interp.
+        N, C, L_in = X_chf.shape
+        if L_in == self.target_length:
+            return X_chf
+        t = torch.from_numpy(X_chf)
+        t_resized = F.interpolate(t, size=self.target_length,
+                                  mode='linear', align_corners=False)
+        return t_resized.numpy().astype(np.float32)
+
+    def _transform_via_mantis(self, net, X_chf):
+        # X_chf: (N, C, target_length). Returns (N, D) embedding.
+        device = self._device or self._resolve_device()
+        from mantis.trainer import MantisTrainer
+        trainer = MantisTrainer(device=str(device), network=net)
+        N, C, L = X_chf.shape
+        if self.multivariate_mode == 'joint':
+            try:
+                emb = trainer.transform(X_chf)
+                emb = np.asarray(emb, dtype=np.float32)
+                if emb.ndim == 3:
+                    emb = emb.reshape(N, -1)
+                self._emb_dim_per_channel = None
+                return emb
+            except Exception:
+                pass
+        # per_channel default
+        out_per_chan = []
+        bs = self.inference_batch
+        for c in range(C):
+            Xc = X_chf[:, c:c + 1, :]
+            chunks = []
+            for i in range(0, N, bs):
+                emb_b = trainer.transform(Xc[i:i + bs])
+                chunks.append(np.asarray(emb_b, dtype=np.float32).reshape(
+                    Xc[i:i + bs].shape[0], -1))
+            emb_c = np.concatenate(chunks, axis=0)
+            out_per_chan.append(emb_c)
+        if self._emb_dim_per_channel is None:
+            self._emb_dim_per_channel = int(out_per_chan[0].shape[1])
+        emb_full = np.concatenate(out_per_chan, axis=1)
+        return emb_full.astype(np.float32)
+
+    def _encode(self, X_3d):
+        X_sel = self._select_channels(X_3d)
+        X_sel = np.nan_to_num(X_sel, nan=0.0, posinf=0.0, neginf=0.0)
+        X_sel = self._apply_channel_scaler(X_sel)
+        X_chf = np.transpose(X_sel, (0, 2, 1)).astype(np.float32)
+        X_resized = self._interpolate_to_target(X_chf)
+        self._num_channels_used = int(X_resized.shape[1])
+        net = self._load_backbone()
+        emb = self._transform_via_mantis(net, X_resized)
+        return emb
+
+    def _stack_features(self, X_3d, emb):
+        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+        parts = [emb]
+        if self.include_last_row:
+            last = X_3d[:, -1, :].astype(np.float32)
+            last = np.nan_to_num(last, nan=0.0, posinf=0.0, neginf=0.0)
+            parts.append(last)
+        return np.concatenate(parts, axis=1)
+
+    def _fit_scaler(self, F_):
+        self._scaler_mean = F_.mean(axis=0).astype(np.float32)
+        self._scaler_std = (F_.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_scaler(self, F_):
+        return ((F_ - self._scaler_mean) / self._scaler_std).astype(np.float32)
+
+    def fit(self, X_train, y_train, X_val=None, y_val=None, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        X_tr_3d = np.asarray(X_train, dtype=np.float32)
+        if X_tr_3d.ndim != 3:
+            raise ValueError(
+                f'torch_mantis expects 3D sequence input (N, L, F); '
+                f'got shape {X_tr_3d.shape}.')
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        X_sel_tr = self._select_channels(X_tr_3d)
+        X_sel_tr = np.nan_to_num(X_sel_tr, nan=0.0, posinf=0.0, neginf=0.0)
+        self._fit_channel_scaler(X_sel_tr)
+
+        emb_tr = self._encode(X_tr_3d)
+        F_tr = self._stack_features(X_tr_3d, emb_tr)
+        self._fit_scaler(F_tr)
+        F_tr = self._apply_scaler(F_tr)
+        self._in_dim = int(F_tr.shape[1])
+
+        has_val = (X_val is not None) and (y_val is not None) and len(y_val) > 0
+        if has_val:
+            X_val_3d = np.asarray(X_val, dtype=np.float32)
+            emb_val = self._encode(X_val_3d)
+            F_val = self._apply_scaler(self._stack_features(X_val_3d, emb_val))
+        else:
+            F_val = None
+
+        y_tr = np.asarray(y_train, dtype=np.float32).ravel()
+
+        device = self._device or self._resolve_device()
+        self._head = _MantisHead(self._in_dim, self.head_hidden, self.dropout).to(device)
+
+        pos_w = torch.tensor([self.pos_weight], device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        opt = optim.AdamW(self._head.parameters(),
+                          lr=self.learning_rate,
+                          weight_decay=self.weight_decay)
+
+        ds_tr = TensorDataset(torch.from_numpy(F_tr), torch.from_numpy(y_tr))
+        dl_tr = DataLoader(ds_tr, batch_size=self.batch_size,
+                           shuffle=True, drop_last=False)
+
+        if has_val:
+            y_val_arr = np.asarray(y_val, dtype=np.float32).ravel()
+            ds_va = TensorDataset(torch.from_numpy(F_val), torch.from_numpy(y_val_arr))
+            dl_va = DataLoader(ds_va, batch_size=self.batch_size, shuffle=False)
+
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        for _ in range(self.epochs):
+            self._head.train()
+            for xb, yb in dl_tr:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad()
+                logits = self._head(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._head.parameters(), self.grad_clip)
+                opt.step()
+
+            if has_val:
+                self._head.eval()
+                losses = []
+                with torch.no_grad():
+                    for xb, yb in dl_va:
+                        xb = xb.to(device, non_blocking=True)
+                        yb = yb.to(device, non_blocking=True)
+                        logits = self._head(xb)
+                        losses.append(loss_fn(logits, yb).item())
+                val_loss = float(np.mean(losses)) if losses else float('inf')
+                if val_loss < best_val - 1e-5:
+                    best_val = val_loss
+                    bad = 0
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self._head.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+
+        if best_state is not None:
+            self._head.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        X_3d = np.asarray(X, dtype=np.float32)
+        if X_3d.ndim != 3:
+            raise ValueError(
+                f'torch_mantis.predict_proba expects 3D input (N, L, F); '
+                f'got shape {X_3d.shape}.')
+        emb = self._encode(X_3d)
+        F_ = self._apply_scaler(self._stack_features(X_3d, emb))
+        device = self._device or self._resolve_device()
+        self._head.eval()
+        chunks = []
+        bs = self.batch_size
+        with torch.no_grad():
+            for i in range(0, len(F_), bs):
+                xb = torch.from_numpy(F_[i:i + bs]).to(device)
+                logits = self._head(xb)
+                chunks.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(chunks)
+
+    def save(self, output_dir, extra=None):
+        from pathlib import Path
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'head_state_dict': self._head.state_dict() if self._head is not None else None,
+            'scaler_mean': self._scaler_mean,
+            'scaler_std': self._scaler_std,
+            'chan_mean': self._chan_mean,
+            'chan_std': self._chan_std,
+            'in_dim': self._in_dim,
+            'num_channels_used': self._num_channels_used,
+            'emb_dim_per_channel': self._emb_dim_per_channel,
+            'hparams': {
+                'model_id': self.model_id,
+                'model_class': self.model_class,
+                'target_length': self.target_length,
+                'channel_indices': self.channel_indices,
+                'multivariate_mode': self.multivariate_mode,
+                'head_hidden': self.head_hidden,
+                'dropout': self.dropout,
+                'pos_weight': self.pos_weight,
+                'use_pretrained': self.use_pretrained,
+                'include_last_row': self.include_last_row,
+            },
+        }, out / 'model.pt')
+        if extra:
+            (out / 'extra.json').write_text(json.dumps(extra, default=str, indent=2))
+        return {'model_pt': str(out / 'model.pt')}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -16816,6 +17183,7 @@ TRAINERS = {
     'torch_itransformer': TorchITransformerTrainer,
     'torch_ttm': TorchTTMTrainer,
     'torch_toto2': TorchToto2Trainer,
+    'torch_mantis': TorchMantisTrainer,
 }
 
 

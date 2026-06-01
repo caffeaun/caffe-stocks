@@ -1598,6 +1598,23 @@ SEARCH_SPACES: dict[str, dict] = {
     'include_last_row':    [True, False],
     'has_missing_values':  [False],
 },
+    'torch_mantis': {
+    'model_id':            ['paris-noah/Mantis-8M'],
+    'model_class':         ['MantisV1'],
+    'target_length':       [256, 512],
+    'multivariate_mode':   ['per_channel'],
+    'head_hidden':         [64, 128, 256],
+    'dropout':             (0.05, 0.35),
+    'learning_rate':       (3e-4, 3e-3),
+    'weight_decay':        (1e-5, 1e-3),
+    'pos_weight':          (1.0, 1.5),
+    'epochs':              [15, 25, 40],
+    'batch_size':          [128, 256, 512],
+    'inference_batch':     [64, 128, 256],
+    'patience':            [3, 5, 7],
+    'grad_clip':           (0.5, 2.0),
+    'include_last_row':    [True, False],
+},
 }
 
 
