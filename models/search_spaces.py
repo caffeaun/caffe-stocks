@@ -1608,7 +1608,8 @@ SEARCH_SPACES: dict[str, dict] = {
     # (indices 5/6/7) that collapse TS structure for foundation backbones
     # (see iter #1759 note in models/feature_eng.py). Iter #2012 adds
     # candidate subsets of pure continuous TS channels.
-    'channel_indices':     [None, [0, 1, 24], [0, 1, 3, 4, 24], [0, 1, 2, 3, 4]],
+    'channel_indices':     [None, [0, 1, 24], [0, 1, 3, 4, 24], [0, 1, 2, 3, 4],
+                            [0, 1, 5, 8, 24]],
     'head_hidden':         [64, 128, 256],
     'dropout':             (0.05, 0.35),
     'learning_rate':       (3e-4, 3e-3),
@@ -1620,6 +1621,19 @@ SEARCH_SPACES: dict[str, dict] = {
     'patience':            [3, 5, 7],
     'grad_clip':           (0.5, 2.0),
     'include_last_row':    [True, False],
+},
+    'tabdpt_v1': {
+    'n_ensembles':         [2, 4, 8],
+    'context_size':        [1024, 2048, 4096],
+    'temperature':         (0.5, 1.5),
+    'permute_classes':     [True, False],
+    'normalizer':          ['standard', 'robust', 'quantile-normal', 'power'],
+    'feature_reduction':   ['pca', 'subsample'],
+    'faiss_metric':        ['l2', 'ip'],
+    'clip_sigma':          (2.0, 6.0),
+    'missing_indicators':  [False, True],
+    'max_train_rows':      [15000, 30000, 50000],
+    'random_state':        [42, 7, 1337],
 },
 }
 

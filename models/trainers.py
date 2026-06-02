@@ -17113,6 +17113,204 @@ class TorchMantisTrainer(BaseTrainer):
         return {'model_pt': str(out / 'model.pt')}
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import pickle
+import numpy as np
+
+try:
+    import torch
+    _HAS_TORCH_TABDPT = True
+except Exception:
+    _HAS_TORCH_TABDPT = False
+
+try:
+    from tabdpt import TabDPTClassifier
+    _HAS_TABDPT = True
+except Exception:
+    _HAS_TABDPT = False
+
+
+class TabDPTv1Trainer(BaseTrainer):
+    """TabDPT v1.1 (Layer6 AI, NeurIPS 2025) — real-data ICL tabular FM.
+
+    First trainer in the registry whose inference path retrieves a
+    `context_size=2048` k-NN block from the training rows via FAISS
+    before each forward pass through the pretrained transformer. The
+    backbone is self-supervised on real OpenML/Kaggle tables (not the
+    synthetic priors used by tabpfn_v25 / tabicl_v2). No gradient
+    updates at fit-time: fit() stores sanitized rows and the backbone
+    performs Bayesian ICL inference per-row at predict_proba time.
+
+    Caps training rows at max_train_rows for wall-time, with
+    stratified subsampling to preserve the ~30% positive prior.
+    Ensembles via `permute_classes=True` over `n_ensembles` random
+    class permutations and feature permutations — same recipe as the
+    paper's reported numbers, just scaled down from 8 to 4 for our
+    7-window walk-forward budget.
+    """
+    name = 'tabdpt_v1'
+    consumes_sequences = False
+
+    def __init__(self,
+                 n_ensembles: int = 4,
+                 context_size: int = 2048,
+                 temperature: float = 0.8,
+                 permute_classes: bool = True,
+                 normalizer: str = 'standard',
+                 feature_reduction: str = 'pca',
+                 faiss_metric: str = 'l2',
+                 clip_sigma: float = 4.0,
+                 missing_indicators: bool = False,
+                 use_flash: bool = True,
+                 compile: bool = False,
+                 max_train_rows: int = 30000,
+                 inf_batch_size: int = 512,
+                 random_state: int = 42,
+                 **_):
+        if not _HAS_TABDPT:
+            raise ImportError(
+                "tabdpt not installed. `pip install tabdpt` "
+                "(Python >=3.10, torch>=2.6, faiss-cpu>=1.11)."
+            )
+        self.n_ensembles = int(n_ensembles)
+        self.context_size = int(context_size)
+        self.temperature = float(temperature)
+        self.permute_classes = bool(permute_classes)
+        self.normalizer = str(normalizer) if normalizer is not None else None
+        self.feature_reduction = str(feature_reduction)
+        self.faiss_metric = str(faiss_metric)
+        self.clip_sigma = float(clip_sigma)
+        self.missing_indicators = bool(missing_indicators)
+        self.use_flash = bool(use_flash)
+        self.compile = bool(compile)
+        self.max_train_rows = int(max_train_rows)
+        self.inf_batch_size = int(inf_batch_size)
+        self.random_state = int(random_state)
+        self._model = None
+        self._X_train = None
+        self._y_train = None
+        self._device = None
+
+    def _sanitize(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _stratified_subsample(self, X, y):
+        n = len(X)
+        if n <= self.max_train_rows:
+            return X, y
+        rng = np.random.default_rng(self.random_state)
+        pos_idx = np.where(y == 1)[0]
+        neg_idx = np.where(y == 0)[0]
+        frac = self.max_train_rows / float(n)
+        n_pos = max(1, int(round(len(pos_idx) * frac)))
+        n_neg = max(1, min(self.max_train_rows - n_pos, len(neg_idx)))
+        sel_pos = rng.choice(pos_idx, size=n_pos, replace=False)
+        sel_neg = rng.choice(neg_idx, size=n_neg, replace=False)
+        idx = np.concatenate([sel_pos, sel_neg])
+        rng.shuffle(idx)
+        return X[idx], y[idx]
+
+    def _pick_device(self):
+        if not _HAS_TORCH_TABDPT or not torch.cuda.is_available():
+            return 'cpu'
+        best_idx, best_free = 0, -1
+        for i in range(torch.cuda.device_count()):
+            try:
+                free, _ = torch.cuda.mem_get_info(i)
+            except Exception:
+                free = 0
+            if free > best_free:
+                best_free, best_idx = free, i
+        return f'cuda:{best_idx}'
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, verbose: bool = False,
+            pnl_train=None, pnl_val=None,
+            dates_train=None, dates_val=None):
+        X_tr = self._sanitize(X_tr)
+        y_tr = np.asarray(y_tr).astype(np.int64).ravel()
+        X_tr, y_tr = self._stratified_subsample(X_tr, y_tr)
+        self._device = self._pick_device()
+        self._model = TabDPTClassifier(
+            inf_batch_size=self.inf_batch_size,
+            normalizer=self.normalizer,
+            missing_indicators=self.missing_indicators,
+            clip_sigma=self.clip_sigma,
+            feature_reduction=self.feature_reduction,
+            faiss_metric=self.faiss_metric,
+            device=self._device,
+            use_flash=self.use_flash,
+            compile=self.compile,
+            verbose=False,
+        )
+        self._model.fit(X_tr, y_tr)
+        self._X_train = X_tr
+        self._y_train = y_tr
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("TabDPTv1Trainer: predict_proba called before fit()")
+        X = self._sanitize(X)
+        if self.n_ensembles <= 1:
+            proba = self._model.predict_proba(
+                X,
+                temperature=self.temperature,
+                context_size=self.context_size,
+                seed=self.random_state,
+            )
+        else:
+            proba = self._model.ensemble_predict_proba(
+                X,
+                n_ensembles=self.n_ensembles,
+                temperature=self.temperature,
+                context_size=self.context_size,
+                permute_classes=self.permute_classes,
+                seed=self.random_state,
+            )
+        proba = np.asarray(proba, dtype=np.float32)
+        if proba.ndim == 2 and proba.shape[1] >= 2:
+            return proba[:, 1].astype(np.float32)
+        return proba.ravel().astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        with open(os.path.join(model_dir, 'tabdpt_state.pkl'), 'wb') as f:
+            pickle.dump({
+                'X_train': self._X_train,
+                'y_train': self._y_train,
+                'hp': {
+                    'n_ensembles': self.n_ensembles,
+                    'context_size': self.context_size,
+                    'temperature': self.temperature,
+                    'permute_classes': self.permute_classes,
+                    'normalizer': self.normalizer,
+                    'feature_reduction': self.feature_reduction,
+                    'faiss_metric': self.faiss_metric,
+                    'clip_sigma': self.clip_sigma,
+                    'missing_indicators': self.missing_indicators,
+                    'use_flash': self.use_flash,
+                    'compile': self.compile,
+                    'max_train_rows': self.max_train_rows,
+                    'inf_batch_size': self.inf_batch_size,
+                    'random_state': self.random_state,
+                },
+                'device': self._device,
+            }, f)
+        meta = {'trainer': self.name, 'device': self._device}
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+        return {
+            'state': os.path.join(model_dir, 'tabdpt_state.pkl'),
+            'meta': os.path.join(model_dir, 'meta.json'),
+        }
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -17184,6 +17382,7 @@ TRAINERS = {
     'torch_ttm': TorchTTMTrainer,
     'torch_toto2': TorchToto2Trainer,
     'torch_mantis': TorchMantisTrainer,
+    'tabdpt_v1': TabDPTv1Trainer,
 }
 
 
