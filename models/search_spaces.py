@@ -1603,6 +1603,12 @@ SEARCH_SPACES: dict[str, dict] = {
     'model_class':         ['MantisV1'],
     'target_length':       [256, 512],
     'multivariate_mode':   ['per_channel'],
+    # Channel subsets for per_channel encoding. Default (None) stacks
+    # first-8 features, half of which are uniform [0,1] xrank channels
+    # (indices 5/6/7) that collapse TS structure for foundation backbones
+    # (see iter #1759 note in models/feature_eng.py). Iter #2012 adds
+    # candidate subsets of pure continuous TS channels.
+    'channel_indices':     [None, [0, 1, 24], [0, 1, 3, 4, 24], [0, 1, 2, 3, 4]],
     'head_hidden':         [64, 128, 256],
     'dropout':             (0.05, 0.35),
     'learning_rate':       (3e-4, 3e-3),
