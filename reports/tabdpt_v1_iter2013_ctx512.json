@@ -1,0 +1,648 @@
+{
+  "gate_passed": false,
+  "pass_fraction_required": 0.8571428571428571,
+  "windows_passed": 0,
+  "windows_total": 7,
+  "max_dd": 0.2,
+  "min_trades_per_window": 20,
+  "min_wr": 0.4,
+  "model_type": "tabdpt_v1",
+  "trainer_kwargs": {
+    "num_leaves": 31,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "n_estimators": 500,
+    "min_child_samples": 50,
+    "min_child_weight": 10.0,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_alpha": 0.1,
+    "reg_lambda": 0.1,
+    "pos_class_weight": 1.5,
+    "quantile_alpha": 0.7,
+    "recency_decay": 1.5,
+    "huber_slope": 1.0,
+    "early_stopping_rounds": 30,
+    "calibrate": "none",
+    "random_state": 42,
+    "n_ensembles": 2,
+    "context_size": 512,
+    "temperature": 0.8,
+    "normalizer": "standard",
+    "feature_reduction": "pca",
+    "faiss_metric": "l2",
+    "clip_sigma": 4.0,
+    "missing_indicators": false,
+    "max_train_rows": 15000,
+    "inf_batch_size": 256,
+    "use_flash": true,
+    "compile": false,
+    "permute_classes": true
+  },
+  "results": [
+    {
+      "passed": false,
+      "fails": [
+        "wr 31.8% < 50% [regime (SET wr=48.7%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 0.04532893622193936,
+      "bayes_dd_pass": true,
+      "bayes_dd_tail": 0.15973669650808497,
+      "train": "2023-05-01..2023-10-31",
+      "test": "2023-11-01..2024-02-28",
+      "n_train": 8210,
+      "n_test": 25690,
+      "best": {
+        "threshold": 0.6,
+        "n_trades": 22,
+        "win_rate": 0.3181818181818182,
+        "avg_pnl": -0.005224516318941658,
+        "avg_win": 0.05536580391760383,
+        "avg_loss": -0.03349999909599622,
+        "annualized_return": -0.17693821316113645,
+        "total_return": -0.06201268289997053,
+        "max_drawdown": 0.1956066005174857,
+        "final_equity": 0.9379873171000295,
+        "span_days": 120
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 33,
+          "win_rate": 0.2727272727272727,
+          "annualized_return": -0.44392347311558433,
+          "max_drawdown": 0.24038766803381592
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 32,
+          "win_rate": 0.28125,
+          "annualized_return": -0.4127912300751474,
+          "max_drawdown": 0.22666089853336063
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 33,
+          "win_rate": 0.30303030303030304,
+          "annualized_return": -0.35338512682112244,
+          "max_drawdown": 0.2126860759234581
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 29,
+          "win_rate": 0.20689655172413793,
+          "annualized_return": -0.6021707424163865,
+          "max_drawdown": 0.29719945542994974
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 29,
+          "win_rate": 0.2413793103448276,
+          "annualized_return": -0.43788311884810693,
+          "max_drawdown": 0.2512158538199071
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 22,
+          "win_rate": 0.3181818181818182,
+          "annualized_return": -0.17693821316113645,
+          "max_drawdown": 0.1956066005174857
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 23,
+          "win_rate": 0.30434782608695654,
+          "annualized_return": -0.2318520327638529,
+          "max_drawdown": 0.20988459581216518
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 15,
+          "win_rate": 0.3333333333333333,
+          "annualized_return": 0.04984364394661833,
+          "max_drawdown": 0.12267127186921166
+        }
+      ]
+    },
+    {
+      "passed": false,
+      "fails": [
+        "wr 22.2% < 44% [regime (SET wr=43.0%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 0.009286940987397784,
+      "bayes_dd_pass": true,
+      "bayes_dd_tail": 0.1987221116123271,
+      "train": "2023-07-01..2023-12-31",
+      "test": "2024-01-01..2024-04-30",
+      "n_train": 20749,
+      "n_test": 26179,
+      "best": {
+        "threshold": 0.7,
+        "n_trades": 27,
+        "win_rate": 0.2222222222222222,
+        "avg_pnl": 0.0002579818548703635,
+        "avg_win": 0.12134722472789387,
+        "avg_loss": -0.03433894468027921,
+        "annualized_return": -0.03666614126138512,
+        "total_return": -0.012104970222411637,
+        "max_drawdown": 0.14075168389887963,
+        "final_equity": 0.9878950297775884,
+        "span_days": 119
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 40,
+          "win_rate": 0.225,
+          "annualized_return": -0.29033759071174536,
+          "max_drawdown": 0.16732106954278067
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 42,
+          "win_rate": 0.21428571428571427,
+          "annualized_return": -0.3998959585484597,
+          "max_drawdown": 0.2491510077430065
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 40,
+          "win_rate": 0.225,
+          "annualized_return": -0.3262214512719698,
+          "max_drawdown": 0.22176899767724284
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 38,
+          "win_rate": 0.23684210526315788,
+          "annualized_return": -0.27985779852143844,
+          "max_drawdown": 0.17881233718874823
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 36,
+          "win_rate": 0.25,
+          "annualized_return": -0.19622995806826682,
+          "max_drawdown": 0.16397285487696106
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 33,
+          "win_rate": 0.21212121212121213,
+          "annualized_return": -0.3650965464570948,
+          "max_drawdown": 0.1957681914142264
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 31,
+          "win_rate": 0.22580645161290322,
+          "annualized_return": -0.3909729508186639,
+          "max_drawdown": 0.2144601956503447
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 27,
+          "win_rate": 0.2222222222222222,
+          "annualized_return": -0.03666614126138512,
+          "max_drawdown": 0.14075168389887963
+        }
+      ]
+    },
+    {
+      "passed": false,
+      "fails": [
+        "max_dd 21.8% > 20%",
+        "wr 21.7% < 55% [regime (SET wr=53.8%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 0.0006150934222361815,
+      "bayes_dd_pass": false,
+      "bayes_dd_tail": 0.2080541280718907,
+      "train": "2023-11-01..2024-04-30",
+      "test": "2024-05-01..2024-08-31",
+      "n_train": 38718,
+      "n_test": 26085,
+      "best": {
+        "threshold": 0.5,
+        "n_trades": 23,
+        "win_rate": 0.21739130434782608,
+        "avg_pnl": -0.01383334402318882,
+        "avg_win": 0.043936537392437455,
+        "avg_loss": -0.029880533305307228,
+        "annualized_return": -0.390371759888163,
+        "total_return": -0.1513129003104312,
+        "max_drawdown": 0.21816396444095892,
+        "final_equity": 0.8486870996895688,
+        "span_days": 121
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 39,
+          "win_rate": 0.1794871794871795,
+          "annualized_return": -0.4457102254126314,
+          "max_drawdown": 0.36178296615397537
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 40,
+          "win_rate": 0.2,
+          "annualized_return": -0.44353614091358406,
+          "max_drawdown": 0.36178296615397537
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 28,
+          "win_rate": 0.14285714285714285,
+          "annualized_return": -0.5393528937022878,
+          "max_drawdown": 0.27575758946332857
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 23,
+          "win_rate": 0.21739130434782608,
+          "annualized_return": -0.390371759888163,
+          "max_drawdown": 0.21816396444095892
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 16,
+          "win_rate": 0.375,
+          "annualized_return": 0.09911485122137864,
+          "max_drawdown": 0.10884482578748014
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 7,
+          "win_rate": 0.42857142857142855,
+          "annualized_return": 0.057537093392695304,
+          "max_drawdown": 0.06913189737610238
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 2,
+          "win_rate": 0.5,
+          "annualized_return": -0.033530724489954644,
+          "max_drawdown": 0.01775000058114528
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 1,
+          "win_rate": 1.0,
+          "annualized_return": 0.02011821396041391,
+          "max_drawdown": 0.0
+        }
+      ]
+    },
+    {
+      "passed": false,
+      "fails": [
+        "wr 38.9% < 47% [regime (SET wr=46.2%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 0.1574926447678494,
+      "bayes_dd_pass": true,
+      "bayes_dd_tail": 0.16132619425412442,
+      "train": "2024-03-01..2024-08-31",
+      "test": "2024-09-01..2024-12-31",
+      "n_train": 38785,
+      "n_test": 26181,
+      "best": {
+        "threshold": 0.3,
+        "n_trades": 36,
+        "win_rate": 0.3888888888888889,
+        "avg_pnl": 0.007462407565779156,
+        "avg_win": 0.07168804428407125,
+        "avg_loss": -0.03340845216404308,
+        "annualized_return": 0.428440122496504,
+        "total_return": 0.12438112760371456,
+        "max_drawdown": 0.08565480673864623,
+        "final_equity": 1.1243811276037146,
+        "span_days": 120
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 38,
+          "win_rate": 0.3157894736842105,
+          "annualized_return": 0.17331236158786512,
+          "max_drawdown": 0.11001818066923956
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 36,
+          "win_rate": 0.3888888888888889,
+          "annualized_return": 0.428440122496504,
+          "max_drawdown": 0.08565480673864623
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 21,
+          "win_rate": 0.42857142857142855,
+          "annualized_return": 0.36738240674996336,
+          "max_drawdown": 0.07993122750259037
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 9,
+          "win_rate": 0.4444444444444444,
+          "annualized_return": 0.039335058198891604,
+          "max_drawdown": 0.0626617614362714
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 4,
+          "win_rate": 0.25,
+          "annualized_return": -0.10646957807326163,
+          "max_drawdown": 0.03518493864165995
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 1,
+          "win_rate": 0.0,
+          "annualized_return": -0.05301733324660829,
+          "max_drawdown": 0.0
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 1,
+          "win_rate": 0.0,
+          "annualized_return": -0.05301733324660829,
+          "max_drawdown": 0.0
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 1,
+          "win_rate": 0.0,
+          "annualized_return": -0.05301733324660829,
+          "max_drawdown": 0.0
+        }
+      ]
+    },
+    {
+      "passed": false,
+      "fails": [
+        "max_dd 21.7% > 20%",
+        "wr 34.6% < 47% [regime (SET wr=46.2%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 0.09756242761025977,
+      "bayes_dd_pass": true,
+      "bayes_dd_tail": 0.1693417401295441,
+      "train": "2024-07-01..2024-12-31",
+      "test": "2025-01-01..2025-04-30",
+      "n_train": 39679,
+      "n_test": 24526,
+      "best": {
+        "threshold": 0.3,
+        "n_trades": 26,
+        "win_rate": 0.34615384615384615,
+        "avg_pnl": -0.004573883853691558,
+        "avg_win": 0.04784758334668974,
+        "avg_loss": -0.032326425312716955,
+        "annualized_return": -0.184774806212617,
+        "total_return": -0.06443478842085126,
+        "max_drawdown": 0.21700626539485945,
+        "final_equity": 0.9355652115791487,
+        "span_days": 119
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 27,
+          "win_rate": 0.3333333333333333,
+          "annualized_return": -0.22834919052421,
+          "max_drawdown": 0.21700626539485945
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 26,
+          "win_rate": 0.34615384615384615,
+          "annualized_return": -0.184774806212617,
+          "max_drawdown": 0.21700626539485945
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 25,
+          "win_rate": 0.32,
+          "annualized_return": -0.4293749718393268,
+          "max_drawdown": 0.20285697626022248
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 22,
+          "win_rate": 0.36363636363636365,
+          "annualized_return": -0.295391041900983,
+          "max_drawdown": 0.14611478593329913
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 22,
+          "win_rate": 0.3181818181818182,
+          "annualized_return": -0.4037186699810522,
+          "max_drawdown": 0.20314304122924798
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 17,
+          "win_rate": 0.29411764705882354,
+          "annualized_return": -0.3248325348302884,
+          "max_drawdown": 0.14553477655986424
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 12,
+          "win_rate": 0.25,
+          "annualized_return": -0.3050304640550491,
+          "max_drawdown": 0.11090981223950797
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 10,
+          "win_rate": 0.4,
+          "annualized_return": -0.14455441206198005,
+          "max_drawdown": 0.08207701925589689
+        }
+      ]
+    },
+    {
+      "passed": false,
+      "fails": [
+        "wr 34.9% < 50% [regime (SET wr=49.4%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 0.020682349431775108,
+      "bayes_dd_pass": true,
+      "bayes_dd_tail": 0.17968960432163253,
+      "train": "2024-11-01..2025-04-30",
+      "test": "2025-05-01..2025-08-31",
+      "n_train": 37043,
+      "n_test": 23293,
+      "best": {
+        "threshold": 0.0,
+        "n_trades": 43,
+        "win_rate": 0.3488372093023256,
+        "avg_pnl": 0.01200789645812366,
+        "avg_win": 0.0986893052700907,
+        "avg_loss": -0.03442857254828725,
+        "annualized_return": 1.0211777956027386,
+        "total_return": 0.2602964658671818,
+        "max_drawdown": 0.16397286755985754,
+        "final_equity": 1.2602964658671818,
+        "span_days": 120
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 43,
+          "win_rate": 0.3488372093023256,
+          "annualized_return": 1.0211777956027386,
+          "max_drawdown": 0.16397286755985754
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 29,
+          "win_rate": 0.41379310344827586,
+          "annualized_return": 0.36301199925013883,
+          "max_drawdown": 0.10188443445040264
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 16,
+          "win_rate": 0.5625,
+          "annualized_return": 0.28628845859679686,
+          "max_drawdown": 0.035184938641659974
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 4,
+          "win_rate": 0.75,
+          "annualized_return": 0.2712449313856031,
+          "max_drawdown": 0.017750000581145293
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 4,
+          "win_rate": 0.75,
+          "annualized_return": 0.2712449313856031,
+          "max_drawdown": 0.017750000581145293
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 2,
+          "win_rate": 0.5,
+          "annualized_return": -0.002450272553759958,
+          "max_drawdown": 0.01775000058114527
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 0,
+          "win_rate": 0.0,
+          "annualized_return": 0.0,
+          "max_drawdown": 0.0
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 0,
+          "win_rate": 0.0,
+          "annualized_return": 0.0,
+          "max_drawdown": 0.0
+        }
+      ]
+    },
+    {
+      "passed": false,
+      "fails": [
+        "wr 22.7% < 63% [regime (SET wr=61.7%+1%)]"
+      ],
+      "bayes_passed": false,
+      "bayes_wr_pass": false,
+      "bayes_wr_prob": 6.592396088034678e-05,
+      "bayes_dd_pass": true,
+      "bayes_dd_tail": 0.18647126846332762,
+      "train": "2025-07-01..2025-12-31",
+      "test": "2026-01-01..2026-03-31",
+      "n_train": 37015,
+      "n_test": 18765,
+      "best": {
+        "threshold": 0.0,
+        "n_trades": 22,
+        "win_rate": 0.22727272727272727,
+        "avg_pnl": -0.00989265236156908,
+        "avg_win": 0.0650910573080182,
+        "avg_loss": -0.031946684617330044,
+        "annualized_return": -0.3862242866033211,
+        "total_return": -0.10864316202162982,
+        "max_drawdown": 0.16385990574996306,
+        "final_equity": 0.8913568379783702,
+        "span_days": 86
+      },
+      "all_thresholds": [
+        {
+          "threshold": 0.0,
+          "n_trades": 22,
+          "win_rate": 0.22727272727272727,
+          "annualized_return": -0.3862242866033211,
+          "max_drawdown": 0.16385990574996306
+        },
+        {
+          "threshold": 0.3,
+          "n_trades": 14,
+          "win_rate": 0.42857142857142855,
+          "annualized_return": 0.14597214517428592,
+          "max_drawdown": 0.0815912863847945
+        },
+        {
+          "threshold": 0.4,
+          "n_trades": 10,
+          "win_rate": 0.5,
+          "annualized_return": 0.2597929126350267,
+          "max_drawdown": 0.020758336682073324
+        },
+        {
+          "threshold": 0.5,
+          "n_trades": 5,
+          "win_rate": 0.4,
+          "annualized_return": 0.09050592802642599,
+          "max_drawdown": 0.04814734148968492
+        },
+        {
+          "threshold": 0.55,
+          "n_trades": 4,
+          "win_rate": 0.5,
+          "annualized_return": 0.19607337936141667,
+          "max_drawdown": 0.03518493864165998
+        },
+        {
+          "threshold": 0.6,
+          "n_trades": 4,
+          "win_rate": 0.5,
+          "annualized_return": 0.19607337936141667,
+          "max_drawdown": 0.017750000581145314
+        },
+        {
+          "threshold": 0.65,
+          "n_trades": 4,
+          "win_rate": 0.5,
+          "annualized_return": 0.19607337936141667,
+          "max_drawdown": 0.017750000581145314
+        },
+        {
+          "threshold": 0.7,
+          "n_trades": 0,
+          "win_rate": 0.0,
+          "annualized_return": 0.0,
+          "max_drawdown": 0.0
+        }
+      ]
+    }
+  ]
+}
