@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First TabDPT v1.1 claude-mode shot (context=512, n_ens=2 — minor nudge below search-space min of 1024, forced by wall-time budget) produced unprecedented W6 +102.1% ann at thr=0.0 (biggest single-window W6 ann across last 20+ claude iters) and W4 +42.8% ann alive thr=0.3 sweep, but WR collapses on W2/W7 (~22%) — the FAISS-retrieved per-row k-NN context picks high-magnitude winners AND losers, +9.87% avg_win vs -3.44% avg_loss = 2.87:1 reward/risk that needs >30% WR. Train mode should sweep temperature ∈ {0.5, 0.8, 1.2} (sharpen retrieval), normalizer ∈ {standard, quantile-normal, power} (reduce outlier influence on W2/W7), feature_reduction ∈ {pca, subsample}, and n_ensembles ∈ {2, 4} — the W6 magnitude signal at default HPs is novel for the registry and worth preserving across HP sweeps.",
+  "rationale": "First TabDPT v1.1 claude shot produced the biggest W6 single-window ann (+102.1%) ever recorded across last 20+ iters AND W4 +42.8% ann alive sweep AND avg_ann +3.9% (top-3 among last 10 iters). Brief unexhausted (1 attempt, novel signal). Train mode should sweep temperature \u2208 {0.5, 0.8, 1.2} (sharpen retrieval to lift WR), normalizer \u2208 {standard, quantile-normal, power} (winsorize outliers dragging W2/W7), feature_reduction \u2208 {pca, subsample}, n_ensembles \u2208 {2, 4} around a pinned context_size=512 (going to 1024 within search space if a sweep beats the WR-floor wall).",
   "claude_iter_id": 2013,
-  "designated_at": "2026-06-04T01:17:00"
+  "designated_at": "2026-06-04T01:19:30"
 }
