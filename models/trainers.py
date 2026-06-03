@@ -17311,6 +17311,420 @@ class TabDPTv1Trainer(BaseTrainer):
         }
 
 
+try:
+    from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
+    _HAS_MOIRAI2 = True
+except Exception:
+    _HAS_MOIRAI2 = False
+
+
+_MOIRAI2_CACHE: dict = {}
+
+
+class _Moirai2Head(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+class TorchMoirai2Trainer(BaseTrainer):
+    """Frozen Salesforce Moirai-2.0 backbone -> MLP classifier head.
+
+    Decoder-only causal-attention TS foundation model with a multi-token
+    quantile prediction head (9 quantiles 0.1..0.9 over horizon H). Freeze
+    the backbone, run per-channel univariate forecasts over L=20 sequence
+    windows (left-zero-padded + is_pad mask up to context_length), extract
+    per-quantile per-horizon statistics, concatenate with the last raw row
+    + cheap per-channel sequence stats, train a small MLP head with
+    BCEWithLogitsLoss + pos_weight. Slot-complement to torch_timesfm
+    (patched-decoder + flat-quantile head) and torch_toto2 (factorized
+    attention + scalar head).
+    """
+
+    name = 'torch_moirai2'
+    consumes_sequences = True
+
+    _DEFAULT_CHANNELS = (0, 1, 3, 4, 10, 11, 24)
+
+    def __init__(self,
+                 model_id: str = 'Salesforce/moirai-2.0-R-small',
+                 context_length: int = 512,
+                 prediction_length: int = 64,
+                 channel_indices=None,
+                 head_hidden: int = 128,
+                 dropout: float = 0.15,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 pos_weight: float = 1.5,
+                 epochs: int = 25,
+                 batch_size: int = 256,
+                 inference_batch: int = 64,
+                 patience: int = 5,
+                 grad_clip: float = 1.0,
+                 use_pretrained: bool = True,
+                 include_last_row: bool = True,
+                 use_seq_stats: bool = True,
+                 max_train_rows: int = 60000,
+                 device: str = None,
+                 random_state: int = 42,
+                 **_):
+        if not _HAS_TORCH:
+            raise ImportError("torch not available. `pip install torch>=2.6`.")
+        if not _HAS_MOIRAI2:
+            raise ImportError(
+                "uni2ts not installed. `pip install uni2ts==2.0.0` (with "
+                "gluonts and huggingface_hub already in the env).")
+        self.model_id = str(model_id)
+        self.context_length = int(context_length)
+        self.prediction_length = int(prediction_length)
+        if channel_indices is None or len(channel_indices) == 0:
+            self.channel_indices = None
+        else:
+            self.channel_indices = [int(c) for c in channel_indices]
+        self.head_hidden = int(head_hidden)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.pos_weight = float(pos_weight)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.inference_batch = int(inference_batch)
+        self.patience = int(patience)
+        self.grad_clip = float(grad_clip)
+        self.use_pretrained = bool(use_pretrained)
+        self.include_last_row = bool(include_last_row)
+        self.use_seq_stats = bool(use_seq_stats)
+        self.max_train_rows = int(max_train_rows)
+        self.requested_device = device
+        self.random_state = int(random_state)
+        self._head = None
+        self._scaler_mean = None
+        self._scaler_std = None
+        self._chan_mean = None
+        self._chan_std = None
+        self._in_dim = None
+        self._device = None
+        self._num_channels_used = None
+
+    def _pick_device(self):
+        if self.requested_device:
+            return self.requested_device
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _sanitize(self, X):
+        return np.nan_to_num(np.asarray(X, dtype=np.float32),
+                              nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _stratified_subsample(self, X_3d, y):
+        n = len(X_3d)
+        if n <= self.max_train_rows:
+            return X_3d, y
+        rng = np.random.default_rng(self.random_state)
+        pos_idx = np.where(y == 1)[0]
+        neg_idx = np.where(y == 0)[0]
+        frac = self.max_train_rows / float(n)
+        n_pos = max(1, int(round(len(pos_idx) * frac)))
+        n_neg = max(1, min(self.max_train_rows - n_pos, len(neg_idx)))
+        sel_pos = rng.choice(pos_idx, size=min(n_pos, len(pos_idx)), replace=False)
+        sel_neg = rng.choice(neg_idx, size=min(n_neg, len(neg_idx)), replace=False)
+        idx = np.concatenate([sel_pos, sel_neg])
+        rng.shuffle(idx)
+        return X_3d[idx], y[idx]
+
+    def _select_channels(self, X_3d):
+        N, L, F = X_3d.shape
+        if self.channel_indices is None:
+            idx = [c for c in self._DEFAULT_CHANNELS if c < F]
+            if not idx:
+                idx = list(range(min(F, 7)))
+        else:
+            idx = [c if c >= 0 else (F + c) for c in self.channel_indices]
+            idx = [max(0, min(int(c), F - 1)) for c in idx]
+        return X_3d[:, :, idx].astype(np.float32)
+
+    def _fit_channel_scaler(self, X_sel):
+        flat = X_sel.reshape(-1, X_sel.shape[2])
+        self._chan_mean = flat.mean(axis=0).astype(np.float32)
+        self._chan_std = (flat.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_channel_scaler(self, X_sel):
+        return ((X_sel - self._chan_mean) / self._chan_std).astype(np.float32)
+
+    def _pad_context(self, X_sel):
+        N, L, C = X_sel.shape
+        target = self.context_length
+        if L == target:
+            pad_mask = np.zeros((N, L), dtype=bool)
+            return X_sel, pad_mask
+        if L > target:
+            pad_mask = np.zeros((N, target), dtype=bool)
+            return X_sel[:, -target:, :], pad_mask
+        pad = np.zeros((N, target - L, C), dtype=np.float32)
+        out = np.concatenate([pad, X_sel], axis=1)
+        pad_mask = np.zeros((N, target), dtype=bool)
+        pad_mask[:, :target - L] = True
+        return out, pad_mask
+
+    def _load_backbone(self):
+        key = (self.model_id, self.context_length, self.prediction_length,
+               self.use_pretrained)
+        if key in _MOIRAI2_CACHE:
+            forecaster = _MOIRAI2_CACHE[key]
+            self._device = next(forecaster.module.parameters()).device
+            return forecaster
+        module = Moirai2Module.from_pretrained(self.model_id)
+        if not self.use_pretrained:
+            for p in module.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+                else:
+                    nn.init.zeros_(p)
+        forecaster = Moirai2Forecast(
+            prediction_length=self.prediction_length,
+            target_dim=1,
+            feat_dynamic_real_dim=0,
+            past_feat_dynamic_real_dim=0,
+            context_length=self.context_length,
+            module=module,
+        )
+        forecaster.module.eval()
+        for p in forecaster.module.parameters():
+            p.requires_grad_(False)
+        device = self._pick_device()
+        forecaster.to(device)
+        _MOIRAI2_CACHE[key] = forecaster
+        self._device = torch.device(device) if isinstance(device, str) else device
+        return forecaster
+
+    def _encode(self, X_3d):
+        """Per-row per-channel Moirai-2.0 forecast.
+        Output (N, C * (5 + 2*Q)) where Q = 9 quantile levels.
+        Per channel stats: mean(median forecast), std (across quantiles),
+        last step (median), first step (median), pooled std, q-first vec,
+        q-last vec.
+        """
+        X_sel = self._select_channels(X_3d)
+        X_sel = self._sanitize(X_sel)
+        X_sel = self._apply_channel_scaler(X_sel)
+        X_padded, pad_mask = self._pad_context(X_sel)
+        N, L, C = X_padded.shape
+        self._num_channels_used = C
+        forecaster = self._load_backbone()
+        device = self._device
+        bs = max(1, self.inference_batch)
+        feats = []
+        with torch.no_grad():
+            for ch in range(C):
+                series = X_padded[:, :, ch:ch + 1]  # (N, L, 1)
+                ch_chunks = []
+                for i in range(0, N, bs):
+                    j = min(N, i + bs)
+                    past_target = torch.from_numpy(series[i:j]).to(device)
+                    past_observed = torch.ones_like(past_target, dtype=torch.bool)
+                    past_pad = torch.from_numpy(pad_mask[i:j]).to(device)
+                    # output: (B, Q=9, H) for target_dim=1
+                    q = forecaster(past_target, past_observed, past_pad)
+                    if q.dim() == 4:
+                        q = q.squeeze(-1)
+                    H = q.shape[-1]
+                    Q = q.shape[1]
+                    # median forecast across quantiles per step
+                    median = q.median(dim=1).values  # (B, H)
+                    q_std = q.std(dim=1) + 1e-6  # (B, H) across quantiles
+                    mean_med = median.mean(dim=-1, keepdim=True)  # (B,1)
+                    std_pool = q_std.mean(dim=-1, keepdim=True)  # (B,1)
+                    first_step = median[:, :1]  # (B,1)
+                    last_step = median[:, -1:]  # (B,1)
+                    slope = (median[:, -1] - median[:, 0]).unsqueeze(-1)  # (B,1)
+                    q_first = q[:, :, 0]  # (B,Q)
+                    q_last = q[:, :, -1]  # (B,Q)
+                    blk = torch.cat([
+                        mean_med, std_pool, first_step, last_step, slope,
+                        q_first, q_last,
+                    ], dim=-1)  # (B, 5 + 2Q)
+                    ch_chunks.append(blk.cpu().numpy().astype(np.float32))
+                feats.append(np.concatenate(ch_chunks, axis=0))
+        return np.concatenate(feats, axis=1).astype(np.float32)
+
+    def _stack_features(self, X_3d, emb):
+        emb = self._sanitize(emb)
+        parts = [emb]
+        if self.include_last_row:
+            last = self._sanitize(X_3d[:, -1, :])
+            parts.append(last)
+        if self.use_seq_stats:
+            seq = self._sanitize(X_3d)
+            stats = np.concatenate([
+                seq.mean(axis=1), seq.std(axis=1),
+                seq.min(axis=1), seq.max(axis=1),
+                (seq[:, -1, :] - seq[:, 0, :]),
+            ], axis=1).astype(np.float32)
+            parts.append(stats)
+        return np.concatenate(parts, axis=1)
+
+    def _fit_scaler(self, Fmat):
+        self._scaler_mean = Fmat.mean(axis=0).astype(np.float32)
+        self._scaler_std = (Fmat.std(axis=0) + 1e-6).astype(np.float32)
+
+    def _apply_scaler(self, Fmat):
+        return ((Fmat - self._scaler_mean) / self._scaler_std).astype(np.float32)
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, verbose: bool = False,
+            pnl_train=None, pnl_val=None, dates_train=None, dates_val=None):
+        X_tr_3d = self._sanitize(X_tr)
+        if X_tr_3d.ndim != 3:
+            raise ValueError(
+                f'torch_moirai2 expects 3D sequence input (N, L, F); '
+                f'got shape {X_tr_3d.shape}.')
+        y_tr_arr = np.asarray(y_tr, dtype=np.float32).ravel()
+        X_tr_3d, y_tr_arr = self._stratified_subsample(X_tr_3d, y_tr_arr)
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+        X_sel_tr = self._select_channels(X_tr_3d)
+        X_sel_tr = self._sanitize(X_sel_tr)
+        self._fit_channel_scaler(X_sel_tr)
+        emb_tr = self._encode(X_tr_3d)
+        F_tr = self._stack_features(X_tr_3d, emb_tr)
+        self._fit_scaler(F_tr)
+        F_tr = self._apply_scaler(F_tr)
+        self._in_dim = int(F_tr.shape[1])
+        has_val = (X_val is not None) and (y_val is not None) and len(y_val) > 0
+        if has_val:
+            X_val_3d = self._sanitize(X_val)
+            emb_val = self._encode(X_val_3d)
+            F_val = self._apply_scaler(self._stack_features(X_val_3d, emb_val))
+            y_val_arr = np.asarray(y_val, dtype=np.float32).ravel()
+        else:
+            F_val = None
+        device = self._device or self._pick_device()
+        self._head = _Moirai2Head(self._in_dim, self.head_hidden, self.dropout).to(device)
+        pos_w = torch.tensor([self.pos_weight], device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        opt = torch.optim.AdamW(self._head.parameters(),
+                                lr=self.learning_rate,
+                                weight_decay=self.weight_decay)
+        F_tr_t = torch.from_numpy(F_tr).to(device)
+        y_tr_t = torch.from_numpy(y_tr_arr).to(device)
+        if has_val:
+            F_val_t = torch.from_numpy(F_val).to(device)
+            y_val_t = torch.from_numpy(y_val_arr).to(device)
+        best_val = float('inf')
+        best_state = None
+        bad = 0
+        N = F_tr_t.size(0)
+        for _ep in range(self.epochs):
+            self._head.train()
+            perm = torch.randperm(N, device=device)
+            for i in range(0, N, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                logit = self._head(F_tr_t[idx])
+                loss = loss_fn(logit, y_tr_t[idx])
+                opt.zero_grad()
+                loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._head.parameters(), self.grad_clip)
+                opt.step()
+            if has_val:
+                self._head.eval()
+                with torch.no_grad():
+                    vloss = loss_fn(self._head(F_val_t), y_val_t).item()
+                if vloss < best_val - 1e-4:
+                    best_val = vloss
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self._head.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+        if best_state is not None:
+            self._head.load_state_dict(best_state)
+        self._head.eval()
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self._head is None:
+            raise RuntimeError('TorchMoirai2Trainer.predict_proba before fit')
+        X_3d = self._sanitize(X)
+        if X_3d.ndim != 3:
+            raise ValueError(
+                f'torch_moirai2.predict_proba expects 3D input (N, L, F); '
+                f'got shape {X_3d.shape}.')
+        emb = self._encode(X_3d)
+        Fmat = self._apply_scaler(self._stack_features(X_3d, emb))
+        device = self._device or self._pick_device()
+        out = []
+        self._head.eval()
+        bs = max(self.batch_size, 1)
+        with torch.no_grad():
+            for i in range(0, Fmat.shape[0], bs):
+                xb = torch.from_numpy(Fmat[i:i + bs]).to(device)
+                p = torch.sigmoid(self._head(xb)).cpu().numpy().astype(np.float32)
+                out.append(p)
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    @property
+    def hyperparams(self):
+        return dict(
+            model_id=self.model_id,
+            context_length=self.context_length,
+            prediction_length=self.prediction_length,
+            channel_indices=self.channel_indices,
+            head_hidden=self.head_hidden,
+            dropout=self.dropout,
+            learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay,
+            pos_weight=self.pos_weight,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            inference_batch=self.inference_batch,
+            patience=self.patience,
+            grad_clip=self.grad_clip,
+            use_pretrained=self.use_pretrained,
+            include_last_row=self.include_last_row,
+            use_seq_stats=self.use_seq_stats,
+            max_train_rows=self.max_train_rows,
+            random_state=self.random_state,
+        )
+
+    def save(self, model_dir, extra=None):
+        from pathlib import Path
+        out = Path(model_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'head_state_dict': self._head.state_dict() if self._head is not None else None,
+            'scaler_mean': self._scaler_mean,
+            'scaler_std': self._scaler_std,
+            'chan_mean': self._chan_mean,
+            'chan_std': self._chan_std,
+            'in_dim': self._in_dim,
+            'num_channels_used': self._num_channels_used,
+            'hparams': self.hyperparams,
+        }, out / 'model.pt')
+        meta = {'trainer': self.name, 'device': str(self._device),
+                'in_dim': self._in_dim,
+                'num_channels_used': self._num_channels_used,
+                'hparams': self.hyperparams}
+        if extra:
+            meta.update(extra)
+        with open(out / 'meta.json', 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+        return {'model_pt': str(out / 'model.pt'),
+                'meta': str(out / 'meta.json')}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -17383,6 +17797,7 @@ TRAINERS = {
     'torch_toto2': TorchToto2Trainer,
     'torch_mantis': TorchMantisTrainer,
     'tabdpt_v1': TabDPTv1Trainer,
+    'torch_moirai2': TorchMoirai2Trainer,
 }
 
 

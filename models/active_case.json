@@ -1,12 +1,12 @@
 {
-  "trainer": "tabdpt_v1",
+  "trainer": "torch_moirai2",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First TabDPT v1.1 claude shot produced the biggest W6 single-window ann (+102.1%) ever recorded across last 20+ iters AND W4 +42.8% ann alive sweep AND avg_ann +3.9% (top-3 among last 10 iters). Brief unexhausted (1 attempt, novel signal). Train mode should sweep temperature \u2208 {0.5, 0.8, 1.2} (sharpen retrieval to lift WR), normalizer \u2208 {standard, quantile-normal, power} (winsorize outliers dragging W2/W7), feature_reduction \u2208 {pca, subsample}, n_ensembles \u2208 {2, 4} around a pinned context_size=512 (going to 1024 within search space if a sweep beats the WR-floor wall).",
-  "claude_iter_id": 2013,
-  "designated_at": "2026-06-04T01:19:30"
+  "rationale": "First Moirai-2.0 (multi-token 9-quantile head, decoder-only) claude shot produced the first alive W1 thr=0.4 sweep among recent attempts (+84.8% ann; WR 40.9% just 9pp shy of the 50% regime-WR floor) and a viable W3 thr=0.0 ann=-2.4% (vs the W3 0/20 wall most TS-FMs collapse to deep negatives on). avg_ann -1.4% beats both baselines (random_topk -30%, rule_only -28%). Train mode should sweep channel_indices \u2208 {[0,1,24], [0,1,3,4,24], [0,1,3,4,10,11,24]} (per mantis-channel-pruning lesson \u2014 likely lifts W2/W3/W5 WR floor by dropping noisy xranks), pos_weight \u2208 [1.0, 1.5] (lower to demote score-collapse), dropout \u2208 [0.05, 0.30], head_hidden \u2208 {64, 128, 256}, around pinned (ctx=512, pred=64) \u2014 per toto2-horizon96-regresses do NOT sweep encoder geometry jointly with head HPs.",
+  "claude_iter_id": 2014,
+  "designated_at": "2026-06-04T06:15:50"
 }

@@ -1635,6 +1635,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'max_train_rows':      [15000, 30000, 50000],
     'random_state':        [42, 7, 1337],
 },
+    'torch_moirai2': {
+    'context_length':       [256, 512, 1024],
+    'prediction_length':    [32, 64, 96],
+    'channel_indices':      [None, [0, 1, 24], [0, 1, 3, 4, 24], [0, 1, 3, 4, 10, 11, 24]],
+    'head_hidden':          [64, 128, 256],
+    'dropout':              (0.05, 0.30),
+    'learning_rate':        (1e-4, 3e-3),
+    'weight_decay':         (1e-5, 1e-3),
+    'pos_weight':           (1.0, 1.5),
+    'use_seq_stats':        [True, False],
+    'include_last_row':     [True, False],
+    'epochs':               [20, 30, 50],
+    'random_state':         [42, 7, 1337],
+},
 }
 
 
