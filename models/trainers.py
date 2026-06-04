@@ -17725,6 +17725,180 @@ class TorchMoirai2Trainer(BaseTrainer):
                 'meta': str(out / 'meta.json')}
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+class TorchGatedDeltaNetTrainer(BaseTrainer):
+    """Gated DeltaNet (Mamba-2 + delta rule) — fla.layers.GatedDeltaNet over (B, L=20, F=96) panels.
+
+    Fills the data-dependent-gating recurrent slot the registry lacks; addresses the
+    [[mamba-variates-as-tokens-exhausted]] regression by tokenizing on the time axis (L=20)
+    instead of the feature axis, and by using delta-rule error-correction which fixes
+    Mamba-1's associative-recall failure on short, noisy windows.
+    """
+
+    name = 'torch_gated_delta_net'
+    consumes_sequences = True
+
+    def __init__(
+        self,
+        hidden_dim: int = 192,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.10,
+        lr: float = 5e-4,
+        weight_decay: float = 1e-4,
+        batch_size: int = 512,
+        epochs: int = 8,
+        pos_weight: float = 1.5,
+        grad_clip: float = 1.0,
+        seed: int = 42,
+        device: str = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.pos_weight = float(pos_weight)
+        self.grad_clip = float(grad_clip)
+        self.seed = int(seed)
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.n_feat = None
+        self.seq_len = None
+
+    def _build(self, n_feat: int) -> nn.Module:
+        from fla.layers import GatedDeltaNet  # lazy import — pip install flash-linear-attention
+
+        hidden = self.hidden_dim
+        n_heads = self.num_heads
+        n_layers = self.num_layers
+        drop = self.dropout
+
+        class GDNNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.in_proj = nn.Linear(n_feat, hidden)
+                self.in_norm = nn.LayerNorm(hidden)
+                self.blocks = nn.ModuleList([
+                    GatedDeltaNet(hidden_size=hidden, num_heads=n_heads)
+                    for _ in range(n_layers)
+                ])
+                self.block_norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(n_layers)])
+                self.drop = nn.Dropout(drop)
+                self.head = nn.Sequential(
+                    nn.LayerNorm(hidden),
+                    nn.Linear(hidden, hidden),
+                    nn.GELU(),
+                    nn.Dropout(drop),
+                    nn.Linear(hidden, 1),
+                )
+
+            def forward(self, x):  # x: (B, L, F)
+                h = self.drop(self.in_norm(self.in_proj(x)))
+                for blk, ln in zip(self.blocks, self.block_norms):
+                    res = blk(hidden_states=ln(h))
+                    y = res[0] if isinstance(res, (tuple, list)) else res
+                    h = h + self.drop(y)
+                last = h[:, -1, :]
+                return self.head(last).squeeze(-1)
+
+        return GDNNet()
+
+    def _ensure_3d(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 2:
+            return X[:, None, :]
+        return X
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        X_tr = self._ensure_3d(X_tr)
+        y_tr = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        n, L, F = X_tr.shape
+        self.n_feat = F
+        self.seq_len = L
+
+        self.model = self._build(F).to(self.device)
+        opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        pw = torch.tensor([self.pos_weight], device=self.device, dtype=torch.float32)
+        crit = nn.BCEWithLogitsLoss(pos_weight=pw)
+
+        X_t = torch.from_numpy(X_tr).to(self.device)
+        y_t = torch.from_numpy(y_tr).to(self.device)
+
+        for ep in range(self.epochs):
+            self.model.train()
+            perm = torch.randperm(n, device=self.device)
+            for i in range(0, n, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                xb = X_t[idx]
+                yb = y_t[idx]
+                logits = self.model(xb)
+                loss = crit(logits, yb)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if self.grad_clip and self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                opt.step()
+
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        X = self._ensure_3d(X)
+        self.model.eval()
+        out = []
+        with torch.no_grad():
+            X_t = torch.from_numpy(X).to(self.device)
+            for i in range(0, X_t.size(0), self.batch_size):
+                xb = X_t[i:i + self.batch_size]
+                logits = self.model(xb)
+                out.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(out, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        hp = {
+            'hidden_dim': self.hidden_dim,
+            'num_heads': self.num_heads,
+            'num_layers': self.num_layers,
+            'dropout': self.dropout,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            'batch_size': self.batch_size,
+            'epochs': self.epochs,
+            'pos_weight': self.pos_weight,
+            'grad_clip': self.grad_clip,
+            'seed': self.seed,
+        }
+        meta = {
+            'name': self.name,
+            'hp': hp,
+            'n_feat': self.n_feat,
+            'seq_len': self.seq_len,
+            'consumes_sequences': self.consumes_sequences,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+        if self.model is not None:
+            torch.save(self.model.state_dict(), os.path.join(model_dir, 'model.pt'))
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -17798,6 +17972,7 @@ TRAINERS = {
     'torch_mantis': TorchMantisTrainer,
     'tabdpt_v1': TabDPTv1Trainer,
     'torch_moirai2': TorchMoirai2Trainer,
+    'torch_gated_delta_net': TorchGatedDeltaNetTrainer,
 }
 
 

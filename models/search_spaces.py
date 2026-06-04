@@ -1649,6 +1649,17 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':               [20, 30, 50],
     'random_state':         [42, 7, 1337],
 },
+    'torch_gated_delta_net': {
+    'hidden_dim':    [128, 192, 256],
+    'num_heads':     [2, 4, 8],
+    'num_layers':    [1, 2, 3],
+    'dropout':       (0.05, 0.30),
+    'lr':            (1e-4, 3e-3),
+    'weight_decay':  (1e-5, 1e-3),
+    'batch_size':    [256, 512, 1024],
+    'epochs':        [6, 8, 10, 12],
+    'pos_weight':    (1.0, 1.8),
+},
 }
 
 
