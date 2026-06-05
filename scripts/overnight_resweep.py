@@ -31,6 +31,7 @@ import argparse
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -75,17 +76,49 @@ CONTENDERS = [
 # Lock — own tag so claude_mode stands down instead of killing us.
 # ---------------------------------------------------------------------------
 def acquire_lock(path: Path, tag: str = 'overnight_resweep'):
+    """Acquire the loop lock. This job OWNS the night, so it preempts a running
+    train_mode (SIGTERM→SIGKILL, mirroring claude_mode.acquire_lock_with_priority)
+    — otherwise a still-running :30 train sweep would block the launch. Stands
+    down (returns None) for a running claude_mode / another overnight job."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o644)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+
+    def _claim():
+        os.ftruncate(fd, 0)
+        os.write(fd, f'{os.getpid()} {tag} {datetime.now().isoformat()}\n'.encode())
+        os.fsync(fd)
+        return fd
+
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _claim()
     except BlockingIOError:
-        os.close(fd)
-        return None
-    os.ftruncate(fd, 0)
-    os.write(fd, f'{os.getpid()} {tag} {datetime.now().isoformat()}\n'.encode())
-    os.fsync(fd)
-    return fd
+        pass
+
+    os.lseek(fd, 0, 0)
+    holder = os.read(fd, 1024).decode(errors='replace').strip()
+    parts = holder.split()
+    if len(parts) >= 2 and parts[1] == 'train_mode':
+        print(f'Preempting train_mode holder: {holder!r}', flush=True)
+        try:
+            pid = int(parts[0])
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                time.sleep(0.5)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return _claim()
+                except BlockingIOError:
+                    continue
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(0.5)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return _claim()
+        except (ValueError, ProcessLookupError, BlockingIOError):
+            pass
+
+    os.close(fd)
+    return None
 
 
 def release_lock(fd):
