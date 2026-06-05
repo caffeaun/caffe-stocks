@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_moirai2",
+  "trainer": "torch_gated_delta_net",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First Moirai-2.0 (multi-token 9-quantile head, decoder-only) claude shot produced the first alive W1 thr=0.4 sweep among recent attempts (+84.8% ann; WR 40.9% just 9pp shy of the 50% regime-WR floor) and a viable W3 thr=0.0 ann=-2.4% (vs the W3 0/20 wall most TS-FMs collapse to deep negatives on). avg_ann -1.4% beats both baselines (random_topk -30%, rule_only -28%). Train mode should sweep channel_indices \u2208 {[0,1,24], [0,1,3,4,24], [0,1,3,4,10,11,24]} (per mantis-channel-pruning lesson \u2014 likely lifts W2/W3/W5 WR floor by dropping noisy xranks), pos_weight \u2208 [1.0, 1.5] (lower to demote score-collapse), dropout \u2208 [0.05, 0.30], head_hidden \u2208 {64, 128, 256}, around pinned (ctx=512, pred=64) \u2014 per toto2-horizon96-regresses do NOT sweep encoder geometry jointly with head HPs.",
-  "claude_iter_id": 2014,
-  "designated_at": "2026-06-04T06:15:50"
+  "rationale": "First claude attempt at torch_gated_delta_net (Mamba-2 + delta-rule linear-attention, fla.layers.GatedDeltaNet over L=20 time-axis panels) at default HPs hit 0/7 wp but avg_ann +4.3% (positive, beats torch_moirai2 #2014's -1.4% / #2015's -13.2%) with the W6 jackpot RE-REPRODUCED (thr=0.65, +104.7% ann at 36.1% WR, avg_win 10.19% vs avg_loss -3.50% = 2.91:1 reward/risk \u2014 tied/edged out tabdpt_v1 #2013's +102.1% as biggest W6 single-window ann in 20+ iters) AND W3 thr=0.0 +36.0% ann (cracking W3's -54.7% avg-ann wall on alive sweep). Threshold sweep alive on W2 (thr=0.6, 5pp shy of floor), W4 (thr=0.5, 14pp shy), W6 (thr=0.65). W1/W5/W7 collapse to thr=0.0 flood. Lever signature is fat-tail magnitude picker blocked by WR floor \u2014 same family as fastkan/tabdpt_v1/gated-delta-net W6-magnitude lever. Train mode should sweep ONE-AT-A-TIME orthogonal axes per [[fastkan-pos-weight-2-regresses]]: (a) pos_weight \u2208 [1.6, 1.8] (push WR via more confident wins; do NOT exceed 1.8 per [[timesfm-pos-weight-2-regresses]]), (b) dropout \u2208 [0.20, 0.30] (regularize the wild W5/W7 flood swings per [[fastkan-dropout-unlocks-w7]] single-lever pattern), (c) num_layers \u2208 {1} (smaller recurrence for sharper short-window decisions), (d) lr \u2208 [3e-4, 1e-3] (slower convergence on choppy sequences). Pin hidden_dim=192, num_heads=4, weight_decay=1e-4, batch_size=512, epochs=8, grad_clip=1.0. Target: lift W2/W4/W6 alive sweeps over the regime WR floor without collapsing the +104.7% W6 magnitude lever.",
+  "claude_iter_id": 2017,
+  "designated_at": "2026-06-05T18:08:12"
 }
