@@ -120,7 +120,7 @@ def section_candidates(top: int) -> list[str]:
             SELECT id, mode, trainer, avg_win_rate, avg_annualized_return,
                    avg_max_dd, total_trades, windows_passed, finished_at
             FROM iterations
-            WHERE gate_passed = 1
+            WHERE gate_passed = 1 AND contaminated = 0
             ORDER BY avg_annualized_return DESC
             LIMIT ?
         """, (top,)).fetchall()
@@ -149,7 +149,7 @@ def section_near_passes(top: int) -> list[str]:
                    avg_max_dd, total_trades, windows_passed, finished_at
             FROM iterations
             WHERE gate_passed = 0 AND windows_passed >= 5
-              AND total_trades > 50
+              AND total_trades > 50 AND contaminated = 0
             ORDER BY windows_passed DESC, avg_annualized_return DESC
             LIMIT ?
         """, (top,)).fetchall()
@@ -177,7 +177,7 @@ def section_best_per_family(days: int) -> list[str]:
             SELECT id, mode, trainer, avg_win_rate, avg_annualized_return,
                    avg_max_dd, total_trades, windows_passed, finished_at
             FROM iterations
-            WHERE finished_at >= ? AND total_trades > 0
+            WHERE finished_at >= ? AND total_trades > 0 AND contaminated = 0
             ORDER BY windows_passed DESC, avg_annualized_return DESC
         """, (cutoff,)).fetchall()
     out = ['', '=' * 110,

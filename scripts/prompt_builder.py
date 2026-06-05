@@ -123,7 +123,8 @@ def _brief_directive() -> str:
     with fb.get_conn() as conn:
         rows = conn.execute(
             "SELECT id, windows_passed FROM iterations "
-            "WHERE mode='claude' AND trainer = ? ORDER BY id DESC LIMIT 10",
+            "WHERE mode='claude' AND trainer = ? AND contaminated = 0 "
+            "ORDER BY id DESC LIMIT 10",
             (registry_key,),
         ).fetchall()
     attempts = len(rows)

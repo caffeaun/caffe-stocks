@@ -66,7 +66,7 @@ def _init_db():
 def _passing_iters(conn):
     cur = conn.execute(
         "SELECT id, trainer, hyperparams, full_result "
-        "FROM iterations WHERE gate_passed = 1 ORDER BY id"
+        "FROM iterations WHERE gate_passed = 1 AND contaminated = 0 ORDER BY id"
     )
     rows = cur.fetchall()
     return [(rid, trainer, json.loads(hp or '{}'),

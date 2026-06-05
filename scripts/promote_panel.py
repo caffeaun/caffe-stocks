@@ -133,6 +133,7 @@ def select_top_candidates(k: int = 10, days: int = 30) -> list[dict]:
             WHERE finished_at >= ?
               AND trainer IN ({valid_trainers})
               AND total_trades > 0
+              AND contaminated = 0
             ORDER BY avg_win_rate DESC, avg_max_dd ASC
             LIMIT 200
         """, (cutoff,)).fetchall()

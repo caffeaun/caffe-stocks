@@ -195,6 +195,34 @@ def init_db():
             print('[feedback.init_db] migrated production_panel CHECK '
                   '3 → 10 ranks', file=sys.stderr)
 
+        # Invalidate the rolling-W7 era (2026-06-05). Until the W7 freeze on
+        # 2026-05-27, the 7th walk-forward window's test set ended on the run
+        # date itself (return_gate rolled it to today) — a look-ahead leak
+        # (whitepaper §4). Every iteration finished before the freeze was
+        # scored against that moving, leaking window, so its gate verdict is
+        # not trustworthy. Flag those rows `contaminated` and zero any
+        # gate_passed: under an honest gate their pass status is unknown, so
+        # the record must read 0 passes (the lone pre-freeze pass, #1218, was
+        # a leak artifact). Rows are KEPT — W1–W6 metrics and full_result stay
+        # queryable, and the flag makes this fully reversible. Guarded on the
+        # column so the backfill runs exactly once.
+        if 'contaminated' not in cols:
+            conn.execute(
+                'ALTER TABLE iterations ADD COLUMN '
+                'contaminated INTEGER NOT NULL DEFAULT 0'
+            )
+            n_flag = conn.execute(
+                "UPDATE iterations SET contaminated = 1 "
+                "WHERE finished_at < '2026-05-27'"
+            ).rowcount
+            n_zero = conn.execute(
+                "UPDATE iterations SET gate_passed = 0 "
+                "WHERE contaminated = 1 AND gate_passed = 1"
+            ).rowcount
+            print(f'[feedback.init_db] flagged {n_flag} pre-freeze iterations '
+                  f'contaminated; zeroed {n_zero} leaked gate_passed verdict(s)',
+                  file=sys.stderr)
+
 
 def _git_sha() -> Optional[str]:
     try:
@@ -395,7 +423,7 @@ def top_n_recent(n: int = 3, days: int = 30) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM iterations
-            WHERE finished_at >= ?
+            WHERE finished_at >= ? AND contaminated = 0
             ORDER BY avg_annualized_return DESC, avg_max_dd ASC
             LIMIT ?
         """, (cutoff, n)).fetchall()
