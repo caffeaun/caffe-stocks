@@ -9,6 +9,7 @@ Convention:
   floats otherwise.
 """
 from __future__ import annotations
+import os
 import numpy as np
 
 
@@ -1566,6 +1567,14 @@ SEARCH_SPACES: dict[str, dict] = {
     'patience':                 [5, 8, 12],
     'dropout':                  (0.0, 0.3),
     'spline_weight_init_scale': (0.05, 0.2),
+    # Part B — direct-policy-optimization reward objective (the swept axis).
+    # 'none' = the original BCE classifier (unchanged); the others optimize
+    # realized P&L shaped accordingly. RL_REWARD_ONLY=1 drops 'none'.
+    'reward_style':             ['none', 'profit', 'sharpe', 'dd_penalized',
+                                 'hit_rate', 'gate_surrogate'],
+    'temperature':              (0.3, 3.0),
+    'dd_lambda':                (0.0, 2.0),
+    'entropy_coef':             (0.0, 0.05),
 },
     'torch_ttm': {
     'ttm_prediction_length': [24, 48, 96],
@@ -1708,6 +1717,14 @@ def sample(trainer: str, rng: np.random.RandomState | None = None) -> dict:
                 cfg[key] = float(rng.uniform(lo, hi))
         else:
             raise ValueError(f'Bad search space value for {key}: {val!r}')
+    # RL week: when the activation schedule exports RL_REWARD_ONLY=1, never
+    # sample the BCE 'none' option for fastkan — every config is a reward-shaped
+    # policy so the week is pure-RL, not 1/6 RL.
+    if (trainer == 'torch_fastkan' and cfg.get('reward_style') == 'none'
+            and os.environ.get('RL_REWARD_ONLY') == '1'):
+        styles = [s for s in SEARCH_SPACES['torch_fastkan']['reward_style']
+                  if s != 'none']
+        cfg['reward_style'] = styles[int(rng.randint(len(styles)))]
     return cfg
 
 

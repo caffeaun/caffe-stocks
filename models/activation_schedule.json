@@ -1,0 +1,9 @@
+[
+  {
+    "start": "2026-06-08",
+    "end": "2026-06-16",
+    "trainer": "torch_fastkan",
+    "rl_week": true,
+    "note": "Part B — RL reward-objective sweep (direct policy optimization). train_mode forces torch_fastkan and exports RL_REWARD_ONLY=1 so every config uses a reward_style policy objective, gated honestly. claude_mode is untouched. Auto-expires 2026-06-16."
+  }
+]

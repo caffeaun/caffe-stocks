@@ -15901,25 +15901,92 @@ class _FastKAN(nn.Module):
         return x
 
 
+_REWARD_STYLES = ('profit', 'sharpe', 'dd_penalized', 'hit_rate', 'gate_surrogate')
+
+
+def _policy_reward_loss(logits, pnl, date_codes, reward_style, temperature,
+                        dd_lambda, entropy_coef, wr_floor=0.40, dd_cap=0.20):
+    """Direct-policy-optimization loss (Part B, 2026-06).
+
+    Optimizes the gate's actual objective directly instead of per-row log-loss:
+    each calendar day softmax-selects over the per-row scores (a differentiable
+    stand-in for the gate's hard top-of-day pick), and the reward is realized
+    P&L shaped by ``reward_style``. Minimizing the returned loss maximizes the
+    shaped reward. No sampling — the right fit for a deterministic,
+    full-information env. Shared so other torch trainers can adopt it.
+
+    logits/pnl: (N,) tensors. date_codes: (N,) long tensor of per-row day group
+    ids (0..D-1). All on the same device.
+    """
+    temp = max(float(temperature), 1e-2)
+    shaped = torch.sign(pnl) if reward_style == 'hit_rate' else pnl
+    D = int(date_codes.max().item()) + 1
+    day_r, day_wr = [], []
+    ent = logits.new_zeros(())
+    for d in range(D):
+        m = date_codes == d
+        if not bool(m.any()):
+            continue
+        w = torch.softmax(logits[m] / temp, dim=0)
+        day_r.append((w * shaped[m]).sum())
+        if reward_style == 'gate_surrogate':
+            day_wr.append((w * (pnl[m] > 0).float()).sum())
+        ent = ent - (w * torch.log(w + 1e-9)).sum()
+    day_r = torch.stack(day_r)
+    mean_r = day_r.mean()
+    if reward_style == 'sharpe':
+        obj = mean_r / (day_r.std() + 1e-6)
+    elif reward_style == 'dd_penalized':
+        eq = torch.cumsum(day_r, 0)
+        dd = (torch.cummax(eq, 0).values - eq).max()
+        obj = mean_r - dd_lambda * dd
+    elif reward_style == 'gate_surrogate':
+        wr = torch.stack(day_wr).mean() if day_wr else mean_r.new_zeros(())
+        eq = torch.cumsum(day_r, 0)
+        dd = (torch.cummax(eq, 0).values - eq).max()
+        obj = mean_r + 0.5 * (wr - wr_floor) - dd_lambda * torch.relu(dd - dd_cap)
+    else:  # profit, hit_rate
+        obj = mean_r
+    return -obj - entropy_coef * (ent / max(len(day_r), 1))
+
+
 class TorchFastKANTrainer(BaseTrainer):
     """FastKAN (Gaussian-RBF Kolmogorov-Arnold Network) — flat tabular binary classifier."""
     name = 'torch_fastkan'
     consumes_sequences = False
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.hidden_dims = list(kwargs.get('hidden_dims', [64, 32]))
-        self.num_grids = int(kwargs.get('num_grids', 8))
-        self.grid_min = float(kwargs.get('grid_min', -2.0))
-        self.grid_max = float(kwargs.get('grid_max', 2.0))
-        self.learning_rate = float(kwargs.get('learning_rate', 1e-3))
-        self.weight_decay = float(kwargs.get('weight_decay', 1e-4))
-        self.n_epochs = int(kwargs.get('n_epochs', 60))
-        self.batch_size = int(kwargs.get('batch_size', 512))
-        self.pos_weight = float(kwargs.get('pos_weight', 1.5))
-        self.patience = int(kwargs.get('patience', 8))
-        self.dropout = float(kwargs.get('dropout', 0.0))
-        self.spline_init = float(kwargs.get('spline_weight_init_scale', 0.1))
+    def __init__(self, hidden_dims=None, num_grids=8, grid_min=-2.0,
+                 grid_max=2.0, learning_rate=1e-3, weight_decay=1e-4,
+                 n_epochs=60, batch_size=512, pos_weight=1.5, patience=8,
+                 dropout=0.0, spline_weight_init_scale=0.1,
+                 reward_style=None, temperature=1.0, dd_lambda=1.0,
+                 entropy_coef=0.0, **kwargs):
+        # Explicit named params (not **kwargs): get_trainer filters kwargs to
+        # __init__.co_varnames, so a **kwargs-only signature silently DROPS every
+        # swept HP. Naming them is what makes the search space (and reward_style)
+        # actually take effect.
+        super().__init__()
+        self.hidden_dims = list(hidden_dims) if hidden_dims is not None else [64, 32]
+        self.num_grids = int(num_grids)
+        self.grid_min = float(grid_min)
+        self.grid_max = float(grid_max)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.n_epochs = int(n_epochs)
+        self.batch_size = int(batch_size)
+        self.pos_weight = float(pos_weight)
+        self.patience = int(patience)
+        self.dropout = float(dropout)
+        self.spline_init = float(spline_weight_init_scale)
+        # Part B: direct-policy-optimization reward objective. reward_style=None
+        # (or 'none') keeps the original BCE classifier — byte-for-byte the
+        # prior behavior. When set, fit() optimizes realized P&L shaped by the
+        # style via per-day softmax selection (see _policy_reward_loss).
+        self.reward_style = (None if (reward_style is None or reward_style == 'none')
+                             else str(reward_style))
+        self.temperature = float(temperature)
+        self.dd_lambda = float(dd_lambda)
+        self.entropy_coef = float(entropy_coef)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.feature_mean = None
@@ -15947,9 +16014,22 @@ class TorchFastKANTrainer(BaseTrainer):
             num_grids=self.num_grids, spline_weight_init_scale=self.spline_init,
             dropout=self.dropout,
         ).to(self.device)
-
         opt = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate,
                                 weight_decay=self.weight_decay)
+
+        pnl_train = kwargs.get('pnl_train')
+        dates_train = kwargs.get('dates_train')
+        use_policy = (self.reward_style is not None
+                      and pnl_train is not None and dates_train is not None)
+        if use_policy:
+            self._fit_policy(X_tr, pnl_train, dates_train, X_val,
+                             kwargs.get('pnl_val'), kwargs.get('dates_val'), opt)
+        else:
+            self._fit_bce(X_tr, y_tr, X_val, y_val, opt)
+        return self
+
+    def _fit_bce(self, X_tr, y_tr, X_val, y_val, opt):
+        """Original binary-classifier objective (reward_style=None)."""
         pos_w = torch.tensor(self.pos_weight, device=self.device, dtype=torch.float32)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
 
@@ -15990,7 +16070,60 @@ class TorchFastKANTrainer(BaseTrainer):
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
-        return self
+
+    def _fit_policy(self, X_tr, pnl_tr, dates_tr, X_val, pnl_val, dates_val, opt):
+        """Direct-policy-optimization objective: maximize realized P&L shaped by
+        reward_style via per-day softmax selection. Full-batch per epoch so the
+        per-day grouping is exact. Early-stops on the validation policy reward
+        when val is available, else on the train objective."""
+        dev = self.device
+
+        def _pack(X, pnl, dates):
+            Xt = torch.from_numpy(np.asarray(X, np.float32)).to(dev)
+            pt = torch.tensor(np.asarray(pnl, np.float32).reshape(-1), device=dev)
+            _, codes = np.unique(np.asarray(dates), return_inverse=True)
+            ct = torch.tensor(codes.astype(np.int64), device=dev)
+            return Xt, pt, ct
+
+        Xt, pnl_t, codes_t = _pack(X_tr, pnl_tr, dates_tr)
+        have_val = (X_val is not None and pnl_val is not None
+                    and dates_val is not None and len(X_val) > 0)
+        if have_val:
+            Xv, pnlv, vcodes = _pack(X_val, pnl_val, dates_val)
+
+        best_obj = float('inf')
+        best_state = None
+        wait = 0
+        for epoch in range(self.n_epochs):
+            self.model.train()
+            logits = self.model(Xt).squeeze(-1)
+            loss = _policy_reward_loss(
+                logits, pnl_t, codes_t, self.reward_style,
+                self.temperature, self.dd_lambda, self.entropy_coef)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            opt.step()
+
+            self.model.eval()
+            with torch.no_grad():
+                if have_val:
+                    vobj = _policy_reward_loss(
+                        self.model(Xv).squeeze(-1), pnlv, vcodes, self.reward_style,
+                        self.temperature, self.dd_lambda, self.entropy_coef).item()
+                else:
+                    vobj = loss.item()
+            if vobj < best_obj - 1e-6:
+                best_obj = vobj
+                best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                wait = 0
+            else:
+                wait += 1
+                if wait >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
 
     @torch.no_grad()
     def predict_proba(self, X) -> np.ndarray:
@@ -16025,12 +16158,40 @@ class TorchFastKANTrainer(BaseTrainer):
             'patience': self.patience,
             'dropout': self.dropout,
             'spline_weight_init_scale': self.spline_init,
+            'reward_style': self.reward_style,
+            'temperature': self.temperature,
+            'dd_lambda': self.dd_lambda,
+            'entropy_coef': self.entropy_coef,
             'input_dims': self.input_dims,
         }
         if extra:
             meta.update(extra)
         with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
             json.dump(meta, f, indent=2)
+
+    @classmethod
+    def load(cls, model_dir):
+        with open(os.path.join(model_dir, 'meta.json')) as f:
+            meta = json.load(f)
+        hp_keys = ('hidden_dims', 'num_grids', 'grid_min', 'grid_max',
+                   'learning_rate', 'weight_decay', 'n_epochs', 'batch_size',
+                   'pos_weight', 'patience', 'dropout', 'spline_weight_init_scale',
+                   'reward_style', 'temperature', 'dd_lambda', 'entropy_coef')
+        obj = cls(**{k: meta[k] for k in hp_keys if k in meta})
+        obj.input_dims = int(meta['input_dims'])
+        layers = [obj.input_dims] + list(obj.hidden_dims) + [1]
+        obj.model = _FastKAN(
+            layers, grid_min=obj.grid_min, grid_max=obj.grid_max,
+            num_grids=obj.num_grids, spline_weight_init_scale=obj.spline_init,
+            dropout=obj.dropout,
+        ).to(obj.device)
+        obj.model.load_state_dict(
+            torch.load(os.path.join(model_dir, 'fastkan.pt'), map_location=obj.device))
+        obj.model.eval()
+        sc = np.load(os.path.join(model_dir, 'scaler.npz'))
+        obj.feature_mean = sc['mean'].astype(np.float32)
+        obj.feature_std = sc['std'].astype(np.float32)
+        return obj
 
 
 # models/trainers.py — append at end (before TRAINERS dict)

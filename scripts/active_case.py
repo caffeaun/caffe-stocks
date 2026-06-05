@@ -30,6 +30,7 @@ from typing import Optional
 
 BASE_PATH = Path(os.path.expanduser('~/projects/caffe-stocks'))
 ACTIVE_CASE_PATH = BASE_PATH / 'models' / 'active_case.json'
+ACTIVATION_SCHEDULE_PATH = BASE_PATH / 'models' / 'activation_schedule.json'
 
 # Conservative defaults applied when claude's report doesn't specify them.
 DEFAULT_FEATURE_SET = 'default'
@@ -51,6 +52,36 @@ def read(path: Optional[Path] = None) -> Optional[dict]:
     if not isinstance(data, dict) or not data.get('trainer'):
         return None
     return data
+
+
+def read_scheduled_trainer(today: Optional[str] = None,
+                            path: Optional[Path] = None) -> Optional[dict]:
+    """Return the activation-schedule entry active for ``today``, or None.
+
+    ``models/activation_schedule.json`` is a list of
+    ``{"start","end","trainer", ...}`` entries; an entry is active when
+    ``start <= today < end`` (ISO ``YYYY-MM-DD`` strings sort lexicographically,
+    ``end`` exclusive). Read by train_mode BEFORE ``active_case`` so a dated
+    experiment (e.g. the RL week) wins over — and survives — claude_mode's
+    active_case rewrites (claude_mode never touches this file). Never raises.
+    """
+    p = Path(path) if path else ACTIVATION_SCHEDULE_PATH
+    if not p.exists():
+        return None
+    try:
+        entries = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    today = today or datetime.now().date().isoformat()
+    for e in entries:
+        if (isinstance(e, dict) and e.get('trainer')
+                and isinstance(e.get('start'), str)
+                and isinstance(e.get('end'), str)
+                and e['start'] <= today < e['end']):
+            return e
+    return None
 
 
 def write(case: dict, path: Optional[Path] = None) -> Path:

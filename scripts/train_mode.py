@@ -113,20 +113,32 @@ def main():
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
-    # Resolve trainer: explicit CLI > active_case.json > xgboost fallback.
+    # Resolve trainer: explicit CLI > dated activation schedule > active_case > fallback.
+    # The schedule (models/activation_schedule.json) is checked BEFORE active_case
+    # so a dated experiment wins over — and survives — claude_mode's active_case
+    # rewrites (claude_mode never touches the schedule file).
     if args.trainer == _TRAINER_SENTINEL:
-        case = active_case.read()
-        if case and case.get('trainer') in list_trainers():
-            print(f'train_mode: using trainer {case["trainer"]!r} '
-                  f'from models/active_case.json (claude_iter_id='
-                  f'{case.get("claude_iter_id")!r})')
-            args.trainer = case['trainer']
+        sched = active_case.read_scheduled_trainer()
+        if sched and sched.get('trainer') in list_trainers():
+            args.trainer = sched['trainer']
+            if sched.get('rl_week'):
+                os.environ['RL_REWARD_ONLY'] = '1'
+            print(f'train_mode: using trainer {args.trainer!r} from activation '
+                  f'schedule ({sched.get("start")}..{sched.get("end")})'
+                  + (' [RL_REWARD_ONLY=1]' if sched.get('rl_week') else ''))
         else:
-            if case:
-                print(f'train_mode: active_case trainer '
-                      f'{case.get("trainer")!r} not in registry — '
-                      f'falling back to {_FALLBACK_TRAINER!r}')
-            args.trainer = _FALLBACK_TRAINER
+            case = active_case.read()
+            if case and case.get('trainer') in list_trainers():
+                print(f'train_mode: using trainer {case["trainer"]!r} '
+                      f'from models/active_case.json (claude_iter_id='
+                      f'{case.get("claude_iter_id")!r})')
+                args.trainer = case['trainer']
+            else:
+                if case:
+                    print(f'train_mode: active_case trainer '
+                          f'{case.get("trainer")!r} not in registry — '
+                          f'falling back to {_FALLBACK_TRAINER!r}')
+                args.trainer = _FALLBACK_TRAINER
 
     # Acquire shared lock
     fd = acquire_lock(LOCK_PATH)
