@@ -197,11 +197,12 @@ def _load_latest_features(seq_len: int = 20):
 
     if not Xs:
         return (np.zeros((0, len(feats) * 4), dtype=np.float32),
+                np.zeros((0, seq_len, len(feats)), dtype=np.float32),
                 np.array([]), feats, str(latest_date))
 
-    X = np.stack(Xs, axis=0)
-    X_tab = aggregate_sequence(X)
-    return X_tab, np.array(kept_syms), feats, str(latest_date)
+    X = np.stack(Xs, axis=0)            # raw 3D (N, seq_len, F) for sequence trainers
+    X_tab = aggregate_sequence(X)       # 4F aggregate for tabular trainers
+    return X_tab, X, np.array(kept_syms), feats, str(latest_date)
 
 
 def _apply_rule_screen(symbols_today: np.ndarray, latest_date: str) -> set[str]:
@@ -231,7 +232,8 @@ def generate_signals():
     if not panel:
         return [], '?', 0, panel, set()
 
-    X_today, symbols_today, features, latest_date = _load_latest_features()
+    X_tab_today, X_seq_today, symbols_today, features, latest_date = \
+        _load_latest_features()
     if len(symbols_today) == 0:
         return [], latest_date, 0, panel, set()
 
@@ -240,8 +242,16 @@ def generate_signals():
     signals = []
     for member in panel:
         try:
-            X_scaled = member['scaler'].transform(X_today)
-            scores = member['scorer'].predict_proba(X_scaled)
+            # Mirror the gate's dispatch: sequence trainers score the raw 3D
+            # window (Seq3DScaler), tabular trainers the 4F aggregate.
+            scorer = member['scorer']
+            if getattr(scorer, 'consumes_sequences', False):
+                X_scaled = member['scaler'].transform(X_seq_today)
+            else:
+                X_scaled = member['scaler'].transform(X_tab_today)
+            if hasattr(scorer, 'set_predict_context'):
+                scorer.set_predict_context(np.array([latest_date] * len(symbols_today)))
+            scores = scorer.predict_proba(X_scaled)
         except Exception as e:
             print(f"panel rank {member['rank']}: predict failed: {e!r}", file=sys.stderr)
             continue

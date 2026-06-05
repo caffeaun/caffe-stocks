@@ -34,7 +34,8 @@ sys.path.insert(0, str(BASE))
 import numpy as np
 from sklearn.preprocessing import RobustScaler
 
-from models.sequence_loader import load_sequences, aggregate_sequence, aggregated_feature_names
+from models.sequence_loader import (
+    load_sequences, aggregate_sequence, aggregated_feature_names, Seq3DScaler)
 from models.trainers import get_trainer, TRAINERS
 from scripts import feedback as fb
 
@@ -152,17 +153,33 @@ def select_top_candidates(k: int = 10, days: int = 30) -> list[dict]:
 
 def fit_and_save(candidate: dict, X_tab: np.ndarray, y: np.ndarray,
                   pnl: np.ndarray, dates: np.ndarray, agg_features: list[str],
-                  out_dir: Path) -> None:
-    """Train on FULL data; save artifact + scaler + metadata."""
+                  out_dir: Path, X_seq: np.ndarray = None) -> None:
+    """Train on FULL data; save artifact + scaler + metadata.
+
+    Mirrors the gate's per-trainer input dispatch: trainers that set
+    ``consumes_sequences=True`` are trained on the raw 3D ``X_seq`` (scaled by
+    a persisted Seq3DScaler), exactly as ``return_gate.evaluate_window`` does —
+    so the promoted production model matches the shape it was gated under.
+    Tabular trainers keep the 2D RobustScaler path.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     hp = json.loads(candidate['hyperparams'])
     trainer = get_trainer(candidate['trainer'], **hp)
 
     # Standardize features the same way the gate does — fit on full data
-    # since this is a production model, not a walk-forward eval.
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X_tab)
+    # since this is a production model, not a walk-forward eval. Sequence
+    # trainers consume the raw 3D window; tabular trainers the 4F aggregate.
+    if getattr(trainer, 'consumes_sequences', False):
+        if X_seq is None:
+            raise RuntimeError(
+                f"{candidate['trainer']} sets consumes_sequences=True but "
+                'X_seq was not passed to fit_and_save')
+        scaler = Seq3DScaler()
+        X_scaled = scaler.fit_transform(X_seq)
+    else:
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(X_tab)
 
     # No held-out val split — fit on all data. Pass dummy val arrays so
     # trainers that expect early-stopping don't crash.
@@ -237,7 +254,7 @@ def main():
         print(f"\n=== Training rank {i}: {c['trainer']} (iter#{c['id']}) ===")
         t = time.time()
         try:
-            fit_and_save(c, X_tab, y, pnl, dates, agg_features, out_dir)
+            fit_and_save(c, X_tab, y, pnl, dates, agg_features, out_dir, X_seq=X)
             print(f'  saved -> {out_dir}  ({time.time()-t:.1f}s)')
             iter_ids.append(c['id'])
         except Exception as e:

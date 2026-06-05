@@ -211,3 +211,37 @@ def aggregated_feature_names(features):
     for kind in ('last', 'mean', 'std', 'dev'):
         names.extend(f'{kind}__{f}' for f in features)
     return names
+
+
+class Seq3DScaler:
+    """RobustScaler-equivalent for 3D (N, T, F) sequences, with a persistable
+    sklearn-like API (``fit`` / ``transform`` / ``fit_transform``).
+
+    Per-feature median and IQR are computed on the time-flattened training
+    data, so the same statistics scale every step of every sequence. The math
+    is identical to ``return_gate._scale_3d_per_feature`` — a fitted instance
+    is what lets ``consumes_sequences=True`` trainers be promoted (trained on
+    full 3D data) and then scored at inference under the *same* scaling the
+    gate evaluated them under. ``joblib.dump`` round-trips it like the 2D
+    ``RobustScaler`` saved alongside tabular panel models.
+    """
+
+    def __init__(self):
+        self.median_ = None
+        self.iqr_ = None
+
+    def fit(self, X):
+        flat = np.asarray(X).reshape(-1, X.shape[-1])
+        self.median_ = np.median(flat, axis=0)
+        q1 = np.quantile(flat, 0.25, axis=0)
+        q3 = np.quantile(flat, 0.75, axis=0)
+        self.iqr_ = np.where(q3 - q1 > 1e-9, q3 - q1, 1.0)
+        return self
+
+    def transform(self, X):
+        if self.median_ is None:
+            raise RuntimeError('Seq3DScaler.transform called before fit')
+        return (np.asarray(X) - self.median_) / self.iqr_
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
