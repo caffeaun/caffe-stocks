@@ -274,6 +274,27 @@ def re_promote():
     print(f'  promote_panel exit={r.returncode}', flush=True)
 
 
+def run_oracle():
+    """Final step (Part B bridge): selection-headroom oracle against the best
+    honest model this run produced — its windows-passed vs the perfect-foresight
+    ceiling. Runs while the lock is still held (no loop contention)."""
+    print('\n=== Oracle upper-bound vs best honest model ===', flush=True)
+    with fb.get_conn() as conn:
+        row = conn.execute(
+            'SELECT id, trainer, windows_passed FROM iterations '
+            'WHERE contaminated=0 AND total_trades>0 '
+            'ORDER BY windows_passed DESC, avg_annualized_return DESC LIMIT 1'
+        ).fetchone()
+    cmd = [sys.executable, str(BASE / 'scripts' / 'oracle_upperbound.py')]
+    if row:
+        print(f"  best honest model: iter #{row['id']} {row['trainer']} "
+              f"(wp={row['windows_passed']})", flush=True)
+        cmd += ['--iter', str(row['id'])]
+    else:
+        print('  no honest model found — running model-free ceiling only', flush=True)
+    subprocess.run(cmd, cwd=str(BASE))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--deadline-hours', type=float, default=9.0,
@@ -287,6 +308,7 @@ def main():
                    help='Limit Tier A to first N trainers (testing)')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--no-promote', action='store_true')
+    p.add_argument('--no-oracle', action='store_true')
     args = p.parse_args()
 
     fd = acquire_lock(LOCK_PATH)
@@ -338,6 +360,9 @@ def main():
         print(f'  honest gate passes (all-time clean): {honest_passes}', flush=True)
         print(f'  best clean windows_passed: {best_wp}', flush=True)
         print(f'  passes found this run: {total_pass}', flush=True)
+
+        if not args.no_oracle:
+            run_oracle()
     finally:
         release_lock(fd)
 
