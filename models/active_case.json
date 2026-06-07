@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Iter #2018 refuted dropout 0.10\u21920.20 as a single lever (avg_ann +18.7%\u2192+8.7%, W6 +105%\u2192+22% jackpot damage, W3 collapsed +36%\u2192-27%, W5 worse -39%\u2192-55%). The W7 alive thr=0.4 sweep IS the only positive datapoint (+75.5% ann, 45.8% WR \u2014 18pp shy of brutal 63% floor) \u2014 preserve it. Per [[fastkan-pos-weight-2-regresses]] one-at-a-time discipline, train mode should now pivot to the OTHER recommended levers from [[gated-delta-net-w6-jackpot]]: (a) pos_weight \u2208 [1.6, 1.8] (do NOT exceed 1.8 per [[timesfm-pos-weight-2-regresses]]), and (c) num_layers=1. Also try lr \u2208 [3e-4, 1e-3]. Pin dropout=0.10 (refuted at 0.20), hidden_dim=192, num_heads=4, weight_decay=1e-4, batch_size=512, epochs=8, grad_clip=1.0. Target: extend the W7 alive sweep AND restore W6 magnitude without re-touching the dropout lever.",
-  "claude_iter_id": 2250,
-  "designated_at": "2026-06-07T18:09:59"
+  "rationale": "Two depth points now exist (num_layers=1 \u2192 W7 +271%, num_layers=2 \u2192 W6 +105%); train mode should sweep (num_layers, pos_weight) JOINTLY in this iteration's HP space to map which depth \u00d7 pos_weight combo unlocks both jackpot windows simultaneously. Dropout pinned at 0.10 per [[gated-delta-net-dropout-02-regresses]].",
+  "claude_iter_id": 2251,
+  "designated_at": "2026-06-08T00:05:58"
 }
