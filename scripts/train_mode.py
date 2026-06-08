@@ -63,8 +63,14 @@ def release_lock(fd):
 
 
 def run_one_config(trainer_name, hp, X_tab, y, dates, symbols, pnl, hold_days,
-                    agg_features, verbose=False):
-    """Run one config across all calendar splits and return aggregate result."""
+                    agg_features, verbose=False, X_seq=None):
+    """Run one config across all calendar splits and return aggregate result.
+
+    X_seq (the raw 3D sequence) MUST be threaded so consumes_sequences trainers
+    (torch_moirai2, ttm, toto2, fastkan, …) evaluate instead of raising
+    "X_seq was not threaded" — otherwise train_mode silently fails every config
+    whenever active_case points at a sequence trainer.
+    """
     started_at = datetime.now().isoformat()
     t0 = time.time()
     results = []
@@ -73,7 +79,7 @@ def run_one_config(trainer_name, hp, X_tab, y, dates, symbols, pnl, hold_days,
             X_tab, y, dates, symbols, pnl, hold_days, agg_features,
             tr_s, tr_e, te_s, te_e,
             trainer_name, dict(hp),  # copy — evaluate_window reads only
-            verbose=verbose)
+            verbose=verbose, X_seq=X_seq)
         results.append(r)
     elapsed = time.time() - t0
 
@@ -171,7 +177,7 @@ def main():
             try:
                 gate_result, started, finished, elapsed = run_one_config(
                     args.trainer, hp, X_tab, y, dates, symbols, pnl, hold_days,
-                    agg_features, verbose=args.verbose)
+                    agg_features, verbose=args.verbose, X_seq=X)
             except Exception as e:
                 print(f'  ✗ failed: {e!r}')
                 continue
