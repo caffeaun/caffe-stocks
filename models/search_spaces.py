@@ -1678,6 +1678,17 @@ SEARCH_SPACES: dict[str, dict] = {
     'max_samples_query':    [256, 512, 1024],
     'seed':                 [7, 13, 17, 23],
 },
+    'torch_graph_attention': {
+    'hidden_dim':     [64, 128, 256],
+    'num_layers':     [2, 3],
+    'n_heads':        [2, 4, 8],
+    'dropout':        (0.10, 0.40),
+    'k_neighbors':    [8, 15, 25, 40],
+    'lr':             (5e-4, 5e-3),
+    'weight_decay':   (1e-5, 5e-3),
+    'epochs':         [15, 20, 30],
+    'pos_weight':     (1.0, 1.5),
+},
 }
 
 

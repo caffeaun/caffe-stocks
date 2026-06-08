@@ -18213,6 +18213,165 @@ class TorchMitraTrainer(BaseTrainer):
             json.dump(meta, f, indent=2, default=str)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.neighbors import NearestNeighbors
+
+
+class _StockGATModule(nn.Module):
+    def __init__(self, in_dim, hidden_dim, num_layers, n_heads, dropout):
+        super().__init__()
+        from torch_geometric.nn import GATConv
+        self.dropout = dropout
+        self.layers = nn.ModuleList()
+        self.layers.append(GATConv(in_dim, hidden_dim, heads=n_heads, dropout=dropout))
+        for _ in range(max(num_layers - 2, 0)):
+            self.layers.append(
+                GATConv(hidden_dim * n_heads, hidden_dim, heads=n_heads, dropout=dropout)
+            )
+        self.head = GATConv(hidden_dim * n_heads, 1, heads=1, concat=False, dropout=dropout)
+
+    def forward(self, x, edge_index):
+        for layer in self.layers:
+            x = F.elu(layer(x, edge_index))
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.head(x, edge_index)
+
+
+class TorchGraphAttentionTrainer(BaseTrainer):
+    name = 'torch_graph_attention'
+    consumes_sequences = False
+
+    def __init__(self,
+                 hidden_dim=128,
+                 num_layers=2,
+                 n_heads=4,
+                 dropout=0.20,
+                 k_neighbors=15,
+                 lr=1e-3,
+                 weight_decay=1e-4,
+                 epochs=20,
+                 pos_weight=1.5,
+                 max_graph_size=40000,
+                 random_state=42,
+                 **kwargs):
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.n_heads = int(n_heads)
+        self.dropout = float(dropout)
+        self.k_neighbors = int(k_neighbors)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.epochs = int(epochs)
+        self.pos_weight = float(pos_weight)
+        self.max_graph_size = int(max_graph_size)
+        self.random_state = int(random_state)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.feat_mean = None
+        self.feat_std = None
+
+    def _knn_edge_index(self, X):
+        k = min(self.k_neighbors + 1, X.shape[0])
+        nn_idx = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(X)
+        _, indices = nn_idx.kneighbors(X)
+        kk = indices.shape[1] - 1
+        if kk < 1:
+            return torch.zeros((2, 0), dtype=torch.long)
+        src = np.repeat(np.arange(X.shape[0]), kk)
+        dst = indices[:, 1:].reshape(-1)
+        ei = np.stack([src, dst])
+        ei = np.concatenate([ei, ei[::-1]], axis=1)
+        return torch.as_tensor(ei, dtype=torch.long)
+
+    def _normalize(self, X, fit=False):
+        X = np.asarray(X, dtype=np.float32)
+        if fit:
+            self.feat_mean = X.mean(axis=0)
+            self.feat_std = X.std(axis=0) + 1e-6
+        return ((X - self.feat_mean) / self.feat_std).astype(np.float32)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        X_tr = self._normalize(X_tr, fit=True)
+        y_tr = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+
+        if X_tr.shape[0] > self.max_graph_size:
+            rng = np.random.default_rng(self.random_state)
+            keep = rng.choice(X_tr.shape[0], self.max_graph_size, replace=False)
+            X_tr = X_tr[keep]
+            y_tr = y_tr[keep]
+
+        edge_index = self._knn_edge_index(X_tr).to(self.device)
+        x = torch.as_tensor(X_tr, dtype=torch.float32, device=self.device)
+        y = torch.as_tensor(y_tr, dtype=torch.float32, device=self.device)
+
+        self.model = _StockGATModule(
+            in_dim=X_tr.shape[1],
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_layers,
+            n_heads=self.n_heads,
+            dropout=self.dropout,
+        ).to(self.device)
+
+        opt = torch.optim.AdamW(
+            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+        )
+        criterion = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([self.pos_weight], device=self.device),
+        )
+
+        self.model.train()
+        for _ in range(self.epochs):
+            opt.zero_grad()
+            logits = self.model(x, edge_index).squeeze(-1)
+            loss = criterion(logits, y)
+            loss.backward()
+            opt.step()
+        return self
+
+    def predict_proba(self, X):
+        X = self._normalize(X, fit=False)
+        edge_index = self._knn_edge_index(X).to(self.device)
+        x = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(x, edge_index).squeeze(-1)
+            probs = torch.sigmoid(logits).cpu().numpy()
+        return probs.astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(self.model.state_dict(), os.path.join(model_dir, 'model.pt'))
+        np.savez(
+            os.path.join(model_dir, 'norm.npz'),
+            mean=self.feat_mean, std=self.feat_std,
+        )
+        cfg = {
+            'hidden_dim': self.hidden_dim,
+            'num_layers': self.num_layers,
+            'n_heads': self.n_heads,
+            'dropout': self.dropout,
+            'k_neighbors': self.k_neighbors,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            'epochs': self.epochs,
+            'pos_weight': self.pos_weight,
+            'max_graph_size': self.max_graph_size,
+        }
+        if extra:
+            cfg.update(extra)
+        with open(os.path.join(model_dir, 'config.json'), 'w') as f:
+            json.dump(cfg, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -18288,6 +18447,7 @@ TRAINERS = {
     'torch_moirai2': TorchMoirai2Trainer,
     'torch_gated_delta_net': TorchGatedDeltaNetTrainer,
     'torch_mitra': TorchMitraTrainer,
+    'torch_graph_attention': TorchGraphAttentionTrainer,
 }
 
 
