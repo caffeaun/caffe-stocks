@@ -18060,6 +18060,159 @@ class TorchGatedDeltaNetTrainer(BaseTrainer):
             torch.save(self.model.state_dict(), os.path.join(model_dir, 'model.pt'))
 
 
+# --------------------------------------------------------------------- #
+# Mitra Tabular Foundation Model (AutoGluon)
+# Per research brief 2026-06-08: mixture-of-random-classifiers synthetic
+# prior; orthogonal to TabPFN's SCM prior, TabICL's real-data slices, and
+# TabDPT's deep-packed transformer prior. ICL with optional fine-tune.
+# --------------------------------------------------------------------- #
+try:
+    from autogluon.tabular.models.mitra.sklearn_interface import (
+        MitraClassifier as _MitraClassifier,
+    )
+    _HAS_MITRA = True
+except Exception:
+    _HAS_MITRA = False
+
+
+class TorchMitraTrainer(BaseTrainer):
+    """Mitra tabular foundation model (AutoGluon, 2025-2026).
+
+    12-layer transformer pretrained on a mixture-of-random-classifiers
+    synthetic prior — a different inductive bias than TabPFN's SCM prior
+    or TabICL's real-data slicing prior. Used here in fine-tune mode over
+    a stratified context-window of the per-fold training set.
+    """
+
+    name = 'torch_mitra'
+    consumes_sequences = False
+
+    def __init__(self,
+                 fine_tune: bool = True,
+                 fine_tune_steps: int = 30,
+                 n_estimators: int = 1,
+                 ctx_subsample: int = 8192,
+                 max_samples_support: int = 1024,
+                 max_samples_query: int = 512,
+                 seed: int = 17,
+                 hf_model: str = 'autogluon/mitra-classifier',
+                 **_):
+        if not _HAS_MITRA:
+            raise ImportError(
+                "autogluon.tabular[mitra] not installed; pip install "
+                "autogluon.tabular and its mitra deps (einx, loguru, "
+                "autogluon.common, autogluon.core)."
+            )
+        self.fine_tune = bool(fine_tune)
+        self.fine_tune_steps = int(fine_tune_steps)
+        self.n_estimators = int(n_estimators)
+        self.ctx_subsample = int(ctx_subsample)
+        # MitraClassifier hard-codes max_samples_support=8192 in _create_config
+        # and OOMs on this box's single GPU, retrying ×3 down to 1024 (5 min
+        # of wasted compute per fold). Pin upfront via _create_config override.
+        self.max_samples_support = int(max_samples_support)
+        self.max_samples_query = int(max_samples_query)
+        self.seed = int(seed)
+        self.hf_model = str(hf_model)
+        self._device = None
+        self.model = None
+
+    def _resolve_device(self):
+        try:
+            import torch as _t
+            return 'cuda' if _t.cuda.is_available() else 'cpu'
+        except Exception:
+            return 'cpu'
+
+    def _sanitize(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        X_tr = self._sanitize(X_tr)
+        y_tr = np.asarray(y_tr).astype(np.int64).ravel()
+        if X_val is not None and y_val is not None:
+            X_val = self._sanitize(X_val)
+            y_val = np.asarray(y_val).astype(np.int64).ravel()
+
+        # Mitra's ICL/fine-tune attention is O(n_ctx^2); above ~10k rows the
+        # latency cliff hits hard. Stratified-subsample to ctx_subsample.
+        if X_tr.shape[0] > self.ctx_subsample:
+            rs = np.random.RandomState(self.seed)
+            pos = np.where(y_tr == 1)[0]
+            neg = np.where(y_tr == 0)[0]
+            n_pos = min(len(pos), self.ctx_subsample // 2)
+            n_neg = min(len(neg), self.ctx_subsample - n_pos)
+            idx = np.concatenate([
+                rs.choice(pos, size=n_pos, replace=False),
+                rs.choice(neg, size=n_neg, replace=False),
+            ])
+            rs.shuffle(idx)
+            X_fit, y_fit = X_tr[idx], y_tr[idx]
+        else:
+            X_fit, y_fit = X_tr, y_tr
+
+        self._device = self._resolve_device()
+        self.model = _MitraClassifier(
+            n_estimators=self.n_estimators,
+            device=self._device,
+            fine_tune=self.fine_tune,
+            fine_tune_steps=self.fine_tune_steps,
+            hf_model=self.hf_model,
+            seed=self.seed,
+            verbose=False,
+        )
+        # Pin support/query to feasible values before fit to skip the OOM
+        # autoscale retry loop in _train_ensemble.
+        _orig_create_config = self.model._create_config
+        _pin_support = self.max_samples_support
+        _pin_query = self.max_samples_query
+
+        def _create_config_pinned(task, dim_output, time_limit):
+            cfg, Tab2D = _orig_create_config(task, dim_output, time_limit)
+            cfg.hyperparams['max_samples_support'] = _pin_support
+            cfg.hyperparams['max_samples_query'] = _pin_query
+            return cfg, Tab2D
+
+        self.model._create_config = _create_config_pinned
+        self.model.fit(X=X_fit, y=y_fit, X_val=X_val, y_val=y_val)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError("TorchMitraTrainer: predict_proba called before fit()")
+        X = self._sanitize(X)
+        proba = self.model.predict_proba(X)
+        proba = np.asarray(proba, dtype=np.float32)
+        if proba.ndim == 2 and proba.shape[1] >= 2:
+            return proba[:, 1]
+        return proba.ravel()
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        try:
+            with open(os.path.join(model_dir, 'mitra_model.pkl'), 'wb') as f:
+                pickle.dump(self.model, f)
+        except Exception:
+            # Mitra's internal torch modules may not pickle cleanly across
+            # devices; meta is still written so the run is traceable.
+            pass
+        meta = {
+            'name': self.name,
+            'fine_tune': self.fine_tune,
+            'fine_tune_steps': self.fine_tune_steps,
+            'n_estimators': self.n_estimators,
+            'ctx_subsample': self.ctx_subsample,
+            'seed': self.seed,
+            'hf_model': self.hf_model,
+            'device': self._device,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2, default=str)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -18134,6 +18287,7 @@ TRAINERS = {
     'tabdpt_v1': TabDPTv1Trainer,
     'torch_moirai2': TorchMoirai2Trainer,
     'torch_gated_delta_net': TorchGatedDeltaNetTrainer,
+    'torch_mitra': TorchMitraTrainer,
 }
 
 

@@ -1669,6 +1669,15 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':        [6, 8, 10, 12],
     'pos_weight':    (1.0, 1.8),
 },
+    'torch_mitra': {
+    'fine_tune':            [True, False],
+    'fine_tune_steps':      [10, 30, 50],
+    'n_estimators':         [1, 3],
+    'ctx_subsample':        [1024, 2048, 4096],
+    'max_samples_support':  [512, 1024, 2048],
+    'max_samples_query':    [256, 512, 1024],
+    'seed':                 [7, 13, 17, 23],
+},
 }
 
 

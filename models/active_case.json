@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_gated_delta_net",
+  "trainer": "kernel_logreg",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Two depth points now exist (num_layers=1 \u2192 W7 +271%, num_layers=2 \u2192 W6 +105%); train mode should sweep (num_layers, pos_weight) JOINTLY in this iteration's HP space to map which depth \u00d7 pos_weight combo unlocks both jackpot windows simultaneously. Dropout pinned at 0.10 per [[gated-delta-net-dropout-02-regresses]].",
-  "claude_iter_id": 2251,
-  "designated_at": "2026-06-08T00:05:58"
+  "rationale": "torch_gated_delta_net pivoted away per directive (3 consecutive claude fails); torch_mitra blocked on per-fold wall-time until the OOM-autoscale fix lands in a fresh process and gets a full 30 min. Revert train-mode HP sweep to kernel_logreg \u2014 reproducible 4/7 ceiling at iter #1344 (n_components=300, gamma=0.5, C=3.0, pca=32), 'calibrate' axis unswept, richest non-FM HP surface in registry.",
+  "claude_iter_id": 2307,
+  "designated_at": "2026-06-08T12:46:24"
 }
