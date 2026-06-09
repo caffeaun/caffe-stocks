@@ -30,6 +30,11 @@ import pandas as pd
 BASE = Path(os.path.expanduser('~/projects/caffe-stocks'))
 sys.path.insert(0, str(BASE))
 
+# Inference runs on GPU 1 (GPU 0 is reserved for the training sweep). Set
+# before any `from models.trainers import …` so it wins over that module's
+# GPU-0 default. setdefault → an explicit outer CUDA_VISIBLE_DEVICES still wins.
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '1')
+
 DB_PATH = BASE / 'data' / 'candles.db'
 FB_DB_PATH = BASE / 'data' / 'ml-feedback.db'
 STATUS_FILE = BASE / 'data' / 'system-status.json'

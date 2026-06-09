@@ -31,6 +31,11 @@ from pathlib import Path
 BASE = Path(os.path.expanduser('~/projects/caffe-stocks'))
 sys.path.insert(0, str(BASE))
 
+# Weekly panel retrain runs on GPU 1 (the inference GPU) — GPU 0 is the
+# daytime-only training sweep, shared with other projects. Set before the
+# `from models.trainers …` import so it wins over that module's GPU-0 default.
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '1')
+
 import numpy as np
 from sklearn.preprocessing import RobustScaler
 

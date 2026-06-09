@@ -5,6 +5,10 @@ LOGFILE="$HOME/projects/caffe-stocks/logs/signal-scan.log"
 PYTHON="$HOME/projects/caffe-stocks/venv/bin/python"
 SCRIPT="$HOME/projects/caffe-stocks/scripts/signal_generator.py"
 
+# GPU 1 is the inference GPU (GPU 0 is reserved for the training sweep).
+# Set before python starts so it wins over trainers.py's GPU-0 default.
+export CUDA_VISIBLE_DEVICES=1
+
 # Telegram config
 source "$HOME/kanoonth/scripts/telegram.conf"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN//\"/}"

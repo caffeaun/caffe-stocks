@@ -23,6 +23,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.expanduser('~/projects/caffe-stocks'))
 
+# Weekly vault retrain runs on GPU 1 (the inference GPU) — GPU 0 is the
+# daytime-only training sweep. Set before importing return_gate/trainers so
+# it wins over their GPU-0 default. setdefault → an explicit override wins.
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '1')
+
 from models.sequence_loader import (
     load_sequences, aggregate_sequence, aggregated_feature_names,
 )

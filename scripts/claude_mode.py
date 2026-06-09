@@ -340,6 +340,24 @@ def main():
         timeout=30,
     ).decode()
 
+    # Compute constraint (2026-06-09): the local GPUs are off-limits to
+    # claude_mode — GPU 0 is the daytime training sweep, GPU 1 is inference.
+    # ml_loop.sh hides CUDA (CUDA_VISIBLE_DEVICES='') and sets ML_FORCE_MODAL=1,
+    # so any local torch run falls back to (far too slow) CPU. Tell the agent
+    # to offload real training/GPU-eval to modal.com instead.
+    if os.environ.get('ML_FORCE_MODAL') == '1':
+        prompt += (
+            "\n\n## Compute constraint (this run)\n"
+            "The local GPUs are OFF-LIMITS this run: GPU 0 is the daytime "
+            "training sweep, GPU 1 is inference. CUDA is hidden "
+            "(`CUDA_VISIBLE_DEVICES=''`), so any local torch run falls back to "
+            "CPU and will be far too slow to finish inside the wall-time. If "
+            "you need to TRAIN or GPU-evaluate a model, route it through "
+            "modal.com (`scripts/modal_runner.py`, `use_modal=True`), NOT the "
+            "local machine. CPU-only smoke tests (imports, tiny fits, gate "
+            "wiring) are fine.\n"
+        )
+
     ts = datetime.now().strftime('%Y%m%d-%H%M%S')
     prompt_path = LOG_DIR / f'claude-prompt-{ts}.txt'
     prompt_path.write_text(prompt)
