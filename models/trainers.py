@@ -18257,7 +18257,7 @@ class TorchGraphAttentionTrainer(BaseTrainer):
                  weight_decay=1e-4,
                  epochs=20,
                  pos_weight=1.5,
-                 max_graph_size=40000,
+                 max_graph_size=12000,
                  random_state=42,
                  **kwargs):
         self.hidden_dim = int(hidden_dim)
@@ -18277,13 +18277,28 @@ class TorchGraphAttentionTrainer(BaseTrainer):
         self.feat_std = None
 
     def _knn_edge_index(self, X):
-        k = min(self.k_neighbors + 1, X.shape[0])
-        nn_idx = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(X)
-        _, indices = nn_idx.kneighbors(X)
+        # Chunked brute-force kNN on GPU when available (else CPU). sklearn
+        # ball_tree at ~100-dim is O(N^1.5) in time — 4 min on N=56k; brute
+        # force on GPU is < 5 s. cdist memory per chunk: chunk_size * N * 4
+        # bytes; with chunk_size=2048 and N=60k that's ~0.5 GB per chunk.
+        k = int(min(self.k_neighbors + 1, X.shape[0]))
+        if k < 2:
+            return torch.zeros((2, 0), dtype=torch.long)
+        x_t = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        n = x_t.shape[0]
+        chunk = 2048
+        idx_chunks = []
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            d = torch.cdist(x_t[start:end], x_t)
+            _, idx = torch.topk(d, k=k, dim=1, largest=False)
+            idx_chunks.append(idx.cpu())
+            del d, idx
+        indices = torch.cat(idx_chunks, dim=0).numpy()
         kk = indices.shape[1] - 1
         if kk < 1:
             return torch.zeros((2, 0), dtype=torch.long)
-        src = np.repeat(np.arange(X.shape[0]), kk)
+        src = np.repeat(np.arange(n), kk)
         dst = indices[:, 1:].reshape(-1)
         ei = np.stack([src, dst])
         ei = np.concatenate([ei, ei[::-1]], axis=1)
