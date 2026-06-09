@@ -1689,6 +1689,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':         [15, 20, 30],
     'pos_weight':     (1.0, 1.5),
 },
+    'torch_ncde': {
+    'hidden_channels':  [8, 16, 32],
+    'mlp_hidden':       [64, 128, 256],
+    'dropout':          (0.0, 0.3),
+    'learning_rate':    (1e-4, 5e-3),
+    'weight_decay':     (1e-6, 1e-3),
+    'epochs':           [20, 30, 50],
+    'batch_size':       [128, 256, 512],
+    'ode_method':       ['euler', 'rk4'],
+    'ode_step_size':    [0.5, 1.0, 2.0],
+    'pos_weight':       (1.0, 2.0),
+    'interpolation':    ['hermite', 'linear'],
+    'early_stop_patience': [3, 5, 8],
+},
 }
 
 

@@ -18387,6 +18387,251 @@ class TorchGraphAttentionTrainer(BaseTrainer):
             json.dump(cfg, f, indent=2)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+try:
+    import torchcde
+    _TORCHCDE_AVAILABLE = True
+except Exception:
+    _TORCHCDE_AVAILABLE = False
+
+
+class _NCDEFunc(nn.Module):
+    """Vector field f: hidden_channels -> hidden_channels x input_channels."""
+    def __init__(self, input_channels: int, hidden_channels: int, mlp_hidden: int, dropout: float):
+        super().__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.net = nn.Sequential(
+            nn.Linear(hidden_channels, mlp_hidden),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, mlp_hidden),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, hidden_channels * input_channels),
+        )
+
+    def forward(self, t, z):
+        out = self.net(z)
+        out = torch.tanh(out)  # bounded vector field — improves ODE stability
+        return out.view(-1, self.hidden_channels, self.input_channels)
+
+
+class _NCDEModel(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int, mlp_hidden: int, dropout: float):
+        super().__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.initial = nn.Linear(input_channels, hidden_channels)
+        self.func = _NCDEFunc(input_channels, hidden_channels, mlp_hidden, dropout)
+        self.readout = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, 1),
+        )
+
+    def forward(self, coeffs, method: str = 'euler', step_size: float = 1.0):
+        X = torchcde.CubicSpline(coeffs)
+        z0 = self.initial(X.evaluate(X.interval[0]))
+        z_T = torchcde.cdeint(
+            X=X,
+            func=self.func,
+            z0=z0,
+            t=X.interval,
+            method=method,
+            options={'step_size': step_size} if method == 'euler' else None,
+        )
+        z_terminal = z_T[:, -1]
+        return self.readout(z_terminal).squeeze(-1)
+
+
+class TorchNCDETrainer(BaseTrainer):
+    name = 'torch_ncde'
+    consumes_sequences = True  # asks pipeline for (N, L, C) sequence tensor
+
+    def __init__(
+        self,
+        hidden_channels: int = 16,
+        mlp_hidden: int = 128,
+        dropout: float = 0.15,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-5,
+        epochs: int = 30,
+        batch_size: int = 256,
+        ode_method: str = 'euler',
+        ode_step_size: float = 1.0,
+        pos_weight: float = 1.5,
+        interpolation: str = 'hermite',  # 'hermite' | 'linear'
+        early_stop_patience: int = 5,
+        device: str = None,
+        **kwargs,
+    ):
+        if not _TORCHCDE_AVAILABLE:
+            raise ImportError('torchcde not installed — pip install torchcde')
+        self.hidden_channels = int(hidden_channels)
+        self.mlp_hidden = int(mlp_hidden)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.ode_method = str(ode_method)
+        self.ode_step_size = float(ode_step_size)
+        self.pos_weight = float(pos_weight)
+        self.interpolation = str(interpolation)
+        self.early_stop_patience = int(early_stop_patience)
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_ = None
+        self.input_channels_ = None
+        self.scaler_mean_ = None
+        self.scaler_std_ = None
+
+    @staticmethod
+    def _attach_time_channel(seq: np.ndarray) -> np.ndarray:
+        # seq: (N, L, C) -> (N, L, C+1) with channel 0 = normalized time index in [0, 1]
+        N, L, C = seq.shape
+        t = np.linspace(0.0, 1.0, L, dtype=np.float32).reshape(1, L, 1)
+        t = np.broadcast_to(t, (N, L, 1))
+        return np.concatenate([t, seq.astype(np.float32, copy=False)], axis=-1)
+
+    def _fit_scaler(self, seq: np.ndarray):
+        # Standardize per-channel across (N, L) — exclude time channel 0
+        flat = seq.reshape(-1, seq.shape[-1])
+        mean = flat.mean(axis=0)
+        std = flat.std(axis=0) + 1e-6
+        mean[0] = 0.0
+        std[0] = 1.0
+        self.scaler_mean_ = mean.astype(np.float32)
+        self.scaler_std_ = std.astype(np.float32)
+
+    def _apply_scaler(self, seq: np.ndarray) -> np.ndarray:
+        return (seq - self.scaler_mean_) / self.scaler_std_
+
+    def _coeffs(self, seq: np.ndarray) -> torch.Tensor:
+        x = torch.tensor(seq, dtype=torch.float32)
+        if self.interpolation == 'linear':
+            return torchcde.linear_interpolation_coeffs(x)
+        return torchcde.hermite_cubic_coefficients_with_backward_differences(x)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        # X_tr expected as (N, L, C) sequence tensor when consumes_sequences=True
+        X_tr = np.asarray(X_tr, dtype=np.float32)
+        X_val = np.asarray(X_val, dtype=np.float32)
+        y_tr = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        y_val = np.asarray(y_val, dtype=np.float32).reshape(-1)
+
+        X_tr = self._attach_time_channel(X_tr)
+        X_val = self._attach_time_channel(X_val)
+        self._fit_scaler(X_tr)
+        X_tr = self._apply_scaler(X_tr)
+        X_val = self._apply_scaler(X_val)
+
+        self.input_channels_ = X_tr.shape[-1]
+        coeffs_tr = self._coeffs(X_tr)
+        coeffs_val = self._coeffs(X_val)
+        y_tr_t = torch.tensor(y_tr, dtype=torch.float32)
+        y_val_t = torch.tensor(y_val, dtype=torch.float32)
+
+        self.model_ = _NCDEModel(
+            input_channels=self.input_channels_,
+            hidden_channels=self.hidden_channels,
+            mlp_hidden=self.mlp_hidden,
+            dropout=self.dropout,
+        ).to(self.device)
+
+        opt = torch.optim.AdamW(
+            self.model_.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        pos_weight_t = torch.tensor([self.pos_weight], dtype=torch.float32, device=self.device)
+        bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+
+        n = coeffs_tr.shape[0]
+        best_val = float('inf')
+        patience = 0
+        best_state = None
+        for epoch in range(self.epochs):
+            self.model_.train()
+            perm = torch.randperm(n)
+            losses = []
+            for i in range(0, n, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                cb = coeffs_tr[idx].to(self.device)
+                yb = y_tr_t[idx].to(self.device)
+                logits = self.model_(cb, method=self.ode_method, step_size=self.ode_step_size)
+                loss = bce(logits, yb)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model_.parameters(), 1.0)
+                opt.step()
+                losses.append(float(loss.detach().cpu()))
+
+            # Validation
+            self.model_.eval()
+            with torch.no_grad():
+                vl = []
+                for i in range(0, coeffs_val.shape[0], self.batch_size):
+                    cb = coeffs_val[i:i + self.batch_size].to(self.device)
+                    yb = y_val_t[i:i + self.batch_size].to(self.device)
+                    logits = self.model_(cb, method=self.ode_method, step_size=self.ode_step_size)
+                    vl.append(float(bce(logits, yb).cpu()))
+                val_loss = float(np.mean(vl)) if vl else 0.0
+
+            if val_loss < best_val - 1e-4:
+                best_val = val_loss
+                patience = 0
+                best_state = {k: v.detach().cpu().clone() for k, v in self.model_.state_dict().items()}
+            else:
+                patience += 1
+                if patience >= self.early_stop_patience:
+                    break
+
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32)
+        X = self._attach_time_channel(X)
+        X = self._apply_scaler(X)
+        coeffs = self._coeffs(X)
+        self.model_.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, coeffs.shape[0], self.batch_size):
+                cb = coeffs[i:i + self.batch_size].to(self.device)
+                logits = self.model_(cb, method=self.ode_method, step_size=self.ode_step_size)
+                out.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(out, axis=0).reshape(-1)
+
+    def save(self, model_dir, extra=None):
+        import os, json
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(self.model_.state_dict(), os.path.join(model_dir, 'ncde_state.pt'))
+        meta = {
+            'hidden_channels': self.hidden_channels,
+            'mlp_hidden': self.mlp_hidden,
+            'dropout': self.dropout,
+            'ode_method': self.ode_method,
+            'ode_step_size': self.ode_step_size,
+            'interpolation': self.interpolation,
+            'input_channels_': self.input_channels_,
+            'scaler_mean_': self.scaler_mean_.tolist() if self.scaler_mean_ is not None else None,
+            'scaler_std_': self.scaler_std_.tolist() if self.scaler_std_ is not None else None,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'ncde_meta.json'), 'w') as f:
+            json.dump(meta, f)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -18463,6 +18708,7 @@ TRAINERS = {
     'torch_gated_delta_net': TorchGatedDeltaNetTrainer,
     'torch_mitra': TorchMitraTrainer,
     'torch_graph_attention': TorchGraphAttentionTrainer,
+    'torch_ncde': TorchNCDETrainer,
 }
 
 
