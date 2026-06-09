@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First-shot GAT default-HPs is alive on 4/7 windows with positive ann on W1 (+12.7%) and W7 (+13.4%); brief's stated next sweep is (k_neighbors, dropout, n_heads) jointly to lift WR \u2014 kNN smoothing alpha is the load-bearing knob and HP-search can address the WR-floor gap without architectural change.",
-  "claude_iter_id": 2414,
-  "designated_at": "2026-06-09T12:04:17"
+  "rationale": "Single-lever k_neighbors 15\u21928 nudge REGRESSED (avg_ann -6.6%\u2192-24.9%, total_trades 259\u2192211, max_dd 17%\u219219%) \u2014 refutes 'smaller k = sharper' direction. W7 still the only alive window (+55.7% ann, 46.2% WR thr=0.0, 16.8pp shy of 63% floor). Train mode should pivot direction to LARGER k (\u2208 {25, 40}) plus pos_weight \u2208 [1.0, 1.3] to test whether wider smoothing + less positive-class bias lifts WR. Single-lever rule: sweep k first while pinning others at default.",
+  "claude_iter_id": 2438,
+  "designated_at": "2026-06-10T00:07:56"
 }
