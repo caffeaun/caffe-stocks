@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_graph_attention",
+  "trainer": "torch_ncde",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Single-lever k_neighbors 15\u21928 nudge REGRESSED (avg_ann -6.6%\u2192-24.9%, total_trades 259\u2192211, max_dd 17%\u219219%) \u2014 refutes 'smaller k = sharper' direction. W7 still the only alive window (+55.7% ann, 46.2% WR thr=0.0, 16.8pp shy of 63% floor). Train mode should pivot direction to LARGER k (\u2208 {25, 40}) plus pos_weight \u2208 [1.0, 1.3] to test whether wider smoothing + less positive-class bias lifts WR. Single-lever rule: sweep k first while pinning others at default.",
-  "claude_iter_id": 2438,
-  "designated_at": "2026-06-10T00:07:56"
+  "rationale": "First NCDE attempt: 0/7 wp but avg_ann -0.8% beats both baselines (random_topk -30%, rule_only -28%), W7 thr=0.3 ann=+123.5%/WR 58.8% on n=17 (3 trades shy of 20-count floor + 4.2pp shy of 63% WR floor), W1 alive sweep 45.8% WR (3.9pp shy). Train mode should single-lever-sweep pos_weight \u2208 [1.0, 1.3] first to push more W7 trades over the count floor without flooding lower-floor windows, then learning_rate \u2208 [3e-4, 3e-3], then ode_step_size=0.5 (densify ODE solver \u2014 currently 1-step Euler over [0,1]). Pin (hidden_channels=16, mlp_hidden=128, dropout=0.15, batch=512, epochs=20, patience=3, interpolation='hermite'). Continuous-time inductive bias slot preserved like fastkan/kernel_logreg/knn \u2014 first family using ODE solver.",
+  "claude_iter_id": 2484,
+  "designated_at": "2026-06-10T18:10:16"
 }
