@@ -1703,6 +1703,19 @@ SEARCH_SPACES: dict[str, dict] = {
     'interpolation':    ['hermite', 'linear'],
     'early_stop_patience': [3, 5, 8],
 },
+    'torch_tabr': {
+    'hidden_dim':       [128, 192, 256],
+    'n_blocks':         [2, 3],
+    'k_context':        [32, 64, 96, 128],
+    'dropout':          [0.05, 0.10, 0.20],
+    'lr':               (3e-4, 3e-3),
+    'weight_decay':     (1e-5, 1e-3),
+    'epochs':           [15, 25, 40],
+    'batch_size':       [512, 1024, 2048],
+    'pos_weight':       [1.0, 1.3, 1.5],
+    'sim_temperature':  [0.5, 1.0, 1.5, 2.0],
+    'label_emb_dim':    [4, 8, 16],
+},
 }
 
 

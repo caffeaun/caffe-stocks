@@ -18632,6 +18632,185 @@ class TorchNCDETrainer(BaseTrainer):
             json.dump(meta, f)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import faiss
+from sklearn.preprocessing import StandardScaler
+
+
+class _TabREncoder(nn.Module):
+    def __init__(self, in_dim, hidden_dim, n_blocks, dropout):
+        super().__init__()
+        blocks = []
+        prev = in_dim
+        for _ in range(n_blocks):
+            blocks.append(nn.Linear(prev, hidden_dim))
+            blocks.append(nn.ReLU())
+            blocks.append(nn.Dropout(dropout))
+            prev = hidden_dim
+        self.net = nn.Sequential(*blocks)
+
+    def forward(self, x):
+        z = self.net(x)
+        return F.normalize(z, dim=-1)
+
+
+class _TabRRetrievalHead(nn.Module):
+    def __init__(self, embed_dim, label_emb_dim, dropout):
+        super().__init__()
+        self.label_emb = nn.Embedding(2, label_emb_dim)
+        self.ctx_proj = nn.Linear(embed_dim + label_emb_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, 1),
+        )
+
+    def forward(self, q_emb, ctx_emb, ctx_y, sims):
+        # q_emb: (B,D); ctx_emb: (B,K,D); ctx_y: (B,K) long; sims: (B,K)
+        ctx_le = self.label_emb(ctx_y)
+        ctx_v = self.ctx_proj(torch.cat([ctx_emb, ctx_le], dim=-1))
+        w = F.softmax(sims, dim=-1).unsqueeze(-1)
+        agg = (ctx_v * w).sum(dim=1)
+        q = self.q_proj(q_emb)
+        return self.head(torch.cat([q, agg], dim=-1)).squeeze(-1)
+
+
+class TorchTabRTrainer(BaseTrainer):
+    name = 'torch_tabr'
+    consumes_sequences = False
+
+    def __init__(self, hidden_dim=192, n_blocks=2, k_context=96,
+                 dropout=0.10, lr=1e-3, weight_decay=1e-4, epochs=25,
+                 batch_size=1024, pos_weight=1.0, label_emb_dim=8,
+                 sim_temperature=1.0, seed=42, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden_dim = int(hidden_dim)
+        self.n_blocks = int(n_blocks)
+        self.k_context = int(k_context)
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.pos_weight = float(pos_weight)
+        self.label_emb_dim = int(label_emb_dim)
+        self.sim_temperature = float(sim_temperature)
+        self.seed = int(seed)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        self.scaler = StandardScaler().fit(X_tr)
+        Xt = self.scaler.transform(X_tr).astype(np.float32)
+        yt = np.asarray(y_tr, dtype=np.int64)
+        in_dim = Xt.shape[1]
+
+        self.encoder = _TabREncoder(in_dim, self.hidden_dim, self.n_blocks, self.dropout).to(device)
+        self.head_net = _TabRRetrievalHead(self.hidden_dim, self.label_emb_dim, self.dropout).to(device)
+
+        params = list(self.encoder.parameters()) + list(self.head_net.parameters())
+        opt = torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        pw = torch.tensor([self.pos_weight], device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+
+        Xt_t = torch.from_numpy(Xt).to(device)
+        yt_t = torch.from_numpy(yt).to(device)
+        N = Xt.shape[0]
+
+        for epoch in range(self.epochs):
+            self.encoder.train(); self.head_net.train()
+            perm = torch.randperm(N, device=device)
+            for i in range(0, N, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                if len(idx) < 16:
+                    continue
+                xb = Xt_t[idx]
+                yb = yt_t[idx]
+                emb = self.encoder(xb)
+                B = emb.size(0)
+                sims = emb @ emb.t() / self.sim_temperature
+                eye = torch.eye(B, dtype=torch.bool, device=device)
+                sims = sims.masked_fill(eye, float('-inf'))
+                k = min(self.k_context, B - 1)
+                top_sims, top_idx = sims.topk(k, dim=-1)
+                ctx_emb = emb[top_idx]
+                ctx_y = yb[top_idx]
+                logits = self.head_net(emb, ctx_emb, ctx_y, top_sims)
+                loss = loss_fn(logits, yb.float())
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        self.encoder.eval()
+        with torch.no_grad():
+            chunks = []
+            for i in range(0, N, 4096):
+                chunks.append(self.encoder(Xt_t[i:i + 4096]).detach().cpu().numpy())
+            self.train_emb = np.concatenate(chunks, axis=0).astype(np.float32)
+        d = self.train_emb.shape[1]
+        self.faiss_index = faiss.IndexFlatIP(d)
+        self.faiss_index.add(self.train_emb)
+        self.train_y = yt
+        self._device = device
+
+    def predict_proba(self, X) -> np.ndarray:
+        device = self._device
+        Xs = self.scaler.transform(X).astype(np.float32)
+        Xs_t = torch.from_numpy(Xs).to(device)
+        probs = np.zeros(Xs.shape[0], dtype=np.float32)
+        bs = 1024
+        self.encoder.eval(); self.head_net.eval()
+        with torch.no_grad():
+            for i in range(0, Xs.shape[0], bs):
+                xb = Xs_t[i:i + bs]
+                emb_t = self.encoder(xb)
+                emb_np = emb_t.detach().cpu().numpy()
+                sims_np, idx_np = self.faiss_index.search(emb_np, self.k_context)
+                ctx_emb_np = self.train_emb[idx_np]
+                ctx_y_np = self.train_y[idx_np]
+                ctx_emb = torch.from_numpy(ctx_emb_np).to(device)
+                ctx_y = torch.from_numpy(ctx_y_np).long().to(device)
+                sims = torch.from_numpy(sims_np).to(device) / self.sim_temperature
+                logits = self.head_net(emb_t, ctx_emb, ctx_y, sims)
+                probs[i:i + bs] = torch.sigmoid(logits).cpu().numpy()
+        return probs
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save({
+            'encoder': self.encoder.state_dict(),
+            'head': self.head_net.state_dict(),
+        }, os.path.join(model_dir, 'tabr_torch.pt'))
+        faiss.write_index(self.faiss_index, os.path.join(model_dir, 'tabr_faiss.bin'))
+        with open(os.path.join(model_dir, 'tabr_meta.pkl'), 'wb') as f:
+            pickle.dump({
+                'scaler': self.scaler,
+                'train_y': self.train_y,
+                'train_emb': self.train_emb,
+                'hyperparams': {
+                    'hidden_dim': self.hidden_dim,
+                    'n_blocks': self.n_blocks,
+                    'k_context': self.k_context,
+                    'dropout': self.dropout,
+                    'label_emb_dim': self.label_emb_dim,
+                    'sim_temperature': self.sim_temperature,
+                    'pos_weight': self.pos_weight,
+                },
+                'extra': extra or {},
+            }, f)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -18709,6 +18888,7 @@ TRAINERS = {
     'torch_mitra': TorchMitraTrainer,
     'torch_graph_attention': TorchGraphAttentionTrainer,
     'torch_ncde': TorchNCDETrainer,
+    'torch_tabr': TorchTabRTrainer,
 }
 
 
