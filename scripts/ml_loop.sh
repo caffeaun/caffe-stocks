@@ -23,6 +23,23 @@ set -uo pipefail
 
 unset CLAUDECODE 2>/dev/null || true
 
+# --- Memory containment (2026-06-11): run the whole loop inside a transient user
+#     cgroup capped at 32G. A runaway trainer (return_gate torch_tabr was seen at
+#     27GB RSS) then gets OOM-killed in its OWN scope instead of dragging the 61GB
+#     host into a global memory-reclaim storm that needs a hard reboot. The `-- true`
+#     probe confirms the user systemd bus is reachable (cron has no XDG_RUNTIME_DIR by
+#     default); if it isn't, we fall through and run unscoped — no regression. ---
+if [ -z "${_MLLOOP_SCOPED:-}" ]; then
+    export _MLLOOP_SCOPED=1
+    : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+    if command -v systemd-run >/dev/null 2>&1 \
+       && systemd-run --user --scope --quiet --collect \
+            -p MemoryMax=32G -p MemorySwapMax=32G -- true >/dev/null 2>&1; then
+        exec systemd-run --user --scope --quiet --collect \
+            -p MemoryMax=32G -p MemorySwapMax=32G -- bash "$0" "$@"
+    fi
+fi
+
 if [ $# -lt 1 ]; then
     echo "Usage: $0 {train|claude|research|panel|status|leaderboard} [args...]" >&2
     exit 1
