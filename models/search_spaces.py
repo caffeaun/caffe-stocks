@@ -1716,6 +1716,24 @@ SEARCH_SPACES: dict[str, dict] = {
     'sim_temperature':  [0.5, 1.0, 1.5, 2.0],
     'label_emb_dim':    [4, 8, 16],
 },
+    'torch_scarf': {
+    'dim_hidden_encoder':   [128, 256, 384],
+    'num_hidden_encoder':   [3, 4, 5],
+    'dim_hidden_head':      [64, 128, 256],
+    'num_hidden_head':      [1, 2, 3],
+    'corruption_rate':      (0.3, 0.7),
+    'dropout':              (0.0, 0.3),
+    'pretrain_epochs':      [10, 25, 40],
+    'finetune_epochs':      [20, 40, 60],
+    'batch_size':           [256, 512, 1024],
+    'lr':                   (3e-4, 5e-3),
+    'finetune_lr_scale':    (0.3, 1.0),
+    'weight_decay':         (1e-5, 1e-3),
+    'ntxent_temperature':   (0.1, 1.0),
+    'pos_weight':           (1.0, 2.0),
+    'cls_hidden':           [64, 128, 256],
+    'freeze_encoder':       [False, True],
+},
 }
 
 

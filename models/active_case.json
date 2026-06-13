@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "torch_tabr first-shot iter #2550 confirms the retrieval-augmented slot (W6 ann +311.4%/wr 42.6% \u2014 biggest W6 magnitude since [[tabdpt-v1-w6-magnitude]] +102%; W7 +82% ann/52.4% wr 4pp shy of 63% floor; W3 +61% ann/44.4% wr 10pp shy of 55% floor). avg_ann +41.0% beats both baselines (random_topk -30%, rule_only -28%) and most recent claude iters. Bear-regime WR floors broken (W1 18.6%, W4 24.0%) \u2014 retrieval pulls noisy similar-volatility patterns mixing winners + losers (avg_win 7-10% vs avg_loss 3.4%). Train mode single-lever sweep order: (1) pos_weight \u2208 {1.0, 1.3, 1.5} FIRST (push WR up on W1/W4 \u2014 both 25pp+ below floor; values from search_spaces.py); (2) k_context \u2208 {32, 64, 128} SECOND (smaller might filter bear-regime noise; 32 = sharper local memory); (3) sim_temperature \u2208 {0.5, 1.5, 2.0} THIRD (attention concentration). Pin (hidden_dim=192, n_blocks=2, epochs=25, batch_size=1024, dropout=0.10) per the single-lever rule from [[fastkan-pos-weight-2-regresses]]. Do NOT touch hidden_dim or n_blocks \u2014 first-shot W6 jackpot is load-bearing.",
-  "claude_iter_id": 2550,
-  "designated_at": "2026-06-11T18:17:09"
+  "rationale": "Keep torch_tabr as the active sweep family. torch_scarf scaffold is in place and instantiates cleanly, but its 2-stage pretrain+finetune workload (even at CPU-friendly HPs: pretrain=10/finetune=20/batch=1024/enc=128x3) did NOT complete a single full gate run within the 30-min wall budget on CPU (CUDA_VISIBLE_DEVICES='' per project_gpu_policy). Process ran at 800-900% CPU for 7+ min before SIGTERM. Designating torch_scarf as active would just stall train_mode against the same wall. torch_tabr W6 +311% / W7 +82% / W3 +61% jackpots from iter #2550 are still the best evidence-backed sweep target; pos_weight \u2208 {1.0, 1.3, 1.5} single-lever order from the prior active_case rationale is unfinished. Re-route torch_scarf via Modal (`use_modal=True` like tabicl_v2) in a follow-up scaffold edit BEFORE designating it active.",
+  "claude_iter_id": 2686,
+  "designated_at": "2026-06-13T18:16:08"
 }

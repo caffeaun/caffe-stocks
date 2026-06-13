@@ -18811,6 +18811,253 @@ class TorchTabRTrainer(BaseTrainer):
             }, f)
 
 
+# --------------------------------------------------------------------- #
+# SCARF — Self-Supervised Contrastive Learning via Random Feature Corruption
+# (Bahri et al., ICLR 2022). Two-stage trainer: contrastive pretrain of an
+# MLP encoder via NT-Xent on (anchor, feature-corrupted view) pairs, then
+# supervised finetune of encoder + head with pos-weighted BCE. The SSL
+# pretrain stage is the new inductive bias the registry was missing —
+# label-noise regularization through unlabeled-feature contrastive views.
+# --------------------------------------------------------------------- #
+from torch.utils.data import DataLoader, TensorDataset as _SCARF_TensorDataset
+
+
+class TorchScarfTrainer(BaseTrainer):
+    name = 'torch_scarf'
+    consumes_sequences = False
+
+    def __init__(self,
+                 dim_hidden_encoder: int = 256,
+                 num_hidden_encoder: int = 4,
+                 dim_hidden_head: int = 128,
+                 num_hidden_head: int = 2,
+                 corruption_rate: float = 0.6,
+                 dropout: float = 0.1,
+                 pretrain_epochs: int = 25,
+                 finetune_epochs: int = 30,
+                 batch_size: int = 512,
+                 lr: float = 1e-3,
+                 finetune_lr_scale: float = 0.5,
+                 weight_decay: float = 1e-4,
+                 ntxent_temperature: float = 0.5,
+                 pos_weight: float = 1.0,
+                 cls_hidden: int = 128,
+                 freeze_encoder: bool = False,
+                 device: str = 'auto',
+                 random_state: int = 42,
+                 **kwargs):
+        self.dim_hidden_encoder = int(dim_hidden_encoder)
+        self.num_hidden_encoder = int(num_hidden_encoder)
+        self.dim_hidden_head = int(dim_hidden_head)
+        self.num_hidden_head = int(num_hidden_head)
+        self.corruption_rate = float(corruption_rate)
+        self.dropout = float(dropout)
+        self.pretrain_epochs = int(pretrain_epochs)
+        self.finetune_epochs = int(finetune_epochs)
+        self.batch_size = int(batch_size)
+        self.lr = float(lr)
+        self.finetune_lr_scale = float(finetune_lr_scale)
+        self.weight_decay = float(weight_decay)
+        self.ntxent_temperature = float(ntxent_temperature)
+        self.pos_weight = float(pos_weight)
+        self.cls_hidden = int(cls_hidden)
+        self.freeze_encoder = bool(freeze_encoder)
+        self.random_state = int(random_state)
+        if device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = device
+        self._feature_mean = None
+        self._feature_std = None
+        self._features_low = None
+        self._features_high = None
+        self._scarf = None
+        self._head = None
+        self._input_dim = None
+
+    def _standardize(self, X):
+        return (X - self._feature_mean) / (self._feature_std + 1e-6)
+
+    def _encode_with_grad(self, x):
+        # SCARF.get_embeddings is decorated with @torch.inference_mode(),
+        # which blocks gradients. Call the encoder MLP directly during
+        # finetune so backprop reaches pretrained weights.
+        return self._scarf.encoder(x)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        from scarf.model import SCARF
+        from scarf.loss import NTXent
+
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        X_tr = np.asarray(X_tr, dtype=np.float32)
+        y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+        X_val_np = np.asarray(X_val, dtype=np.float32) if X_val is not None else None
+        y_val_np = (np.asarray(y_val, dtype=np.float32).ravel()
+                    if y_val is not None else None)
+
+        self._feature_mean = X_tr.mean(axis=0, keepdims=True).astype(np.float32)
+        self._feature_std = X_tr.std(axis=0, keepdims=True).astype(np.float32)
+        Xtr_std = self._standardize(X_tr)
+        Xval_std = self._standardize(X_val_np) if X_val_np is not None else None
+
+        # Per-feature empirical range -> corruption value source.
+        f_low = Xtr_std.min(axis=0).astype(np.float32)
+        f_high = Xtr_std.max(axis=0).astype(np.float32)
+        # Avoid degenerate uniforms (low==high) — bump high by a tiny epsilon.
+        eq = (f_high - f_low) < 1e-6
+        if eq.any():
+            f_high = f_high.copy()
+            f_high[eq] = f_low[eq] + 1e-3
+        self._features_low = torch.tensor(f_low, dtype=torch.float32)
+        self._features_high = torch.tensor(f_high, dtype=torch.float32)
+        self._input_dim = Xtr_std.shape[1]
+
+        scarf = SCARF(
+            input_dim=self._input_dim,
+            features_low=self._features_low,
+            features_high=self._features_high,
+            dim_hidden_encoder=self.dim_hidden_encoder,
+            num_hidden_encoder=self.num_hidden_encoder,
+            dim_hidden_head=self.dim_hidden_head,
+            num_hidden_head=self.num_hidden_head,
+            corruption_rate=self.corruption_rate,
+            dropout=self.dropout,
+        ).to(self.device)
+        ntxent = NTXent(temperature=self.ntxent_temperature).to(self.device)
+
+        # === STAGE 1 — SSL contrastive pretrain (NT-Xent) ===
+        opt_pre = torch.optim.Adam(
+            scarf.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+        )
+        pretrain_loader = DataLoader(
+            _SCARF_TensorDataset(torch.from_numpy(Xtr_std)),
+            batch_size=self.batch_size, shuffle=True, drop_last=True,
+        )
+        for _ in range(self.pretrain_epochs):
+            scarf.train()
+            for (xb,) in pretrain_loader:
+                xb = xb.to(self.device, non_blocking=True)
+                z_anchor, z_positive = scarf(xb)
+                loss = ntxent(z_anchor, z_positive)
+                opt_pre.zero_grad(set_to_none=True)
+                loss.backward()
+                opt_pre.step()
+
+        # === STAGE 2 — Supervised finetune ===
+        head = nn.Sequential(
+            nn.Linear(self.dim_hidden_encoder, self.cls_hidden),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.cls_hidden, 1),
+        ).to(self.device)
+
+        if self.freeze_encoder:
+            for p in scarf.parameters():
+                p.requires_grad = False
+            params = list(head.parameters())
+        else:
+            params = list(scarf.encoder.parameters()) + list(head.parameters())
+
+        opt_ft = torch.optim.Adam(
+            params, lr=self.lr * self.finetune_lr_scale,
+            weight_decay=self.weight_decay,
+        )
+        pw = torch.tensor([self.pos_weight], device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+
+        ft_loader = DataLoader(
+            _SCARF_TensorDataset(
+                torch.from_numpy(Xtr_std),
+                torch.from_numpy(y_tr),
+            ),
+            batch_size=self.batch_size, shuffle=True, drop_last=False,
+        )
+
+        best_val = float('inf')
+        best_state = None
+        for _ in range(self.finetune_epochs):
+            scarf.train()
+            head.train()
+            for xb, yb in ft_loader:
+                if xb.size(0) < 2:
+                    # BatchNorm1d needs >=2 samples in train mode.
+                    continue
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True).unsqueeze(-1)
+                # Direct call to the encoder MLP keeps gradients flowing —
+                # SCARF.get_embeddings is wrapped in @torch.inference_mode().
+                emb = scarf.encoder(xb)
+                logits = head(emb)
+                loss = loss_fn(logits, yb)
+                opt_ft.zero_grad(set_to_none=True)
+                loss.backward()
+                opt_ft.step()
+            if Xval_std is not None and y_val_np is not None and len(Xval_std) >= 2:
+                scarf.eval(); head.eval()
+                with torch.no_grad():
+                    Xv = torch.from_numpy(Xval_std).to(self.device)
+                    yv = torch.from_numpy(y_val_np).to(self.device).unsqueeze(-1)
+                    emb_v = scarf.encoder(Xv)
+                    vloss = loss_fn(head(emb_v), yv).item()
+                if vloss < best_val:
+                    best_val = vloss
+                    best_state = {
+                        'scarf': {k: v.detach().cpu().clone()
+                                  for k, v in scarf.state_dict().items()},
+                        'head': {k: v.detach().cpu().clone()
+                                 for k, v in head.state_dict().items()},
+                    }
+        if best_state is not None:
+            scarf.load_state_dict(best_state['scarf'])
+            head.load_state_dict(best_state['head'])
+
+        self._scarf = scarf
+        self._head = head
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32)
+        Xs = self._standardize(X)
+        self._scarf.eval()
+        self._head.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(Xs), 8192):
+                xb = torch.from_numpy(Xs[i:i + 8192]).to(self.device)
+                emb = self._scarf.encoder(xb)
+                logits = self._head(emb).squeeze(-1)
+                out.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(out).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save({
+            'scarf_state': self._scarf.state_dict(),
+            'head_state': self._head.state_dict(),
+            'feature_mean': self._feature_mean,
+            'feature_std': self._feature_std,
+            'features_low': self._features_low.cpu().numpy()
+                if self._features_low is not None else None,
+            'features_high': self._features_high.cpu().numpy()
+                if self._features_high is not None else None,
+            'input_dim': self._input_dim,
+            'hparams': {
+                'dim_hidden_encoder': self.dim_hidden_encoder,
+                'num_hidden_encoder': self.num_hidden_encoder,
+                'dim_hidden_head': self.dim_hidden_head,
+                'num_hidden_head': self.num_hidden_head,
+                'corruption_rate': self.corruption_rate,
+                'dropout': self.dropout,
+                'cls_hidden': self.cls_hidden,
+            },
+        }, os.path.join(model_dir, 'torch_scarf.pt'))
+        if extra:
+            with open(os.path.join(model_dir, 'extra.json'), 'w') as f:
+                json.dump(extra, f, indent=2, default=str)
+        return {'model_path': os.path.join(model_dir, 'torch_scarf.pt')}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -18889,6 +19136,7 @@ TRAINERS = {
     'torch_graph_attention': TorchGraphAttentionTrainer,
     'torch_ncde': TorchNCDETrainer,
     'torch_tabr': TorchTabRTrainer,
+    'torch_scarf': TorchScarfTrainer,
 }
 
 
