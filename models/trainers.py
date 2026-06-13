@@ -19157,6 +19157,307 @@ class TorchScarfTrainer(BaseTrainer):
         return {'model_path': os.path.join(model_dir, 'torch_scarf.pt')}
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+import os
+import json
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _series_decomp_moving_avg(x, kernel_size):
+    # x: (B, T, C) -> (season, trend) of same shape via 1D avg-pool over time.
+    pad = kernel_size // 2
+    x_t = x.transpose(1, 2)
+    x_t = F.pad(x_t, (pad, pad), mode='replicate')
+    trend = F.avg_pool1d(x_t, kernel_size=kernel_size, stride=1)
+    trend = trend.transpose(1, 2)
+    season = x - trend
+    return season, trend
+
+
+class _MultiScaleSeasonMixing(nn.Module):
+    """Bottom-up MLP mixing: finer-scale season passes information to coarser scales."""
+    def __init__(self, scales, dropout=0.1):
+        super().__init__()
+        self.down_layers = nn.ModuleList()
+        for i in range(len(scales) - 1):
+            self.down_layers.append(nn.Sequential(
+                nn.Linear(scales[i], scales[i + 1]),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(scales[i + 1], scales[i + 1]),
+            ))
+
+    def forward(self, season_list):
+        # season_list ordered fine-first.
+        out_list = [season_list[0]]
+        for i, layer in enumerate(self.down_layers):
+            prev = out_list[-1].transpose(1, 2)
+            down = layer(prev).transpose(1, 2)
+            merged = season_list[i + 1] + down
+            out_list.append(merged)
+        return out_list
+
+
+class _MultiScaleTrendMixing(nn.Module):
+    """Top-down MLP mixing: coarser-scale trend passes information to finer scales."""
+    def __init__(self, scales, dropout=0.1):
+        super().__init__()
+        self.up_layers = nn.ModuleList()
+        for i in range(len(scales) - 1, 0, -1):
+            self.up_layers.append(nn.Sequential(
+                nn.Linear(scales[i], scales[i - 1]),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(scales[i - 1], scales[i - 1]),
+            ))
+
+    def forward(self, trend_list):
+        rev = trend_list[::-1]
+        out_list = [rev[0]]
+        for i, layer in enumerate(self.up_layers):
+            prev = out_list[-1].transpose(1, 2)
+            up = layer(prev).transpose(1, 2)
+            merged = rev[i + 1] + up
+            out_list.append(merged)
+        return out_list[::-1]
+
+
+class _PastDecomposableMixing(nn.Module):
+    def __init__(self, scales, d_model, moving_avg=5, dropout=0.1):
+        super().__init__()
+        self.moving_avg = moving_avg
+        self.norm = nn.LayerNorm(d_model)
+        self.cross_season = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.cross_trend = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.season_mix = _MultiScaleSeasonMixing(scales, dropout=dropout)
+        self.trend_mix = _MultiScaleTrendMixing(scales, dropout=dropout)
+        self.out_layer = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, x_list):
+        seasons, trends = [], []
+        for x in x_list:
+            s, t = _series_decomp_moving_avg(x, self.moving_avg)
+            seasons.append(self.cross_season(s))
+            trends.append(self.cross_trend(t))
+        seasons = self.season_mix(seasons)
+        trends = self.trend_mix(trends)
+        out_list = []
+        for x, s, t in zip(x_list, seasons, trends):
+            out_list.append(self.norm(x + self.out_layer(s + t)))
+        return out_list
+
+
+class _TimeMixerEncoder(nn.Module):
+    def __init__(self, in_channels, seq_len, d_model=64, e_layers=2,
+                 down_window=2, num_scales=3, moving_avg=5, dropout=0.1):
+        super().__init__()
+        self.down_window = down_window
+        self.num_scales = num_scales
+        scales = []
+        cur = seq_len
+        for _ in range(num_scales):
+            scales.append(cur)
+            cur = max(cur // down_window, 1)
+        self.scales = scales
+        self.embed = nn.Linear(in_channels, d_model)
+        self.pdm_blocks = nn.ModuleList([
+            _PastDecomposableMixing(scales, d_model, moving_avg=moving_avg, dropout=dropout)
+            for _ in range(e_layers)
+        ])
+        self.head_in = sum(scales) * d_model
+
+    def _make_multi_scale(self, x):
+        out = [x]
+        cur = x
+        for _ in range(self.num_scales - 1):
+            cur_t = cur.transpose(1, 2)
+            cur_t = F.avg_pool1d(cur_t, kernel_size=self.down_window, stride=self.down_window)
+            cur = cur_t.transpose(1, 2)
+            out.append(cur)
+        return out
+
+    def forward(self, x):
+        x = self.embed(x)
+        x_list = self._make_multi_scale(x)
+        for block in self.pdm_blocks:
+            x_list = block(x_list)
+        return torch.cat([z.reshape(z.size(0), -1) for z in x_list], dim=1)
+
+
+class _TimeMixerClassifier(nn.Module):
+    def __init__(self, in_channels, seq_len, d_model=64, e_layers=2,
+                 down_window=2, num_scales=3, moving_avg=5,
+                 dropout=0.1, head_hidden=128):
+        super().__init__()
+        self.encoder = _TimeMixerEncoder(in_channels, seq_len, d_model, e_layers,
+                                         down_window, num_scales, moving_avg, dropout)
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.encoder.head_in),
+            nn.Dropout(dropout),
+            nn.Linear(self.encoder.head_in, head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.head(z).squeeze(-1)
+
+
+class TorchTimeMixerTrainer(BaseTrainer):
+    """Decomposable Multiscale Mixing (TimeMixer, ICLR 2024) + binary classification head."""
+    name = 'torch_timemixer'
+    consumes_sequences = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model       = int(kwargs.get('d_model', 64))
+        self.e_layers      = int(kwargs.get('e_layers', 2))
+        self.down_window   = int(kwargs.get('down_window', 2))
+        self.num_scales    = int(kwargs.get('num_scales', 3))
+        self.moving_avg    = int(kwargs.get('moving_avg', 5))
+        self.dropout       = float(kwargs.get('dropout', 0.1))
+        self.head_hidden   = int(kwargs.get('head_hidden', 128))
+        self.learning_rate = float(kwargs.get('learning_rate', 1e-3))
+        self.weight_decay  = float(kwargs.get('weight_decay', 1e-4))
+        self.n_epochs      = int(kwargs.get('n_epochs', 30))
+        self.batch_size    = int(kwargs.get('batch_size', 256))
+        self.pos_weight    = float(kwargs.get('pos_weight', 1.5))
+        self.early_stop    = int(kwargs.get('early_stop', 5))
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.in_channels = None
+        self.seq_len = None
+
+    def _to_sequence(self, X):
+        arr = np.asarray(X, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[:, None, :]
+        return arr
+
+    def _resolve_num_scales(self, T):
+        # Cap so that the coarsest scale has at least 2 timesteps when possible.
+        max_scales = 1 + int(math.floor(math.log(max(T, 2), self.down_window)))
+        return max(1, min(self.num_scales, max_scales))
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        X_tr_seq = self._to_sequence(X_tr)
+        X_val_seq = self._to_sequence(X_val)
+        N, T, C = X_tr_seq.shape
+        self.seq_len = T
+        self.in_channels = C
+        ns = self._resolve_num_scales(T)
+        # cap moving_avg to seq_len for short sequences
+        ma = max(2, min(self.moving_avg, T))
+        self.model = _TimeMixerClassifier(
+            in_channels=C, seq_len=T,
+            d_model=self.d_model, e_layers=self.e_layers,
+            down_window=self.down_window, num_scales=ns,
+            moving_avg=ma, dropout=self.dropout,
+            head_hidden=self.head_hidden,
+        ).to(self.device)
+        opt = torch.optim.AdamW(self.model.parameters(),
+                                lr=self.learning_rate,
+                                weight_decay=self.weight_decay)
+        pos_w = torch.tensor([self.pos_weight], device=self.device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        Xt = torch.from_numpy(X_tr_seq)
+        yt = torch.from_numpy(np.asarray(y_tr, dtype=np.float32))
+        Xv = torch.from_numpy(X_val_seq).to(self.device)
+        yv = torch.from_numpy(np.asarray(y_val, dtype=np.float32)).to(self.device)
+        best_val = float('inf')
+        best_state = None
+        patience = 0
+        for epoch in range(self.n_epochs):
+            self.model.train()
+            perm = torch.randperm(N)
+            for i in range(0, N, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                xb = Xt[idx].to(self.device)
+                yb = yt[idx].to(self.device)
+                logits = self.model(xb)
+                loss = loss_fn(logits, yb)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+            self.model.eval()
+            with torch.no_grad():
+                v_logits = self.model(Xv)
+                v_loss = loss_fn(v_logits, yv).item()
+            if v_loss < best_val - 1e-5:
+                best_val = v_loss
+                best_state = {k: v.detach().cpu().clone()
+                              for k, v in self.model.state_dict().items()}
+                patience = 0
+            else:
+                patience += 1
+                if patience >= self.early_stop:
+                    break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        X_seq = self._to_sequence(X)
+        self.model.eval()
+        Xt = torch.from_numpy(X_seq).to(self.device)
+        out = []
+        with torch.no_grad():
+            bs = 1024
+            for i in range(0, Xt.size(0), bs):
+                logits = self.model(Xt[i:i + bs])
+                out.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(out, axis=0)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(), os.path.join(model_dir, 'model.pt'))
+        meta = {
+            'name': self.name,
+            'd_model': self.d_model,
+            'e_layers': self.e_layers,
+            'down_window': self.down_window,
+            'num_scales': self.num_scales,
+            'moving_avg': self.moving_avg,
+            'dropout': self.dropout,
+            'head_hidden': self.head_hidden,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'n_epochs': self.n_epochs,
+            'batch_size': self.batch_size,
+            'pos_weight': self.pos_weight,
+            'early_stop': self.early_stop,
+            'in_channels': self.in_channels,
+            'seq_len': self.seq_len,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -19236,6 +19537,7 @@ TRAINERS = {
     'torch_ncde': TorchNCDETrainer,
     'torch_tabr': TorchTabRTrainer,
     'torch_scarf': TorchScarfTrainer,
+    'torch_timemixer': TorchTimeMixerTrainer,
 }
 
 

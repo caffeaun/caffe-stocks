@@ -1734,6 +1734,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'cls_hidden':           [64, 128, 256],
     'freeze_encoder':       [False, True],
 },
+    'torch_timemixer': {
+    'd_model':        [32, 64, 128],
+    'e_layers':       [1, 2, 3],
+    'down_window':    [2, 4],
+    'num_scales':     [2, 3, 4],
+    'moving_avg':     [3, 5, 9],
+    'dropout':        (0.05, 0.30),
+    'head_hidden':    [64, 128, 256],
+    'learning_rate':  (3e-4, 3e-3),
+    'weight_decay':   (1e-5, 1e-3),
+    'n_epochs':       [20, 30, 50],
+    'batch_size':     [128, 256, 512],
+    'pos_weight':     (1.0, 1.5),
+},
 }
 
 
