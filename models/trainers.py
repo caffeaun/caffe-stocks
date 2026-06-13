@@ -18845,6 +18845,8 @@ class TorchScarfTrainer(BaseTrainer):
                  freeze_encoder: bool = False,
                  device: str = 'auto',
                  random_state: int = 42,
+                 use_modal: bool = True,
+                 modal_gpu: str = 'A100-40GB',
                  **kwargs):
         self.dim_hidden_encoder = int(dim_hidden_encoder)
         self.num_hidden_encoder = int(num_hidden_encoder)
@@ -18863,6 +18865,12 @@ class TorchScarfTrainer(BaseTrainer):
         self.cls_hidden = int(cls_hidden)
         self.freeze_encoder = bool(freeze_encoder)
         self.random_state = int(random_state)
+        # Honour ML_FORCE_MODAL like other foundation-model trainers — keeps
+        # claude-mode runs on Modal even if the caller passed use_modal=False.
+        self.use_modal = bool(use_modal) or bool(int(
+            os.environ.get('ML_FORCE_MODAL', '0') or '0'
+        ))
+        self.modal_gpu = str(modal_gpu)
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
@@ -18873,6 +18881,12 @@ class TorchScarfTrainer(BaseTrainer):
         self._scarf = None
         self._head = None
         self._input_dim = None
+        # Modal path: we don't keep a local torch model — fit() stashes the
+        # train arrays and predict_proba ships them with X_test to the GPU.
+        self._modal_X_tr = None
+        self._modal_y_tr = None
+        self._modal_X_val = None
+        self._modal_y_val = None
 
     def _standardize(self, X):
         return (X - self._feature_mean) / (self._feature_std + 1e-6)
@@ -18883,7 +18897,43 @@ class TorchScarfTrainer(BaseTrainer):
         # finetune so backprop reaches pretrained weights.
         return self._scarf.encoder(x)
 
+    def _modal_hp(self) -> dict:
+        return {
+            'dim_hidden_encoder': self.dim_hidden_encoder,
+            'num_hidden_encoder': self.num_hidden_encoder,
+            'dim_hidden_head': self.dim_hidden_head,
+            'num_hidden_head': self.num_hidden_head,
+            'corruption_rate': self.corruption_rate,
+            'dropout': self.dropout,
+            'pretrain_epochs': self.pretrain_epochs,
+            'finetune_epochs': self.finetune_epochs,
+            'batch_size': self.batch_size,
+            'lr': self.lr,
+            'finetune_lr_scale': self.finetune_lr_scale,
+            'weight_decay': self.weight_decay,
+            'ntxent_temperature': self.ntxent_temperature,
+            'pos_weight': self.pos_weight,
+            'cls_hidden': self.cls_hidden,
+            'freeze_encoder': self.freeze_encoder,
+        }
+
     def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        # Modal path: defer training to a single remote A100 call. Stash the
+        # train arrays here so predict_proba can ship them with X_test in
+        # one round-trip (matches the tabicl_v2 ICL pattern — see #2686
+        # rationale: local CPU timed out at the 30-min wall).
+        if self.use_modal:
+            self._modal_X_tr = np.asarray(X_tr, dtype=np.float32)
+            self._modal_y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+            if X_val is not None and y_val is not None:
+                self._modal_X_val = np.asarray(X_val, dtype=np.float32)
+                self._modal_y_val = np.asarray(y_val, dtype=np.float32).ravel()
+            else:
+                self._modal_X_val = None
+                self._modal_y_val = None
+            self.device = f'modal:{self.modal_gpu}'
+            return self
+
         from scarf.model import SCARF
         from scarf.loss import NTXent
 
@@ -19016,7 +19066,41 @@ class TorchScarfTrainer(BaseTrainer):
         self._head = head
         return self
 
+    def _predict_via_modal(self, X) -> np.ndarray:
+        import time
+        import modal
+        from scripts.modal_budget import check_budget, record_call
+        # Pre-flight budget check: 300 s covers a single 7-fold gate fold at
+        # default HPs (pretrain=25 + finetune=30, batch=512, encoder=256x4).
+        check_budget(estimated_duration_s=300.0, gpu=self.modal_gpu)
+        fn = modal.Function.from_name('caffe-stocks-modal', 'train_predict_scarf')
+        t0 = time.monotonic()
+        try:
+            proba = fn.remote(
+                self._modal_X_tr, self._modal_y_tr,
+                self._modal_X_val, self._modal_y_val,
+                np.asarray(X, dtype=np.float32),
+                self._modal_hp(),
+                self.random_state,
+            )
+            duration = time.monotonic() - t0
+            record_call(
+                trainer=self.name, duration_s=duration, gpu=self.modal_gpu,
+                status='ok',
+            )
+        except Exception:
+            duration = time.monotonic() - t0
+            record_call(
+                trainer=self.name, duration_s=duration, gpu=self.modal_gpu,
+                status='error',
+            )
+            raise
+        proba = np.asarray(proba, dtype=np.float32).ravel()
+        return proba
+
     def predict_proba(self, X) -> np.ndarray:
+        if self.use_modal:
+            return self._predict_via_modal(X)
         X = np.asarray(X, dtype=np.float32)
         Xs = self._standardize(X)
         self._scarf.eval()
@@ -19032,6 +19116,21 @@ class TorchScarfTrainer(BaseTrainer):
 
     def save(self, model_dir, extra=None):
         os.makedirs(model_dir, exist_ok=True)
+        # Modal path: nothing useful to persist locally — the model lives on
+        # the GPU container and the support set has already been used. Write
+        # a marker file so vault_eval and downstream tools see the directory.
+        if self.use_modal:
+            marker = os.path.join(model_dir, 'torch_scarf_modal.json')
+            with open(marker, 'w') as f:
+                json.dump({
+                    'use_modal': True,
+                    'modal_gpu': self.modal_gpu,
+                    'hparams': self._modal_hp(),
+                }, f, indent=2, default=str)
+            if extra:
+                with open(os.path.join(model_dir, 'extra.json'), 'w') as f:
+                    json.dump(extra, f, indent=2, default=str)
+            return {'model_path': marker}
         torch.save({
             'scarf_state': self._scarf.state_dict(),
             'head_state': self._head.state_dict(),

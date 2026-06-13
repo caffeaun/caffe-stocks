@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep torch_tabr as the active sweep family. torch_scarf scaffold is in place and instantiates cleanly, but its 2-stage pretrain+finetune workload (even at CPU-friendly HPs: pretrain=10/finetune=20/batch=1024/enc=128x3) did NOT complete a single full gate run within the 30-min wall budget on CPU (CUDA_VISIBLE_DEVICES='' per project_gpu_policy). Process ran at 800-900% CPU for 7+ min before SIGTERM. Designating torch_scarf as active would just stall train_mode against the same wall. torch_tabr W6 +311% / W7 +82% / W3 +61% jackpots from iter #2550 are still the best evidence-backed sweep target; pos_weight \u2208 {1.0, 1.3, 1.5} single-lever order from the prior active_case rationale is unfinished. Re-route torch_scarf via Modal (`use_modal=True` like tabicl_v2) in a follow-up scaffold edit BEFORE designating it active.",
-  "claude_iter_id": 2686,
-  "designated_at": "2026-06-13T18:16:08"
+  "rationale": "Keep torch_tabr (iter #2550 W6 +311%/W7 +82%/W3 +61% jackpots, avg_ann +41.0%) as the active CPU-friendly sweep target \u2014 the prior pos_weight \u2208 {1.0, 1.3, 1.5} single-lever order is still unfinished. torch_scarf Modal routing is now in place and reproduces the W6 magnitude jackpot (+253%, iter #2707), but per-config Modal cost (~$0.17/config \u00d7 20 configs = $3.4 per train_mode run \u00d7 24 runs/day = ~$86/day) blows the $30/mo budget if train_mode picks it hourly. Promote torch_scarf to active only after a budget-gated sweep cron is in place.",
+  "claude_iter_id": 2707,
+  "designated_at": "2026-06-14T00:25:44"
 }
