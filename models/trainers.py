@@ -19329,21 +19329,33 @@ class TorchTimeMixerTrainer(BaseTrainer):
     name = 'torch_timemixer'
     consumes_sequences = True
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.d_model       = int(kwargs.get('d_model', 64))
-        self.e_layers      = int(kwargs.get('e_layers', 2))
-        self.down_window   = int(kwargs.get('down_window', 2))
-        self.num_scales    = int(kwargs.get('num_scales', 3))
-        self.moving_avg    = int(kwargs.get('moving_avg', 5))
-        self.dropout       = float(kwargs.get('dropout', 0.1))
-        self.head_hidden   = int(kwargs.get('head_hidden', 128))
-        self.learning_rate = float(kwargs.get('learning_rate', 1e-3))
-        self.weight_decay  = float(kwargs.get('weight_decay', 1e-4))
-        self.n_epochs      = int(kwargs.get('n_epochs', 30))
-        self.batch_size    = int(kwargs.get('batch_size', 256))
-        self.pos_weight    = float(kwargs.get('pos_weight', 1.5))
-        self.early_stop    = int(kwargs.get('early_stop', 5))
+    def __init__(self,
+                 d_model: int = 64,
+                 e_layers: int = 2,
+                 down_window: int = 2,
+                 num_scales: int = 3,
+                 moving_avg: int = 5,
+                 dropout: float = 0.1,
+                 head_hidden: int = 128,
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 n_epochs: int = 30,
+                 batch_size: int = 256,
+                 pos_weight: float = 1.5,
+                 early_stop: int = 5):
+        self.d_model       = int(d_model)
+        self.e_layers      = int(e_layers)
+        self.down_window   = int(down_window)
+        self.num_scales    = int(num_scales)
+        self.moving_avg    = int(moving_avg)
+        self.dropout       = float(dropout)
+        self.head_hidden   = int(head_hidden)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay  = float(weight_decay)
+        self.n_epochs      = int(n_epochs)
+        self.batch_size    = int(batch_size)
+        self.pos_weight    = float(pos_weight)
+        self.early_stop    = int(early_stop)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.in_channels = None

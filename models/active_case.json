@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep torch_tabr (iter #2550 W6 +311%/W7 +82%/W3 +61% jackpots, avg_ann +41.0%) as the active CPU-friendly sweep target \u2014 the prior pos_weight \u2208 {1.0, 1.3, 1.5} single-lever order is still unfinished. torch_scarf Modal routing is now in place and reproduces the W6 magnitude jackpot (+253%, iter #2707), but per-config Modal cost (~$0.17/config \u00d7 20 configs = $3.4 per train_mode run \u00d7 24 runs/day = ~$86/day) blows the $30/mo budget if train_mode picks it hourly. Promote torch_scarf to active only after a budget-gated sweep cron is in place.",
-  "claude_iter_id": 2707,
-  "designated_at": "2026-06-14T00:25:44"
+  "rationale": "Keep torch_tabr (iter #2550 W6 +311% / W7 +82% / W3 +61% jackpots, avg_ann +41.0%) as the active sweep target. torch_timemixer at default-shot (this iter) produced only narrow regime-floor misses (W2 0.5pp, W5 1.5pp) and a -20.3% avg_ann with pure score-collapse \u2014 a weaker base than torch_tabr's three positive single-window jackpots. The torch_tabr pos_weight \u2208 {1.0,1.3,1.5} \u2192 k_context \u2192 sim_temperature single-lever sweep is still unfinished. Train_mode can pick up TimeMixer once a multi-lever brief shows it has structural signal beyond under-trained baselines.",
+  "claude_iter_id": 2758,
+  "designated_at": "2026-06-14T18:27:51"
 }
