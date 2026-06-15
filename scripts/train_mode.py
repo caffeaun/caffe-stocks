@@ -23,7 +23,7 @@ sys.path.insert(0, str(BASE))
 
 from models.sequence_loader import load_sequences, aggregate_sequence, aggregated_feature_names
 from models.search_spaces import sample as sample_config, list_trainers
-from scripts import active_case, feedback as fb
+from scripts import active_case, feedback as fb, modal_requests
 from scripts.return_gate import (
     SPLIT_DEFS, evaluate_window, MAX_DD,
     MIN_TRADES_PER_WINDOW, MIN_WR, PASS_FRACTION_REQUIRED,
@@ -119,32 +119,47 @@ def main():
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
-    # Resolve trainer: explicit CLI > dated activation schedule > active_case > fallback.
-    # The schedule (models/activation_schedule.json) is checked BEFORE active_case
-    # so a dated experiment wins over — and survives — claude_mode's active_case
-    # rewrites (claude_mode never touches the schedule file).
+    # Resolve trainer: explicit CLI > approved Modal request > dated activation
+    # schedule > active_case > fallback. An operator-approved Modal sweep
+    # (models/modal_requests.json, status=approved) PREEMPTS the local rotation
+    # for its bounded run — one Modal config per fire, ML_FORCE_MODAL routing —
+    # then status flips to `done` and the schedule resumes. The schedule itself
+    # is checked BEFORE active_case so a dated experiment survives claude_mode's
+    # active_case rewrites (claude_mode touches neither the schedule nor the
+    # request queue).
+    modal_job = None
     if args.trainer == _TRAINER_SENTINEL:
-        sched = active_case.read_scheduled_trainer()
-        if sched and sched.get('trainer') in list_trainers():
-            args.trainer = sched['trainer']
-            if sched.get('rl_week'):
-                os.environ['RL_REWARD_ONLY'] = '1'
-            print(f'train_mode: using trainer {args.trainer!r} from activation '
-                  f'schedule ({sched.get("start")}..{sched.get("end")})'
-                  + (' [RL_REWARD_ONLY=1]' if sched.get('rl_week') else ''))
+        job = modal_requests.next_approved_job()
+        if job and job.get('trainer') in list_trainers():
+            modal_job = job
+            args.trainer = job['trainer']
+            args.configs = 1                     # pace one Modal config per fire
+            os.environ['ML_FORCE_MODAL'] = '1'   # trainer self-routes to Modal
+            print(f'train_mode: draining approved Modal request '
+                  f'{args.trainer!r} (remaining_configs='
+                  f'{job.get("remaining_configs")}) — ML_FORCE_MODAL=1, configs=1')
         else:
-            case = active_case.read()
-            if case and case.get('trainer') in list_trainers():
-                print(f'train_mode: using trainer {case["trainer"]!r} '
-                      f'from models/active_case.json (claude_iter_id='
-                      f'{case.get("claude_iter_id")!r})')
-                args.trainer = case['trainer']
+            sched = active_case.read_scheduled_trainer()
+            if sched and sched.get('trainer') in list_trainers():
+                args.trainer = sched['trainer']
+                if sched.get('rl_week'):
+                    os.environ['RL_REWARD_ONLY'] = '1'
+                print(f'train_mode: using trainer {args.trainer!r} from activation '
+                      f'schedule ({sched.get("start")}..{sched.get("end")})'
+                      + (' [RL_REWARD_ONLY=1]' if sched.get('rl_week') else ''))
             else:
-                if case:
-                    print(f'train_mode: active_case trainer '
-                          f'{case.get("trainer")!r} not in registry — '
-                          f'falling back to {_FALLBACK_TRAINER!r}')
-                args.trainer = _FALLBACK_TRAINER
+                case = active_case.read()
+                if case and case.get('trainer') in list_trainers():
+                    print(f'train_mode: using trainer {case["trainer"]!r} '
+                          f'from models/active_case.json (claude_iter_id='
+                          f'{case.get("claude_iter_id")!r})')
+                    args.trainer = case['trainer']
+                else:
+                    if case:
+                        print(f'train_mode: active_case trainer '
+                              f'{case.get("trainer")!r} not in registry — '
+                              f'falling back to {_FALLBACK_TRAINER!r}')
+                    args.trainer = _FALLBACK_TRAINER
 
     # Acquire shared lock
     fd = acquire_lock(LOCK_PATH)
@@ -217,6 +232,16 @@ def main():
                 elapsed_seconds=int(elapsed),
             )
             print(f'  → iteration #{iter_id}')
+
+            # Count this Modal config down against the approved request. At
+            # zero, modal_requests flips status to `done` and the local
+            # rotation resumes on the next fire.
+            if modal_job is not None:
+                updated = modal_requests.decrement(args.trainer)
+                if updated is not None:
+                    print(f'  → modal request {args.trainer}: '
+                          f'remaining_configs={updated.get("remaining_configs")} '
+                          f'status={updated.get("status")}')
 
         # Summary
         print('\n=== Run summary ===')

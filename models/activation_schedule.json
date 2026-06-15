@@ -5,5 +5,65 @@
     "trainer": "torch_fastkan",
     "rl_week": true,
     "note": "Part B — RL reward-objective sweep (direct policy optimization). train_mode forces torch_fastkan and exports RL_REWARD_ONLY=1 so every config uses a reward_style policy objective, gated honestly. claude_mode is untouched. Auto-expires 2026-06-16."
+  },
+
+  {
+    "start": "2026-06-16",
+    "end": "2026-06-20",
+    "trainer": "lightgbm_ranker",
+    "focus": "supervised",
+    "note": "Supervised challenger week 1a. lightgbm_ranker is the biggest-headroom honest trainer (only 1 clean iter, hit 2/7 on it: W1+W4 pass, W2/W5 near). Fails by score-collapse to thr=0.0 — the sweep should find pos_weight / dispersion that revives a 3rd window. Cheap (~380s/config), local GPU 0."
+  },
+  {
+    "start": "2026-06-20",
+    "end": "2026-06-23",
+    "trainer": "torch_toto2",
+    "focus": "supervised",
+    "note": "Supervised challenger week 1b. torch_toto2 (Datadog Toto-2 decoder-only FM) clean 2/7 (W1+W4), broke the W4 0/20 wall, alive W2 sweep. Complementary inductive bias to a GBDT ranker. ~518s/config, local GPU 0."
+  },
+
+  {
+    "start": "2026-06-23",
+    "end": "2026-06-27",
+    "trainer": "label_spreading",
+    "focus": "unsupervised",
+    "note": "Unsupervised week 2a. label_spreading — transductive semi-supervised, the only trainer using UNLABELED test features; clean 2/7 with W2 +294% / W7 +379% fat tails. Restored to TRAINERS 2026-06-15. Cheap (~10s/config)."
+  },
+  {
+    "start": "2026-06-27",
+    "end": "2026-06-30",
+    "trainer": "kernel_anomaly_blend",
+    "focus": "unsupervised",
+    "note": "Unsupervised week 2b. kernel_anomaly_blend (anomaly score blended with kernel) clean 2/7, alive W1/W6. ~209s/config, local GPU 0."
+  },
+
+  {
+    "start": "2026-06-30",
+    "end": "2026-07-04",
+    "trainer": "lightgbm_ranker",
+    "focus": "supervised",
+    "note": "Supervised challenger week 3a (rotation repeats). See 2026-06-16 entry."
+  },
+  {
+    "start": "2026-07-04",
+    "end": "2026-07-07",
+    "trainer": "torch_toto2",
+    "focus": "supervised",
+    "note": "Supervised challenger week 3b (rotation repeats). See 2026-06-20 entry."
+  },
+
+  {
+    "start": "2026-07-07",
+    "end": "2026-07-11",
+    "trainer": "label_spreading",
+    "focus": "unsupervised",
+    "note": "Unsupervised week 4a (rotation repeats). See 2026-06-23 entry."
+  },
+  {
+    "start": "2026-07-11",
+    "end": "2026-07-14",
+    "trainer": "kernel_anomaly_blend",
+    "focus": "unsupervised",
+    "note": "Unsupervised week 4b (rotation repeats). See 2026-06-27 entry. Schedule alternates supervised/unsupervised week-by-week; extend past 2026-07-14 to continue the cadence."
   }
 ]

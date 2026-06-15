@@ -15825,7 +15825,7 @@ _TRAINERS_ARCHIVED_CLASSES = {
     'xgboost': XGBoostTrainer,
     'xgb_regime_blend': XGBoostRegimeBlendTrainer,
     'gaussian_nb': GaussianNaiveBayesClassifierTrainer,
-    'label_spreading': LabelSpreadingTrainer,
+    # 'label_spreading' restored to the active TRAINERS dict 2026-06-15.
 }
 
 
@@ -19491,17 +19491,17 @@ class TorchLagLlamaTrainer(BaseTrainer):
 
     def __init__(self,
                  context_length: int = 32,
-                 prediction_length: int = 5,
-                 num_samples: int = 100,
-                 channel_indices=(0, 1, 5, 8, 24),
+                 prediction_length: int = 3,
+                 num_samples: int = 20,
+                 channel_indices=(0, 1, 5),
                  hidden_dim: int = 128,
                  dropout: float = 0.10,
                  learning_rate: float = 5e-4,
                  weight_decay: float = 1e-4,
                  n_epochs: int = 25,
                  batch_size: int = 512,
-                 encoder_batch_size: int = 128,
-                 pos_weight: float = 1.5,
+                 encoder_batch_size: int = 256,
+                 pos_weight: float = 1.0,
                  use_modal: bool = True,
                  modal_gpu: str = 'A100-40GB',
                  random_state: int = 42,
@@ -19673,6 +19673,9 @@ TRAINERS = {
     'dae_logreg': DAELogRegTrainer,
     'torch_frets': TorchFreTSTrainer,
     'kernel_anomaly_blend': KernelAnomalyBlendTrainer,
+    # Restored from _TRAINERS_ARCHIVED_CLASSES 2026-06-15 for the unsupervised
+    # rotation week — transductive semi-supervised lead (HP space still active).
+    'label_spreading': LabelSpreadingTrainer,
     'rocket_classifier': ROCKETClassifierTrainer,
     'torch_xlstm': TorchXLSTMTrainer,
     'kernel_histgb_stack': KernelHistGBStackTrainer,

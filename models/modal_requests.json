@@ -1,0 +1,12 @@
+[
+  {
+    "trainer": "torch_scarf",
+    "gpu": "A100-40GB",
+    "configs": 8,
+    "focus": "unsupervised",
+    "note": "SCARF contrastive (NT-Xent pretrain + supervised finetune). W6 +253% magnitude jackpot on its first full run; needs a pos_weight sweep (1.3/1.5/1.7) — W4 blew up at pos_weight=1.0. ~25 min/config on Modal A100, excluded from the local hourly sweep.",
+    "added": "2026-06-15",
+    "status": "open",
+    "remaining_configs": null
+  }
+]

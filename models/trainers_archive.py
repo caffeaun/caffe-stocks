@@ -41,7 +41,7 @@ TRAINERS_ARCHIVED = {
     'xgboost': 'XGBoostTrainer',
     'xgb_regime_blend': 'XGBoostRegimeBlendTrainer',
     'gaussian_nb': 'GaussianNaiveBayesClassifierTrainer',
-    'label_spreading': 'LabelSpreadingTrainer',
+    # 'label_spreading' un-archived 2026-06-15 for the unsupervised rotation week.
 }
 
 

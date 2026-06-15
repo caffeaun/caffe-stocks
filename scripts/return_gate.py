@@ -642,6 +642,20 @@ def main():
         elapsed = time.time() - t1
         results.append(r)
 
+        if args.output:
+            try:
+                with open(args.output, 'w') as f:
+                    json.dump({
+                        'partial': True,
+                        'windows_completed': idx,
+                        'windows_total': len(SPLIT_DEFS),
+                        'model_type': args.model_type,
+                        'trainer_kwargs': trainer_kwargs,
+                        'results': results,
+                    }, f, indent=2)
+            except Exception:
+                pass
+
         if 'best' in r:
             b = r['best']
             flag = '✓' if r['passed'] else '✗'

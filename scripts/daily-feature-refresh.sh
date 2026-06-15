@@ -103,4 +103,14 @@ else
     log "ML health check passed"
 fi
 
+# Modal request approval ping — surfaces/re-pings any pending Modal-trainer
+# requests to Telegram with a cost estimate (see scripts/modal_request_ping.py
+# + models/modal_requests.json). Self-contained: sends its own Telegram asks
+# and never touches a GPU. Non-fatal.
+log "Modal request ping"
+set +e
+"$PYTHON" "$HOME/projects/caffe-stocks/scripts/modal_request_ping.py" >> "$LOGFILE" 2>&1 \
+    || log "WARN: modal_request_ping.py failed"
+set -e
+
 log "Done"
