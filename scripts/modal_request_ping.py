@@ -23,7 +23,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 BASE = os.path.expanduser('~/projects/caffe-stocks')
 sys.path.insert(0, BASE)
@@ -37,6 +38,13 @@ DB_PATH = os.path.join(BASE, 'data', 'ml-feedback.db')
 DEFER_DAYS = 30
 # Fallback per-config runtime when the trainer has no history yet.
 DEFAULT_SECONDS_PER_CONFIG = 1600.0
+# Modal enforces a workspace-level spend cap that is INDEPENDENT of our
+# modal_budget tracker — iter #2801 hit `ResourceExhaustedError: workspace
+# billing cycle spend limit reached` with our tracker still showing budget
+# left. The cap value is not exposed by Modal's API, so set it here (or via
+# the env var) if you know it, to get a spent/cap readout in the ask;
+# otherwise the ping shows the actual Modal-side spend alone.
+MODAL_WORKSPACE_CAP_USD = float(os.environ.get('MODAL_WORKSPACE_CAP_USD', '0') or 0)
 
 
 def _topic(trainer: str) -> str:
@@ -78,6 +86,40 @@ def _median_seconds_per_config(trainer: str) -> float | None:
     return float(rows[len(rows) // 2])
 
 
+@lru_cache(maxsize=1)
+def _workspace_spend_this_month() -> float | None:
+    """Actual Modal-side workspace spend this calendar month (settled days).
+
+    This is the AUTHORITATIVE number — independent of our modal_budget
+    tracker, which can undercount (it only sees calls it recorded). Returns
+    None if the billing API is unavailable. Cached so a ping run hits the
+    Modal API at most once even with several pending requests."""
+    try:
+        import modal.billing as _mb
+        now = datetime.now(timezone.utc)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        rows = _mb.workspace_billing_report(start=start, end=now)
+        return float(sum(float(r.get('cost', 0) or 0) for r in rows))
+    except Exception:
+        return None
+
+
+def _workspace_line() -> str:
+    """One line on the real Modal workspace spend + cap (if known)."""
+    ws = _workspace_spend_this_month()
+    if ws is None:
+        return ('Modal workspace: spend unavailable — it enforces its own cap '
+                '(separate from the tracker above) that can still block a run.')
+    if MODAL_WORKSPACE_CAP_USD > 0:
+        left = MODAL_WORKSPACE_CAP_USD - ws
+        return (f'Modal workspace (actual): ${ws:.2f} / ${MODAL_WORKSPACE_CAP_USD:.0f} '
+                f'cap this cycle, ${left:.2f} left — this cap, not the tracker '
+                f'above, is what actually blocks a run.')
+    return (f'Modal workspace (actual): ${ws:.2f} spent this month — separate '
+            f'from the tracker above and has its own spend cap that can block '
+            f'a run even with tracker budget left.')
+
+
 def _cost_line(req: dict) -> tuple[str, float]:
     """Build the human cost estimate for the ask; returns (text, est_usd)."""
     gpu = req.get('gpu', 'A100-40GB')
@@ -90,8 +132,9 @@ def _cost_line(req: dict) -> tuple[str, float]:
     warn = '  ⚠️ exceeds remaining budget' if est > remaining else ''
     text = (f'{configs} configs on Modal {gpu} ≈ ${est:.2f} '
             f'(~${est / max(1, configs):.2f}/config, ~{per_cfg / 60:.0f} min each)\n'
-            f'Budget: spent ${spent:.2f} / ${BUDGET_USD:.0f} this month, '
-            f'${remaining:.2f} left{warn}')
+            f'Tracker: spent ${spent:.2f} / ${BUDGET_USD:.0f} this month, '
+            f'${remaining:.2f} left{warn}\n'
+            f'{_workspace_line()}')
     return text, est
 
 
