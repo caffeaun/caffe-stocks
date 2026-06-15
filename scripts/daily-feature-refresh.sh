@@ -108,6 +108,10 @@ fi
 # + models/modal_requests.json). Self-contained: sends its own Telegram asks
 # and never touches a GPU. Non-fatal.
 log "Modal request ping"
+# Modal's workspace-level spend cap (independent of our modal_budget tracker;
+# the cap value isn't exposed by Modal's API). Set here so the ping shows a
+# spent/cap/left readout — change this one line if the workspace cap changes.
+export MODAL_WORKSPACE_CAP_USD=30
 set +e
 "$PYTHON" "$HOME/projects/caffe-stocks/scripts/modal_request_ping.py" >> "$LOGFILE" 2>&1 \
     || log "WARN: modal_request_ping.py failed"

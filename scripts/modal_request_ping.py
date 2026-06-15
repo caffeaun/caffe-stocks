@@ -43,11 +43,11 @@ DEFAULT_SECONDS_PER_CONFIG = 1600.0
 # billing cycle spend limit reached` with our tracker still showing budget
 # left. The cap value is not exposed by Modal's API, so set it here (or via
 # the env var) if you know it, to get a spent/cap readout in the ask;
-# otherwise the ping shows the actual Modal-side spend alone.
-# Set to $30 (operator, 2026-06-15) — same figure as our modal_budget tracker
-# but an INDEPENDENT Modal-side limit. Default applies to cron + manual runs
-# alike; override with the env var if the workspace cap changes.
-MODAL_WORKSPACE_CAP_USD = float(os.environ.get('MODAL_WORKSPACE_CAP_USD', '30') or 30)
+# otherwise (cap=0) the ping shows the actual Modal-side spend alone.
+# The live value is set via the env var in scripts/daily-feature-refresh.sh
+# (MODAL_WORKSPACE_CAP_USD=30, operator-confirmed 2026-06-15) — kept out of
+# code so the cap can change without a commit. Default 0 = graceful no-cap.
+MODAL_WORKSPACE_CAP_USD = float(os.environ.get('MODAL_WORKSPACE_CAP_USD', '0') or 0)
 
 
 def _topic(trainer: str) -> str:
