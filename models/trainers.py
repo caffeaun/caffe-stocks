@@ -19470,6 +19470,150 @@ class TorchTimeMixerTrainer(BaseTrainer):
             json.dump(meta, f, indent=2)
 
 
+# Iter #2780 — Lag-Llama (Rasul et al., NeurIPS 2024 R0-FoMo) — first
+# probabilistic foundation model in the registry. LLaMA-style decoder
+# (RoPE + RMSNorm) over lag-indexed historical values, Student-t head
+# emitting (mu, sigma, nu) per timestep. Frozen backbone → MLP head.
+# Routed to Modal A100 unconditionally; local CPU is ~245 ms/row, full
+# 7-fold gate would take ~57 hours. Per the §5b 2026-06-15 brief, the
+# distinctive bias vs existing FMs is *calibrated downside variance* —
+# the quantile spread (q90-q10) and Student-t scale carry uncertainty
+# that TimesFM/Toto-2/TTM (point + quantile) cannot. Brief expects W7
+# (0/20 wall — only manifold/curvature families have broken it) and
+# W5 (bear regime needs downside calibration) to be the targets.
+class TorchLagLlamaTrainer(BaseTrainer):
+    """Frozen Lag-Llama backbone (lag-indexed Student-t FM) → MLP head.
+
+    Always routes to Modal A100 — local CPU is too slow for the 7-fold gate.
+    """
+    name = 'torch_lag_llama'
+    consumes_sequences = True
+
+    def __init__(self,
+                 context_length: int = 32,
+                 prediction_length: int = 5,
+                 num_samples: int = 100,
+                 channel_indices=(0, 1, 5, 8, 24),
+                 hidden_dim: int = 128,
+                 dropout: float = 0.10,
+                 learning_rate: float = 5e-4,
+                 weight_decay: float = 1e-4,
+                 n_epochs: int = 25,
+                 batch_size: int = 512,
+                 encoder_batch_size: int = 128,
+                 pos_weight: float = 1.5,
+                 use_modal: bool = True,
+                 modal_gpu: str = 'A100-40GB',
+                 random_state: int = 42,
+                 **kwargs):
+        self.context_length = int(context_length)
+        self.prediction_length = int(prediction_length)
+        self.num_samples = int(num_samples)
+        if isinstance(channel_indices, (list, tuple)):
+            self.channel_indices = tuple(int(c) for c in channel_indices)
+        else:
+            self.channel_indices = (int(channel_indices),)
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.n_epochs = int(n_epochs)
+        self.batch_size = int(batch_size)
+        self.encoder_batch_size = int(encoder_batch_size)
+        self.pos_weight = float(pos_weight)
+        self.random_state = int(random_state)
+        # Honour ML_FORCE_MODAL — claude/research runs on Modal always.
+        self.use_modal = bool(use_modal) or bool(int(
+            os.environ.get('ML_FORCE_MODAL', '0') or '0'
+        ))
+        self.modal_gpu = str(modal_gpu)
+        # Modal path: arrays stash here for predict_proba to ship.
+        self._modal_X_tr = None
+        self._modal_y_tr = None
+        self._modal_X_val = None
+        self._modal_y_val = None
+
+    def _modal_hp(self) -> dict:
+        return {
+            'context_length': self.context_length,
+            'prediction_length': self.prediction_length,
+            'num_samples': self.num_samples,
+            'channel_indices': list(self.channel_indices),
+            'hidden_dim': self.hidden_dim,
+            'dropout': self.dropout,
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'n_epochs': self.n_epochs,
+            'batch_size': self.batch_size,
+            'encoder_batch_size': self.encoder_batch_size,
+            'pos_weight': self.pos_weight,
+        }
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        if not self.use_modal:
+            raise RuntimeError(
+                'torch_lag_llama requires Modal A100 (use_modal=True) — '
+                'local CPU is too slow for the 7-fold gate (245 ms/row).'
+            )
+        self._modal_X_tr = np.asarray(X_tr, dtype=np.float32)
+        self._modal_y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+        if X_val is not None and y_val is not None:
+            self._modal_X_val = np.asarray(X_val, dtype=np.float32)
+            self._modal_y_val = np.asarray(y_val, dtype=np.float32).ravel()
+        else:
+            self._modal_X_val = None
+            self._modal_y_val = None
+        return self
+
+    def _predict_via_modal(self, X) -> np.ndarray:
+        import time
+        import modal
+        from scripts.modal_budget import check_budget, record_call
+        # Conservative ETA: 5 channels × 30k rows × ~0.5 ms/row on A100
+        # plus head fit ≈ 300 s per fold call.
+        check_budget(estimated_duration_s=400.0, gpu=self.modal_gpu)
+        fn = modal.Function.from_name(
+            'caffe-stocks-modal', 'train_predict_lag_llama')
+        t0 = time.monotonic()
+        try:
+            proba = fn.remote(
+                self._modal_X_tr, self._modal_y_tr,
+                self._modal_X_val, self._modal_y_val,
+                np.asarray(X, dtype=np.float32),
+                self._modal_hp(),
+                self.random_state,
+            )
+            record_call(
+                trainer=self.name,
+                duration_s=time.monotonic() - t0,
+                gpu=self.modal_gpu, status='ok',
+            )
+        except Exception:
+            record_call(
+                trainer=self.name,
+                duration_s=time.monotonic() - t0,
+                gpu=self.modal_gpu, status='error',
+            )
+            raise
+        return np.asarray(proba, dtype=np.float32).ravel()
+
+    def predict_proba(self, X) -> np.ndarray:
+        return self._predict_via_modal(X)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        marker = os.path.join(model_dir, 'torch_lag_llama_modal.json')
+        with open(marker, 'w') as f:
+            json.dump({
+                'name': self.name,
+                'use_modal': True,
+                'modal_gpu': self.modal_gpu,
+                'hparams': self._modal_hp(),
+                'extra': extra or {},
+            }, f, indent=2, default=str)
+        return {'model_path': marker}
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -19550,6 +19694,7 @@ TRAINERS = {
     'torch_tabr': TorchTabRTrainer,
     'torch_scarf': TorchScarfTrainer,
     'torch_timemixer': TorchTimeMixerTrainer,
+    'torch_lag_llama': TorchLagLlamaTrainer,
 }
 
 

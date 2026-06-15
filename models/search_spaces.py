@@ -1748,6 +1748,18 @@ SEARCH_SPACES: dict[str, dict] = {
     'batch_size':     [128, 256, 512],
     'pos_weight':     (1.0, 1.5),
 },
+    'torch_lag_llama': {
+    'context_length':    [32, 48, 64],
+    'prediction_length': [3, 5, 7],
+    'num_samples':       [50, 100, 200],
+    'channel_indices':   [(0, 1, 5, 8, 24), (0, 1, 5), (0, 1, 5, 8, 9, 10, 24)],
+    'hidden_dim':        [64, 128, 256],
+    'dropout':           (0.05, 0.30),
+    'learning_rate':     (1e-4, 3e-3),
+    'weight_decay':      (1e-5, 1e-3),
+    'n_epochs':          [15, 25, 40],
+    'pos_weight':        (1.0, 1.5),
+},
 }
 
 
