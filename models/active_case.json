@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_lag_llama",
+  "trainer": "torch_card_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Kept on lag_llama for the 3rd run; defaults remain retuned from iter #2780 lessons (pos_weight=1.0, num_samples=20, channel_indices=(0,1,5), encoder_batch_size=256). 3rd Modal-cap block \u2014 train_mode is fully covered by activation_schedule.json through 2026-06-30 (fastkan \u2192 lightgbm_ranker \u2192 torch_toto2 \u2192 label_spreading \u2192 kernel_anomaly_blend), so this active_case is dormant and safe to leave pinned. If Modal balance is topped up before 2026-06-30, the family is sweep-ready at the new baseline; if not, research_mode will overwrite this entry with a CPU/local-GPU pivot tomorrow given exhausted_brief=true.",
-  "claude_iter_id": 2827,
-  "designated_at": "2026-06-15T18:08:36"
+  "rationale": "Pivot from Modal-blocked torch_lag_llama to torch_card_classifier. First-shot avg_ann +13.0% (positive \u2014 top quartile of last-20 claude iters), W6 +175% / W7 +85% magnitude jackpots, alive threshold sweeps on W1/W2/W6, CPU-only ~3min/fold (no Modal dependency). Clear single-lever sweep priority per brief: (1) pos_weight \u2208 [1.2, 1.5] to fix W3/W4/W5 DD blowups, (2) revert CPU nudge to brief defaults (n_samples=10, inference_stride=5), (3) prior_epochs \u2208 [18, 20]. First generative-classifier slot in 81-trainer registry \u2014 preserving it is structurally informative for research_mode.",
+  "claude_iter_id": 2849,
+  "designated_at": "2026-06-16T06:06:15"
 }
