@@ -44,7 +44,10 @@ DEFAULT_SECONDS_PER_CONFIG = 1600.0
 # left. The cap value is not exposed by Modal's API, so set it here (or via
 # the env var) if you know it, to get a spent/cap readout in the ask;
 # otherwise the ping shows the actual Modal-side spend alone.
-MODAL_WORKSPACE_CAP_USD = float(os.environ.get('MODAL_WORKSPACE_CAP_USD', '0') or 0)
+# Set to $30 (operator, 2026-06-15) — same figure as our modal_budget tracker
+# but an INDEPENDENT Modal-side limit. Default applies to cron + manual runs
+# alike; override with the env var if the workspace cap changes.
+MODAL_WORKSPACE_CAP_USD = float(os.environ.get('MODAL_WORKSPACE_CAP_USD', '30') or 30)
 
 
 def _topic(trainer: str) -> str:
