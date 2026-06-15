@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Kept on lag_llama \u2014 defaults retuned (pos_weight 1.0, num_samples 20, channel_indices=(0,1,5), encoder_batch_size 256) per iter #2780 lessons, so the family is sweep-ready once Modal billing resets. Train_mode currently follows activation_schedule.json (torch_fastkan thru 2026-06-16, lightgbm_ranker thereafter), so this active_case is dormant for the next ~8 days; when the schedule expires it's ready to pick up the lag-llama sweep at the new baseline. If Modal stays exhausted, research_mode tomorrow should reroute the brief to a CPU/local-GPU family (label_spreading, kernel_logreg, histgb_monotonic) which would override this entry.",
-  "claude_iter_id": 2801,
-  "designated_at": "2026-06-15T12:33:01"
+  "rationale": "Kept on lag_llama for the 3rd run; defaults remain retuned from iter #2780 lessons (pos_weight=1.0, num_samples=20, channel_indices=(0,1,5), encoder_batch_size=256). 3rd Modal-cap block \u2014 train_mode is fully covered by activation_schedule.json through 2026-06-30 (fastkan \u2192 lightgbm_ranker \u2192 torch_toto2 \u2192 label_spreading \u2192 kernel_anomaly_blend), so this active_case is dormant and safe to leave pinned. If Modal balance is topped up before 2026-06-30, the family is sweep-ready at the new baseline; if not, research_mode will overwrite this entry with a CPU/local-GPU pivot tomorrow given exhausted_brief=true.",
+  "claude_iter_id": 2827,
+  "designated_at": "2026-06-15T18:08:36"
 }
