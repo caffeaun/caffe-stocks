@@ -19614,6 +19614,241 @@ class TorchLagLlamaTrainer(BaseTrainer):
         return {'model_path': marker}
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+# CARD: Classification and Regression Diffusion. NeurIPS 2022, arXiv:2206.07275.
+# Two-stage: (1) prior MLP estimates p(y=1|x); (2) conditional denoiser learns
+# reverse diffusion centered on the prior. predict_proba averages M DDIM samples.
+
+import math
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _CardTimeEmbed(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        half = max(self.dim // 2, 1)
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
+        )
+        a = t.float()[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(a), torch.cos(a)], dim=-1)
+        if emb.shape[-1] < self.dim:
+            emb = F.pad(emb, (0, self.dim - emb.shape[-1]))
+        return emb
+
+
+class _CardPriorMLP(nn.Module):
+    def __init__(self, x_dim, hidden):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(x_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def logit(self, x):
+        return self.net(x).squeeze(-1)
+
+    def forward(self, x):
+        return torch.sigmoid(self.logit(x))
+
+
+class _CardDenoiser(nn.Module):
+    def __init__(self, x_dim, hidden, time_emb_dim=64):
+        super().__init__()
+        self.time_emb = _CardTimeEmbed(time_emb_dim)
+        self.x_enc = nn.Sequential(
+            nn.Linear(x_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+        )
+        self.t_proj = nn.Sequential(
+            nn.Linear(time_emb_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.y_proj = nn.Linear(1, hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 3, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, y_t, x, t):
+        h_x = self.x_enc(x)
+        h_y = self.y_proj(y_t.unsqueeze(-1))
+        h_t = self.t_proj(self.time_emb(t))
+        return self.head(torch.cat([h_x, h_y, h_t], dim=-1)).squeeze(-1)
+
+
+class TorchCardClassifierTrainer(BaseTrainer):
+    """Generative binary classifier via conditional diffusion (CARD).
+
+    Stage 1: prior MLP fits p(y=1|x) by BCE.
+    Stage 2: denoiser learns ε_θ(y_t, x, t) with forward process centered
+             on prior(x): y_t = sqrt(ab_t)*(y_0 - mu) + mu + sqrt(1-ab_t)*eps.
+    Inference: DDIM-stride sampling, M chains per row, mean clipped to [0,1].
+    """
+    name = 'torch_card_classifier'
+    consumes_sequences = False
+
+    def __init__(
+        self,
+        hidden=128,
+        prior_hidden=128,
+        n_timesteps=50,
+        beta_start=1e-4,
+        beta_end=2e-2,
+        epochs=20,
+        prior_epochs=15,
+        batch_size=1024,
+        lr=1e-3,
+        weight_decay=1e-5,
+        n_samples=10,
+        inference_stride=5,
+        pos_weight=1.0,
+        seed=0,
+    ):
+        super().__init__()
+        self.hidden = int(hidden)
+        self.prior_hidden = int(prior_hidden)
+        self.n_timesteps = int(n_timesteps)
+        self.beta_start = float(beta_start)
+        self.beta_end = float(beta_end)
+        self.epochs = int(epochs)
+        self.prior_epochs = int(prior_epochs)
+        self.batch_size = int(batch_size)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.n_samples = int(n_samples)
+        self.inference_stride = max(1, int(inference_stride))
+        self.pos_weight = float(pos_weight)
+        self.seed = int(seed)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        betas = torch.linspace(self.beta_start, self.beta_end, self.n_timesteps, dtype=torch.float32)
+        alphas = 1.0 - betas
+        ab = torch.cumprod(alphas, dim=0)
+        self._betas_cpu = betas
+        self._ab_cpu = ab
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        X = torch.tensor(np.asarray(X_tr, dtype=np.float32), device=self.device)
+        y = torch.tensor(np.asarray(y_tr, dtype=np.float32), device=self.device)
+        d = X.shape[1]
+        N = X.shape[0]
+        ab = self._ab_cpu.to(self.device)
+
+        # Stage 1: prior MLP via BCE
+        self.prior_ = _CardPriorMLP(d, self.prior_hidden).to(self.device)
+        opt = torch.optim.Adam(
+            self.prior_.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+        pw = torch.tensor([self.pos_weight], device=self.device)
+        for _ in range(self.prior_epochs):
+            perm = torch.randperm(N, device=self.device)
+            for s in range(0, N, self.batch_size):
+                idx = perm[s:s + self.batch_size]
+                logit = self.prior_.logit(X[idx])
+                loss = F.binary_cross_entropy_with_logits(logit, y[idx], pos_weight=pw)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        self.prior_.eval()
+
+        # Stage 2: conditional denoiser via MSE on epsilon
+        self.eps_ = _CardDenoiser(d, self.hidden).to(self.device)
+        opt = torch.optim.Adam(
+            self.eps_.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+        with torch.no_grad():
+            mu_all = self.prior_(X)
+
+        for _ in range(self.epochs):
+            perm = torch.randperm(N, device=self.device)
+            for s in range(0, N, self.batch_size):
+                idx = perm[s:s + self.batch_size]
+                xb, yb, mub = X[idx], y[idx], mu_all[idx]
+                t = torch.randint(0, self.n_timesteps, (len(idx),), device=self.device)
+                eps = torch.randn_like(yb)
+                ab_t = ab[t]
+                y_centered = yb - mub
+                y_t = torch.sqrt(ab_t) * y_centered + torch.sqrt(1.0 - ab_t) * eps
+                eps_pred = self.eps_(y_t + mub, xb, t)
+                loss = F.mse_loss(eps_pred, eps)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        self.eps_.eval()
+        return self
+
+    @torch.no_grad()
+    def _ddim_sample(self, X, n_samples, stride):
+        N = X.shape[0]
+        mu = self.prior_(X)
+        ab = self._ab_cpu.to(self.device)
+        steps = list(range(0, self.n_timesteps, stride))
+        if steps[-1] != self.n_timesteps - 1:
+            steps.append(self.n_timesteps - 1)
+        steps = list(reversed(steps))
+
+        chains = []
+        for _ in range(n_samples):
+            y = mu + torch.randn(N, device=self.device)
+            for i, t in enumerate(steps):
+                t_b = torch.full((N,), t, device=self.device, dtype=torch.long)
+                eps_pred = self.eps_(y, X, t_b)
+                ab_t = ab[t]
+                if i + 1 < len(steps):
+                    ab_prev = ab[steps[i + 1]]
+                else:
+                    ab_prev = torch.tensor(1.0, device=self.device)
+                y_centered = y - mu
+                pred_y0_c = (y_centered - torch.sqrt(1.0 - ab_t) * eps_pred) / torch.sqrt(ab_t)
+                y_next_c = torch.sqrt(ab_prev) * pred_y0_c + torch.sqrt(1.0 - ab_prev) * eps_pred
+                y = y_next_c + mu
+            chains.append(y)
+        return torch.stack(chains, dim=0)
+
+    def predict_proba(self, X):
+        Xt = torch.tensor(np.asarray(X, dtype=np.float32), device=self.device)
+        with torch.no_grad():
+            samples = self._ddim_sample(Xt, self.n_samples, self.inference_stride)
+            p = samples.mean(dim=0).clamp(0.0, 1.0)
+        return p.cpu().numpy()
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(
+            {
+                'prior': self.prior_.state_dict(),
+                'eps': self.eps_.state_dict(),
+                'config': {
+                    'hidden': self.hidden, 'prior_hidden': self.prior_hidden,
+                    'n_timesteps': self.n_timesteps,
+                    'beta_start': self.beta_start, 'beta_end': self.beta_end,
+                    'epochs': self.epochs, 'prior_epochs': self.prior_epochs,
+                    'batch_size': self.batch_size, 'lr': self.lr,
+                    'weight_decay': self.weight_decay, 'n_samples': self.n_samples,
+                    'inference_stride': self.inference_stride,
+                    'pos_weight': self.pos_weight, 'seed': self.seed,
+                },
+            },
+            os.path.join(model_dir, 'card_classifier.pt'),
+        )
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump({'name': self.name, **(extra or {})}, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -19698,6 +19933,8 @@ TRAINERS = {
     'torch_scarf': TorchScarfTrainer,
     'torch_timemixer': TorchTimeMixerTrainer,
     'torch_lag_llama': TorchLagLlamaTrainer,
+    # Single line to append to TRAINERS dict in models/trainers.py
+'torch_card_classifier': TorchCardClassifierTrainer,
 }
 
 

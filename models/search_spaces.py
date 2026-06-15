@@ -1760,6 +1760,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'n_epochs':          [15, 25, 40],
     'pos_weight':        (1.0, 1.5),
 },
+    # models/search_spaces.py — entry to add to SEARCH_SPACES dict
+'torch_card_classifier': {
+    'hidden':           [64, 128, 256],
+    'prior_hidden':     [64, 128, 256],
+    'n_timesteps':      [50, 100],
+    'epochs':           (10, 30),
+    'prior_epochs':     (10, 20),
+    'batch_size':       [512, 1024, 2048],
+    'lr':               (1e-4, 3e-3),
+    'weight_decay':     (1e-6, 1e-4),
+    'n_samples':        [5, 10, 25],
+    'inference_stride': [1, 5, 10],
+    'pos_weight':       (1.0, 1.8),
+},
 }
 
 
