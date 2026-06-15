@@ -52,6 +52,7 @@ data/backtest_results/
 data/*.bak.*
 data/headlines.json
 data/economic_calendar.json
+data/.modal_workspace_spend.json
 data/vix_sentiment.json
 data/latest_signal.json
 data/system-status.json
