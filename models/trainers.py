@@ -13702,6 +13702,7 @@ class ROCKETClassifierTrainer(BaseTrainer):
                  ridge_alpha: float = 1.0,
                  class_weight: str = 'balanced',
                  chunk_size: int = 4096,
+                 day_abstain_q: float = 0.0,
                  random_state: int = 42,
                  **_):
         self._params = dict(
@@ -13711,6 +13712,7 @@ class ROCKETClassifierTrainer(BaseTrainer):
             ridge_alpha=float(ridge_alpha),
             class_weight=str(class_weight),
             chunk_size=int(chunk_size),
+            day_abstain_q=float(day_abstain_q),
             random_state=int(random_state),
         )
         self._kernels = None
@@ -13718,6 +13720,8 @@ class ROCKETClassifierTrainer(BaseTrainer):
         self._channels = None
         self._scaler = None
         self._clf = None
+        self._train_day_score_sorted = None
+        self._predict_dates = None
 
     def _generate_kernels(self, seq_len: int, channels: int):
         p = self._params
@@ -13848,7 +13852,25 @@ class ROCKETClassifierTrainer(BaseTrainer):
             n_jobs=1,
         )
         self._clf.fit(Z, y_full)
+
+        if p['day_abstain_q'] > 0 and dates_train is not None and dates_val is not None:
+            try:
+                d_full = np.concatenate(
+                    [np.asarray(dates_train), np.asarray(dates_val)])
+                if len(d_full) == len(y_full):
+                    train_scores = self._clf.predict_proba(Z)[:, 1].astype(np.float32)
+                    uniq = np.unique(d_full)
+                    day_means = np.empty(len(uniq), dtype=np.float32)
+                    for i, d in enumerate(uniq):
+                        day_means[i] = float(np.mean(train_scores[d_full == d]))
+                    self._train_day_score_sorted = np.sort(day_means)
+            except Exception:
+                self._train_day_score_sorted = None
         return self
+
+    def set_predict_context(self, dates):
+        self._predict_dates = (
+            np.asarray(dates) if dates is not None else None)
 
     def predict_proba(self, X) -> np.ndarray:
         if self._clf is None:
@@ -13857,7 +13879,23 @@ class ROCKETClassifierTrainer(BaseTrainer):
         X = np.clip(X, -8.0, 8.0)
         Z = self._transform(X)
         Z = self._scaler.transform(Z)
-        return self._clf.predict_proba(Z)[:, 1]
+        scores = self._clf.predict_proba(Z)[:, 1].astype(np.float32)
+
+        q = self._params.get('day_abstain_q', 0.0)
+        if (q > 0 and self._predict_dates is not None
+                and self._train_day_score_sorted is not None
+                and len(self._train_day_score_sorted) > 0
+                and len(self._predict_dates) == len(scores)):
+            d = np.asarray(self._predict_dates)
+            sorted_day = self._train_day_score_sorted
+            n_day = len(sorted_day)
+            for u in np.unique(d):
+                mask = d == u
+                day_mean = float(np.mean(scores[mask]))
+                rank_q = np.searchsorted(sorted_day, day_mean, side='right') / n_day
+                if rank_q < q:
+                    scores[mask] = 0.0
+        return scores
 
     @property
     def hyperparams(self):
@@ -19849,6 +19887,153 @@ class TorchCardClassifierTrainer(BaseTrainer):
             json.dump({'name': self.name, **(extra or {})}, f, indent=2)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import joblib
+from sklearn.linear_model import LogisticRegression
+
+
+class EchoStateClassifierTrainer(BaseTrainer):
+    """Echo State Network — frozen random recurrent reservoir + linear readout.
+
+    Encodes each row's L-step historical sequence panel through a fixed
+    randomly-initialized reservoir of `units` leaky-integrator neurons, takes
+    the last-step state as a high-dimensional feature vector, concatenates
+    it with the tabular features, and fits a logistic-regression readout.
+    No backpropagation.
+    """
+
+    name = 'esn_classifier'
+    consumes_sequences = True
+
+    def __init__(
+        self,
+        units=500,
+        spectral_radius=0.9,
+        leak_rate=0.3,
+        input_scaling=1.0,
+        readout_C=1.0,
+        readout_penalty='l2',
+        warmup=2,
+        pool='last',
+        random_state=42,
+    ):
+        self.units = int(units)
+        self.spectral_radius = float(spectral_radius)
+        self.leak_rate = float(leak_rate)
+        self.input_scaling = float(input_scaling)
+        self.readout_C = float(readout_C)
+        self.readout_penalty = str(readout_penalty)
+        self.warmup = int(warmup)
+        self.pool = str(pool)
+        self.random_state = int(random_state)
+        self._reservoir = None
+        self._readout = None
+        self._seq_mean = None
+        self._seq_std = None
+
+    def _build_reservoir(self):
+        from reservoirpy.nodes import Reservoir
+        return Reservoir(
+            units=self.units,
+            sr=self.spectral_radius,
+            lr=self.leak_rate,
+            input_scaling=self.input_scaling,
+            seed=self.random_state,
+        )
+
+    def _standardize_seq(self, seq_arr, fit_stats=False):
+        # seq_arr: (N, L, C) per-row historical panel
+        if fit_stats:
+            self._seq_mean = seq_arr.mean(axis=(0, 1), keepdims=True).astype(np.float32)
+            std = seq_arr.std(axis=(0, 1), keepdims=True).astype(np.float32)
+            std[std < 1e-6] = 1.0
+            self._seq_std = std
+        return ((seq_arr - self._seq_mean) / self._seq_std).astype(np.float32)
+
+    def _encode(self, seq_arr):
+        # seq_arr: (N, L, C) normalized. Returns (N, units).
+        N, L, _ = seq_arr.shape
+        Z = np.zeros((N, self.units), dtype=np.float32)
+        for i in range(N):
+            self._reservoir.reset()
+            states = self._reservoir.run(seq_arr[i])
+            # states: (L, units)
+            start = min(self.warmup, max(0, L - 1))
+            if self.pool == 'mean':
+                Z[i] = states[start:].mean(axis=0)
+            else:
+                Z[i] = states[-1]
+        return Z
+
+    def _coerce_seq(self, X, seq):
+        # Accept either an explicit panel (N, L, C) via `seq` kwarg
+        # or fall back to a degenerate L=1 panel built from the 2D X.
+        if seq is not None:
+            arr = np.asarray(seq, dtype=np.float32)
+            if arr.ndim == 2:
+                arr = arr[:, None, :]
+            return arr
+        X = np.asarray(X, dtype=np.float32)
+        return X.reshape(X.shape[0], 1, X.shape[1])
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        seq_tr = self._coerce_seq(X_tr, kwargs.get('seq_tr'))
+        seq_tr = self._standardize_seq(seq_tr, fit_stats=True)
+        self._reservoir = self._build_reservoir()
+        Z_tr = self._encode(seq_tr)
+        X_tr_arr = np.asarray(X_tr, dtype=np.float32)
+        feat = np.concatenate([Z_tr, X_tr_arr], axis=1)
+        self._readout = LogisticRegression(
+            C=self.readout_C,
+            penalty=self.readout_penalty,
+            solver='lbfgs' if self.readout_penalty == 'l2' else 'liblinear',
+            max_iter=2000,
+            random_state=self.random_state,
+            n_jobs=-1 if self.readout_penalty == 'l2' else None,
+        )
+        self._readout.fit(feat, np.asarray(y_tr).astype(np.int64))
+        return self
+
+    def predict_proba(self, X, **kwargs):
+        seq = self._coerce_seq(X, kwargs.get('seq'))
+        seq = self._standardize_seq(seq, fit_stats=False)
+        Z = self._encode(seq)
+        X_arr = np.asarray(X, dtype=np.float32)
+        feat = np.concatenate([Z, X_arr], axis=1)
+        proba = self._readout.predict_proba(feat)[:, 1]
+        return np.asarray(proba, dtype=np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        joblib.dump(
+            {
+                'reservoir': self._reservoir,
+                'readout': self._readout,
+                'seq_mean': self._seq_mean,
+                'seq_std': self._seq_std,
+                'config': {
+                    'units': self.units,
+                    'spectral_radius': self.spectral_radius,
+                    'leak_rate': self.leak_rate,
+                    'input_scaling': self.input_scaling,
+                    'readout_C': self.readout_C,
+                    'readout_penalty': self.readout_penalty,
+                    'warmup': self.warmup,
+                    'pool': self.pool,
+                    'random_state': self.random_state,
+                },
+            },
+            os.path.join(model_dir, 'model.joblib'),
+        )
+        if extra:
+            with open(os.path.join(model_dir, 'extra.json'), 'w') as f:
+                json.dump(extra, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -19935,6 +20120,7 @@ TRAINERS = {
     'torch_lag_llama': TorchLagLlamaTrainer,
     # Single line to append to TRAINERS dict in models/trainers.py
 'torch_card_classifier': TorchCardClassifierTrainer,
+    'esn_classifier': EchoStateClassifierTrainer,
 }
 
 

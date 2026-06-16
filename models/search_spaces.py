@@ -1431,6 +1431,7 @@ SEARCH_SPACES: dict[str, dict] = {
     'max_channels_per_kernel':  [4, 6, 9, 12],
     'ridge_alpha':              (0.1, 10.0),
     'class_weight':             ['balanced', 'none'],
+    'day_abstain_q':            [0.0, 0.15, 0.25, 0.35],
     'random_state':             [42, 7, 1337, 2024],
 },
     'torch_xlstm': {
@@ -1773,6 +1774,16 @@ SEARCH_SPACES: dict[str, dict] = {
     'n_samples':        [5, 10, 25],
     'inference_stride': [1, 5, 10],
     'pos_weight':       (1.0, 1.8),
+},
+    'esn_classifier': {
+    'units':           [200, 500, 1000],
+    'spectral_radius': (0.5, 1.2),
+    'leak_rate':       (0.1, 0.9),
+    'input_scaling':   (0.3, 2.0),
+    'readout_C':       (0.01, 10.0),
+    'readout_penalty': ['l2', 'l1'],
+    'warmup':          [0, 2, 5],
+    'pool':            ['last', 'mean'],
 },
 }
 
