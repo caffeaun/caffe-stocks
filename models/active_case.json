@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep CARD as the active case \u2014 pos_weight=1.3 single-lever nudge (iter #2850) regressed avg_ann +13.0%\u2192+6.5% and worsened W5 DD 26.7%\u219230.0%, so pos_weight is NOT the right lever. W6 +154% / W7 +85% jackpots preserved (still the biggest single-window magnitudes in 20+ iters) and threshold sweep alive on W2/W4/W5/W6 (thr=0.6-0.65). Train_mode should sweep the OTHER brief-recommended levers now: epochs \u2208 [10, 30], prior_epochs \u2208 [15, 20], n_samples \u2208 [10, 25], inference_stride \u2208 [1, 5] (search_spaces.py already covers these). Pin pos_weight \u2264 1.3 and avoid revisiting it as the primary axis.",
-  "claude_iter_id": 2850,
-  "designated_at": "2026-06-16T12:06:21"
+  "rationale": "FIRST CARD wp pass (iter #2851: W6 thr=0.6 ann=+440%/WR 52.2%/n=23/DD 6.9%) at (n_samples=10, inference_stride=5, pos_weight=1.0); avg_ann +13.0%\u2192+44.4%. Train_mode should sweep n_timesteps \u2208 {50, 100}, hidden \u2208 {64, 128, 256}, epochs \u2208 [20, 30], prior_epochs \u2208 [15, 20] pinning (n_samples=10, inference_stride=5, pos_weight=1.0); DO NOT sweep pos_weight per #2850 lesson.",
+  "claude_iter_id": 2851,
+  "designated_at": "2026-06-16T18:08:54"
 }
