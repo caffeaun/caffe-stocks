@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from Modal-blocked torch_lag_llama to torch_card_classifier. First-shot avg_ann +13.0% (positive \u2014 top quartile of last-20 claude iters), W6 +175% / W7 +85% magnitude jackpots, alive threshold sweeps on W1/W2/W6, CPU-only ~3min/fold (no Modal dependency). Clear single-lever sweep priority per brief: (1) pos_weight \u2208 [1.2, 1.5] to fix W3/W4/W5 DD blowups, (2) revert CPU nudge to brief defaults (n_samples=10, inference_stride=5), (3) prior_epochs \u2208 [18, 20]. First generative-classifier slot in 81-trainer registry \u2014 preserving it is structurally informative for research_mode.",
-  "claude_iter_id": 2849,
-  "designated_at": "2026-06-16T06:06:15"
+  "rationale": "Keep CARD as the active case \u2014 pos_weight=1.3 single-lever nudge (iter #2850) regressed avg_ann +13.0%\u2192+6.5% and worsened W5 DD 26.7%\u219230.0%, so pos_weight is NOT the right lever. W6 +154% / W7 +85% jackpots preserved (still the biggest single-window magnitudes in 20+ iters) and threshold sweep alive on W2/W4/W5/W6 (thr=0.6-0.65). Train_mode should sweep the OTHER brief-recommended levers now: epochs \u2208 [10, 30], prior_epochs \u2208 [15, 20], n_samples \u2208 [10, 25], inference_stride \u2208 [1, 5] (search_spaces.py already covers these). Pin pos_weight \u2264 1.3 and avoid revisiting it as the primary axis.",
+  "claude_iter_id": 2850,
+  "designated_at": "2026-06-16T12:06:21"
 }
