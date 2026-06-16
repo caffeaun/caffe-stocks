@@ -19887,23 +19887,19 @@ class TorchCardClassifierTrainer(BaseTrainer):
             json.dump({'name': self.name, **(extra or {})}, f, indent=2)
 
 
-# models/trainers.py — append at end (before TRAINERS dict)
-
-import os
-import json
-import numpy as np
-import joblib
-from sklearn.linear_model import LogisticRegression
-
-
 class EchoStateClassifierTrainer(BaseTrainer):
     """Echo State Network — frozen random recurrent reservoir + linear readout.
 
     Encodes each row's L-step historical sequence panel through a fixed
-    randomly-initialized reservoir of `units` leaky-integrator neurons, takes
-    the last-step state as a high-dimensional feature vector, concatenates
-    it with the tabular features, and fits a logistic-regression readout.
-    No backpropagation.
+    randomly-initialized leaky-integrator reservoir, pools the post-warmup
+    states into a `units`-dim feature vector, concatenates it with the
+    last-step raw features, and fits a logistic-regression readout. No
+    backpropagation — only the readout is trained.
+
+    Implementation uses a batched NumPy reservoir update (S_{t+1} =
+    (1-lr)*S_t + lr*tanh(X_t @ W_in.T + S_t @ W.T)) instead of the
+    per-sequence loop in reservoirpy.nodes.Reservoir, which would not
+    complete inside the wall-time budget at N ≈ 80k.
     """
 
     name = 'esn_classifier'
@@ -19911,42 +19907,56 @@ class EchoStateClassifierTrainer(BaseTrainer):
 
     def __init__(
         self,
-        units=500,
+        units=300,
         spectral_radius=0.9,
         leak_rate=0.3,
         input_scaling=1.0,
+        density=0.1,
         readout_C=1.0,
         readout_penalty='l2',
         warmup=2,
         pool='last',
+        pos_class_weight=1.5,
+        include_last_step=True,
         random_state=42,
+        **_,
     ):
         self.units = int(units)
         self.spectral_radius = float(spectral_radius)
         self.leak_rate = float(leak_rate)
         self.input_scaling = float(input_scaling)
+        self.density = float(density)
         self.readout_C = float(readout_C)
         self.readout_penalty = str(readout_penalty)
         self.warmup = int(warmup)
         self.pool = str(pool)
+        self.pos_class_weight = float(pos_class_weight)
+        self.include_last_step = bool(include_last_step)
         self.random_state = int(random_state)
-        self._reservoir = None
+        self._W_in = None
+        self._W = None
         self._readout = None
         self._seq_mean = None
         self._seq_std = None
 
-    def _build_reservoir(self):
-        from reservoirpy.nodes import Reservoir
-        return Reservoir(
-            units=self.units,
-            sr=self.spectral_radius,
-            lr=self.leak_rate,
-            input_scaling=self.input_scaling,
-            seed=self.random_state,
-        )
+    def _init_reservoir(self, n_channels):
+        rng = np.random.RandomState(self.random_state)
+        units = self.units
 
-    def _standardize_seq(self, seq_arr, fit_stats=False):
-        # seq_arr: (N, L, C) per-row historical panel
+        W_in = rng.uniform(-1.0, 1.0, size=(units, n_channels)).astype(np.float32)
+        W_in *= np.float32(self.input_scaling)
+
+        W = rng.uniform(-1.0, 1.0, size=(units, units)).astype(np.float32)
+        mask = (rng.uniform(0.0, 1.0, size=(units, units)) < self.density).astype(np.float32)
+        W *= mask
+        sr = float(np.max(np.abs(np.linalg.eigvals(W.astype(np.float64)))))
+        if sr > 1e-9:
+            W *= np.float32(self.spectral_radius / sr)
+
+        self._W_in = W_in
+        self._W = W
+
+    def _standardize(self, seq_arr, fit_stats=False):
         if fit_stats:
             self._seq_mean = seq_arr.mean(axis=(0, 1), keepdims=True).astype(np.float32)
             std = seq_arr.std(axis=(0, 1), keepdims=True).astype(np.float32)
@@ -19955,55 +19965,89 @@ class EchoStateClassifierTrainer(BaseTrainer):
         return ((seq_arr - self._seq_mean) / self._seq_std).astype(np.float32)
 
     def _encode(self, seq_arr):
-        # seq_arr: (N, L, C) normalized. Returns (N, units).
+        import torch as _torch
+        _torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
         N, L, _ = seq_arr.shape
-        Z = np.zeros((N, self.units), dtype=np.float32)
-        for i in range(N):
-            self._reservoir.reset()
-            states = self._reservoir.run(seq_arr[i])
-            # states: (L, units)
-            start = min(self.warmup, max(0, L - 1))
-            if self.pool == 'mean':
-                Z[i] = states[start:].mean(axis=0)
-            else:
-                Z[i] = states[-1]
-        return Z
+        units = self.units
+        leak = float(self.leak_rate)
+        one_minus_leak = 1.0 - leak
+        seq_t = _torch.from_numpy(np.ascontiguousarray(seq_arr))
+        W_in_T = _torch.from_numpy(np.ascontiguousarray(self._W_in.T))
+        W_T = _torch.from_numpy(np.ascontiguousarray(self._W.T))
 
-    def _coerce_seq(self, X, seq):
-        # Accept either an explicit panel (N, L, C) via `seq` kwarg
-        # or fall back to a degenerate L=1 panel built from the 2D X.
-        if seq is not None:
-            arr = np.asarray(seq, dtype=np.float32)
-            if arr.ndim == 2:
-                arr = arr[:, None, :]
-            return arr
+        S = _torch.zeros((N, units), dtype=_torch.float32)
+        if self.pool == 'mean':
+            accum = _torch.zeros((N, units), dtype=_torch.float32)
+            n_accum = 0
+        for t in range(L):
+            Xt = seq_t[:, t, :]
+            pre = Xt @ W_in_T + S @ W_T
+            S = one_minus_leak * S + leak * _torch.tanh(pre)
+            if self.pool == 'mean' and t >= self.warmup:
+                accum += S
+                n_accum += 1
+        if self.pool == 'mean':
+            return (accum / max(n_accum, 1)).numpy()
+        return S.numpy()
+
+    @staticmethod
+    def _coerce_3d(X):
         X = np.asarray(X, dtype=np.float32)
-        return X.reshape(X.shape[0], 1, X.shape[1])
+        if X.ndim == 2:
+            X = X[:, None, :]
+        elif X.ndim != 3:
+            raise ValueError(f'esn_classifier expects 3D (N, L, C); got {X.shape}.')
+        return X
 
     def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
-        seq_tr = self._coerce_seq(X_tr, kwargs.get('seq_tr'))
-        seq_tr = self._standardize_seq(seq_tr, fit_stats=True)
-        self._reservoir = self._build_reservoir()
-        Z_tr = self._encode(seq_tr)
-        X_tr_arr = np.asarray(X_tr, dtype=np.float32)
-        feat = np.concatenate([Z_tr, X_tr_arr], axis=1)
+        seq_tr = self._coerce_3d(X_tr)
+        seq_val = self._coerce_3d(X_val) if X_val is not None and len(X_val) > 0 else None
+        y_tr_arr = np.asarray(y_tr).astype(np.int64)
+        if seq_val is not None and y_val is not None and len(y_val) > 0:
+            seq_full = np.concatenate([seq_tr, seq_val], axis=0)
+            y_full = np.concatenate([y_tr_arr, np.asarray(y_val).astype(np.int64)])
+        else:
+            seq_full = seq_tr
+            y_full = y_tr_arr
+
+        seq_norm = self._standardize(seq_full, fit_stats=True)
+        self._init_reservoir(seq_norm.shape[2])
+        Z = self._encode(seq_norm)
+        if self.include_last_step:
+            feat = np.concatenate([Z, seq_norm[:, -1, :]], axis=1)
+        else:
+            feat = Z
+
+        class_weight = None
+        if abs(self.pos_class_weight - 1.0) > 1e-6:
+            class_weight = {0: 1.0, 1: float(self.pos_class_weight)}
+
+        if self.readout_penalty == 'l2':
+            solver = 'lbfgs'
+            n_jobs = -1
+        else:
+            solver = 'liblinear'
+            n_jobs = None
         self._readout = LogisticRegression(
             C=self.readout_C,
             penalty=self.readout_penalty,
-            solver='lbfgs' if self.readout_penalty == 'l2' else 'liblinear',
+            solver=solver,
             max_iter=2000,
             random_state=self.random_state,
-            n_jobs=-1 if self.readout_penalty == 'l2' else None,
+            class_weight=class_weight,
+            n_jobs=n_jobs,
         )
-        self._readout.fit(feat, np.asarray(y_tr).astype(np.int64))
+        self._readout.fit(feat, y_full)
         return self
 
     def predict_proba(self, X, **kwargs):
-        seq = self._coerce_seq(X, kwargs.get('seq'))
-        seq = self._standardize_seq(seq, fit_stats=False)
+        seq = self._coerce_3d(X)
+        seq = self._standardize(seq, fit_stats=False)
         Z = self._encode(seq)
-        X_arr = np.asarray(X, dtype=np.float32)
-        feat = np.concatenate([Z, X_arr], axis=1)
+        if self.include_last_step:
+            feat = np.concatenate([Z, seq[:, -1, :]], axis=1)
+        else:
+            feat = Z
         proba = self._readout.predict_proba(feat)[:, 1]
         return np.asarray(proba, dtype=np.float32)
 
@@ -20011,7 +20055,8 @@ class EchoStateClassifierTrainer(BaseTrainer):
         os.makedirs(model_dir, exist_ok=True)
         joblib.dump(
             {
-                'reservoir': self._reservoir,
+                'W_in': self._W_in,
+                'W': self._W,
                 'readout': self._readout,
                 'seq_mean': self._seq_mean,
                 'seq_std': self._seq_std,
@@ -20020,10 +20065,13 @@ class EchoStateClassifierTrainer(BaseTrainer):
                     'spectral_radius': self.spectral_radius,
                     'leak_rate': self.leak_rate,
                     'input_scaling': self.input_scaling,
+                    'density': self.density,
                     'readout_C': self.readout_C,
                     'readout_penalty': self.readout_penalty,
                     'warmup': self.warmup,
                     'pool': self.pool,
+                    'pos_class_weight': self.pos_class_weight,
+                    'include_last_step': self.include_last_step,
                     'random_state': self.random_state,
                 },
             },

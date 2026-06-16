@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_card_classifier",
+  "trainer": "esn_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "FIRST CARD wp pass (iter #2851: W6 thr=0.6 ann=+440%/WR 52.2%/n=23/DD 6.9%) at (n_samples=10, inference_stride=5, pos_weight=1.0); avg_ann +13.0%\u2192+44.4%. Train_mode should sweep n_timesteps \u2208 {50, 100}, hidden \u2208 {64, 128, 256}, epochs \u2208 [20, 30], prior_epochs \u2208 [15, 20] pinning (n_samples=10, inference_stride=5, pos_weight=1.0); DO NOT sweep pos_weight per #2850 lesson.",
-  "claude_iter_id": 2851,
-  "designated_at": "2026-06-16T18:08:54"
+  "rationale": "First reservoir-computing entry in the registry. Default-shot W4 NARROW MISS (42.9% WR, 4pp shy of 47% regime floor, +16.4% ann, 8.6% DD, n=21) plus W6 +23.7% ann \u2014 only ESN family member with an alive thr-sweep on 4/7 windows and the genuinely orthogonal non-gradient inductive bias the loop hasn't explored. Train mode single-lever order: readout_C \u2208 [0.1, 10] first (LR regularization, 'readout_C' is the only knob that can move the bear-WR floor without disturbing the reservoir's frozen dynamics), then spectral_radius \u2208 [0.7, 1.2] (reservoir richness \u2014 beware sr>1.0 destabilizes the leaky integrator), then pos_class_weight \u2208 [1.0, 2.0]. Skip units (encode is wall-time-bounded at 300) and density (0.1 already gives the canonical sparse-reservoir prior).",
+  "claude_iter_id": 2852,
+  "designated_at": "2026-06-17T06:19:55"
 }
