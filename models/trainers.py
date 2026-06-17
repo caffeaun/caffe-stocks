@@ -20275,14 +20275,17 @@ class TorchModernTCNTrainer(BaseTrainer):
         self._seq_len = None
 
     def _coerce_seq(self, X, seq):
-        # Sequence-loader path: (N, L, K).
+        # Primary path: gate threads (N, L, K) directly as X_tr for
+        # consumes_sequences=True trainers; secondary path: explicit `seq` kwarg.
         if seq is not None:
             arr = np.asarray(seq, dtype=np.float32)
             if arr.ndim == 2:
                 arr = arr[:, None, :]
             return arr
-        # Fallback: treat the flat tabular row as a single-variable length-F sequence.
         X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 3:
+            return X
+        # Final fallback: treat the flat tabular row as a single-variable length-F sequence.
         return X.reshape(X.shape[0], X.shape[1], 1)
 
     def _standardize_seq(self, seq_arr, fit_stats=False):

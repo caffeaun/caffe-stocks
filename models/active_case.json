@@ -1,12 +1,12 @@
 {
-  "trainer": "esn_classifier",
+  "trainer": "torch_moderntcn",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "First reservoir-computing entry in the registry. Default-shot W4 NARROW MISS (42.9% WR, 4pp shy of 47% regime floor, +16.4% ann, 8.6% DD, n=21) plus W6 +23.7% ann \u2014 only ESN family member with an alive thr-sweep on 4/7 windows and the genuinely orthogonal non-gradient inductive bias the loop hasn't explored. Train mode single-lever order: readout_C \u2208 [0.1, 10] first (LR regularization, 'readout_C' is the only knob that can move the bear-WR floor without disturbing the reservoir's frozen dynamics), then spectral_radius \u2208 [0.7, 1.2] (reservoir richness \u2014 beware sr>1.0 destabilizes the leaky integrator), then pos_class_weight \u2208 [1.0, 2.0]. Skip units (encode is wall-time-bounded at 300) and density (0.1 already gives the canonical sparse-reservoir prior).",
-  "claude_iter_id": 2852,
-  "designated_at": "2026-06-17T06:19:55"
+  "rationale": "ModernTCN survived first-shot (W2 PASS @ thr=0.0 50% WR / +7.1% ann; W1 narrow miss thr=0.6 +17.5% ann) but the CPU wall blew up on splits 5-7. Pin {num_blocks=1, dims=32, batch_size=512} for wall-time safety and let train_mode sweep epochs \u2208 [10, 25], pos_weight \u2208 [1.0, 1.8], dropout \u2208 [0.0, 0.3], head_dropout \u2208 [0.0, 0.3], learning_rate \u2208 [3e-4, 3e-3] one-at-a-time. Per [[timesfm-pos-weight-2-regresses]] keep pos_weight \u2264 1.5; the score-collapse on splits 3-4 (thr=0.0 dominates) is the same calibration symptom seen in iter #2849 CARD and is the priority axis for the sweep.",
+  "claude_iter_id": 2853,
+  "designated_at": "2026-06-18T06:32:56"
 }
