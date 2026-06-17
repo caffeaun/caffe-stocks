@@ -1785,6 +1785,23 @@ SEARCH_SPACES: dict[str, dict] = {
     'warmup':          [0, 2, 5],
     'pool':            ['last', 'mean'],
 },
+    'torch_moderntcn': {
+    'patch_size':     [2, 4, 8],
+    'patch_stride':   [1, 2, 4],
+    'num_blocks':     [1, 2, 3],
+    'large_size':     [7, 13, 21],
+    'small_size':     [3, 5],
+    'dims':           [32, 64, 128],
+    'ffn_ratio':      [1, 2, 4],
+    'dropout':        (0.0, 0.3),
+    'head_dropout':   (0.0, 0.3),
+    'pos_weight':     (1.0, 1.8),
+    'learning_rate':  (1e-4, 5e-3),
+    'weight_decay':   (1e-6, 1e-2),
+    'batch_size':     [128, 256, 512],
+    'epochs':         [20, 30, 50],
+    'revin':          [True, False],
+},
 }
 
 

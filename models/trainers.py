@@ -19912,7 +19912,7 @@ class EchoStateClassifierTrainer(BaseTrainer):
         leak_rate=0.3,
         input_scaling=1.0,
         density=0.1,
-        readout_C=1.0,
+        readout_C=0.3,
         readout_penalty='l2',
         warmup=2,
         pool='last',
@@ -20082,6 +20082,334 @@ class EchoStateClassifierTrainer(BaseTrainer):
                 json.dump(extra, f, indent=2)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _ReparamLargeKernelConv1d(nn.Module):
+    """Depth-wise large-kernel conv with a parallel small-kernel branch
+    (re-parameterized at inference time per the RepLKNet / ModernTCN trick)."""
+
+    def __init__(self, channels, large_kernel, small_kernel, stride=1):
+        super().__init__()
+        self.large_kernel = int(large_kernel)
+        self.small_kernel = int(small_kernel) if small_kernel else 0
+        pad_l = self.large_kernel // 2
+        self.lk = nn.Conv1d(channels, channels, kernel_size=self.large_kernel,
+                            stride=stride, padding=pad_l, groups=channels, bias=False)
+        self.lk_bn = nn.BatchNorm1d(channels)
+        if self.small_kernel > 0:
+            assert self.small_kernel <= self.large_kernel
+            pad_s = self.small_kernel // 2
+            self.sk = nn.Conv1d(channels, channels, kernel_size=self.small_kernel,
+                                stride=stride, padding=pad_s, groups=channels, bias=False)
+            self.sk_bn = nn.BatchNorm1d(channels)
+        else:
+            self.sk = None
+
+    def forward(self, x):
+        out = self.lk_bn(self.lk(x))
+        if self.sk is not None:
+            out = out + self.sk_bn(self.sk(x))
+        return out
+
+
+class _ModernTCNBlock(nn.Module):
+    """One ModernTCN block: depth-wise large-kernel conv -> BN ->
+    cross-channel ConvFFN -> cross-variable ConvFFN, with residual."""
+
+    def __init__(self, nvars, dmodel, large_kernel, small_kernel,
+                 ffn_ratio, dropout):
+        super().__init__()
+        self.nvars = int(nvars)
+        self.dmodel = int(dmodel)
+        dff = int(dmodel * ffn_ratio)
+        ch = nvars * dmodel
+        self.dw = _ReparamLargeKernelConv1d(ch, large_kernel, small_kernel)
+        self.norm = nn.BatchNorm1d(dmodel)
+        # ConvFFN over channels (per-variable mixing of feature dimensions)
+        self.ffn1_pw1 = nn.Conv1d(ch, nvars * dff, kernel_size=1, groups=nvars)
+        self.ffn1_pw2 = nn.Conv1d(nvars * dff, ch, kernel_size=1, groups=nvars)
+        # ConvFFN over variables (per-feature mixing of variables)
+        self.ffn2_pw1 = nn.Conv1d(ch, nvars * dff, kernel_size=1, groups=dmodel)
+        self.ffn2_pw2 = nn.Conv1d(nvars * dff, ch, kernel_size=1, groups=dmodel)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.drop2 = nn.Dropout(dropout)
+        self.drop3 = nn.Dropout(dropout)
+        self.drop4 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, M, D, N) — M variables, D feature dim, N temporal patches
+        residual = x
+        B, M, D, N = x.shape
+        h = x.reshape(B, M * D, N)
+        h = self.dw(h)
+        h = h.reshape(B * M, D, N)
+        h = self.norm(h)
+        h = h.reshape(B, M * D, N)
+        h = self.drop1(self.ffn1_pw1(h))
+        h = self.act(h)
+        h = self.drop2(self.ffn1_pw2(h))
+        h = h.reshape(B, M, D, N).permute(0, 2, 1, 3).reshape(B, D * M, N)
+        h = self.drop3(self.ffn2_pw1(h))
+        h = self.act(h)
+        h = self.drop4(self.ffn2_pw2(h))
+        h = h.reshape(B, D, M, N).permute(0, 2, 1, 3)
+        return residual + h
+
+
+class _ModernTCNNet(nn.Module):
+    """Full ModernTCN classifier head over (B, M, L) variates-over-length input."""
+
+    def __init__(self, nvars, seq_len, patch_size, patch_stride,
+                 num_blocks, large_size, small_size, dims, ffn_ratio,
+                 dropout, head_dropout):
+        super().__init__()
+        self.nvars = int(nvars)
+        self.seq_len = int(seq_len)
+        self.patch_size = int(patch_size)
+        self.patch_stride = int(patch_stride)
+        # Stem: per-variable 1x1 conv that patches the time axis.
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, dims[0], kernel_size=self.patch_size,
+                      stride=self.patch_stride),
+            nn.BatchNorm1d(dims[0]),
+        )
+        # Number of patches after the stem.
+        self.patch_num = max(1, (self.seq_len - self.patch_size) // self.patch_stride + 1)
+        # Backbone: a single multi-block stage at dims[0] (small + sequential).
+        self.blocks = nn.ModuleList([
+            _ModernTCNBlock(
+                nvars=self.nvars,
+                dmodel=dims[0],
+                large_kernel=large_size[0],
+                small_kernel=small_size[0],
+                ffn_ratio=ffn_ratio,
+                dropout=dropout,
+            )
+            for _ in range(num_blocks[0])
+        ])
+        self.act = nn.GELU()
+        self.head_drop = nn.Dropout(head_dropout)
+        self.head = nn.Linear(self.nvars * dims[0] * self.patch_num, 1)
+
+    def forward(self, x):
+        # x: (B, M, L)
+        B, M, L = x.shape
+        # Patch each variable independently with the shared stem.
+        x = x.reshape(B * M, 1, L)
+        if L < self.patch_size:
+            x = F.pad(x, (0, self.patch_size - L))
+        x = self.stem(x)
+        x = x.reshape(B, M, x.shape[1], x.shape[2])
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.act(x)
+        x = self.head_drop(x)
+        x = x.reshape(B, -1)
+        return self.head(x).squeeze(-1)
+
+
+class TorchModernTCNTrainer(BaseTrainer):
+    """ModernTCN: pure-convolution time-series classifier with large-kernel
+    depthwise convs, dual ConvFFNs, and a flatten head.
+
+    Operates on the per-row historical panel of shape (N, L, K) provided by
+    the sequence loader (consumes_sequences=True). Falls back to a degenerate
+    (N, 1, F) view of the 2D tabular X if the sequence wiring is not yet
+    plumbed for this trainer.
+    """
+
+    name = 'torch_moderntcn'
+    consumes_sequences = True
+
+    def __init__(
+        self,
+        patch_size=4,
+        patch_stride=2,
+        num_blocks=2,
+        large_size=7,
+        small_size=3,
+        dims=64,
+        ffn_ratio=2,
+        dropout=0.1,
+        head_dropout=0.1,
+        pos_weight=1.5,
+        learning_rate=1e-3,
+        weight_decay=1e-4,
+        batch_size=256,
+        epochs=30,
+        revin=True,
+        random_state=42,
+        device=None,
+    ):
+        self.patch_size = int(patch_size)
+        self.patch_stride = int(patch_stride)
+        self.num_blocks = int(num_blocks)
+        self.large_size = int(large_size)
+        self.small_size = int(small_size)
+        self.dims = int(dims)
+        self.ffn_ratio = int(ffn_ratio)
+        self.dropout = float(dropout)
+        self.head_dropout = float(head_dropout)
+        self.pos_weight = float(pos_weight)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.revin = bool(revin)
+        self.random_state = int(random_state)
+        self._device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self._net = None
+        self._seq_mean = None
+        self._seq_std = None
+        self._nvars = None
+        self._seq_len = None
+
+    def _coerce_seq(self, X, seq):
+        # Sequence-loader path: (N, L, K).
+        if seq is not None:
+            arr = np.asarray(seq, dtype=np.float32)
+            if arr.ndim == 2:
+                arr = arr[:, None, :]
+            return arr
+        # Fallback: treat the flat tabular row as a single-variable length-F sequence.
+        X = np.asarray(X, dtype=np.float32)
+        return X.reshape(X.shape[0], X.shape[1], 1)
+
+    def _standardize_seq(self, seq_arr, fit_stats=False):
+        if self.revin:
+            # Per-row instance norm (RevIN-lite): centers each row's panel
+            # to zero-mean / unit-std per channel, restoring scale-equivariance.
+            mu = seq_arr.mean(axis=1, keepdims=True)
+            sd = seq_arr.std(axis=1, keepdims=True)
+            sd = np.where(sd < 1e-6, 1.0, sd)
+            return ((seq_arr - mu) / sd).astype(np.float32)
+        if fit_stats:
+            self._seq_mean = seq_arr.mean(axis=(0, 1), keepdims=True).astype(np.float32)
+            std = seq_arr.std(axis=(0, 1), keepdims=True).astype(np.float32)
+            std[std < 1e-6] = 1.0
+            self._seq_std = std
+        return ((seq_arr - self._seq_mean) / self._seq_std).astype(np.float32)
+
+    def _to_btn(self, seq_arr):
+        # seq_arr: (N, L, K) -> (N, K, L) so each variable is a 1D conv channel.
+        return torch.from_numpy(np.transpose(seq_arr, (0, 2, 1)).copy())
+
+    def _build_net(self, nvars, seq_len):
+        torch.manual_seed(self.random_state)
+        return _ModernTCNNet(
+            nvars=nvars,
+            seq_len=seq_len,
+            patch_size=self.patch_size,
+            patch_stride=self.patch_stride,
+            num_blocks=[self.num_blocks],
+            large_size=[self.large_size],
+            small_size=[self.small_size],
+            dims=[self.dims],
+            ffn_ratio=self.ffn_ratio,
+            dropout=self.dropout,
+            head_dropout=self.head_dropout,
+        ).to(self._device)
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        seq_tr = self._standardize_seq(self._coerce_seq(X_tr, kwargs.get('seq_tr')), fit_stats=True)
+        seq_val = self._standardize_seq(self._coerce_seq(X_val, kwargs.get('seq_val')), fit_stats=False)
+        N, L, K = seq_tr.shape
+        self._nvars = K
+        self._seq_len = L
+        self._net = self._build_net(nvars=K, seq_len=L)
+        x_tr = self._to_btn(seq_tr)
+        y_tr_t = torch.from_numpy(np.asarray(y_tr, dtype=np.float32))
+        x_val = self._to_btn(seq_val).to(self._device)
+        y_val_t = torch.from_numpy(np.asarray(y_val, dtype=np.float32)).to(self._device)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([self.pos_weight], device=self._device)
+        )
+        opt = torch.optim.AdamW(
+            self._net.parameters(), lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        best_val = float('inf')
+        best_state = None
+        for epoch in range(self.epochs):
+            self._net.train()
+            perm = torch.randperm(x_tr.shape[0])
+            for i in range(0, x_tr.shape[0], self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                xb = x_tr[idx].to(self._device)
+                yb = y_tr_t[idx].to(self._device)
+                opt.zero_grad()
+                logits = self._net(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                opt.step()
+            self._net.eval()
+            with torch.no_grad():
+                val_logits = self._net(x_val)
+                val_loss = loss_fn(val_logits, y_val_t).item()
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in self._net.state_dict().items()}
+        if best_state is not None:
+            self._net.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X, **kwargs):
+        seq = self._standardize_seq(self._coerce_seq(X, kwargs.get('seq')), fit_stats=False)
+        x = self._to_btn(seq).to(self._device)
+        self._net.eval()
+        out = np.zeros((x.shape[0],), dtype=np.float32)
+        with torch.no_grad():
+            for i in range(0, x.shape[0], self.batch_size):
+                xb = x[i:i + self.batch_size]
+                logits = self._net(xb)
+                out[i:i + self.batch_size] = torch.sigmoid(logits).cpu().numpy()
+        return out
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(
+            {
+                'state_dict': self._net.state_dict() if self._net is not None else None,
+                'seq_mean': None if self._seq_mean is None else self._seq_mean.tolist(),
+                'seq_std': None if self._seq_std is None else self._seq_std.tolist(),
+                'nvars': self._nvars,
+                'seq_len': self._seq_len,
+                'config': {
+                    'patch_size': self.patch_size,
+                    'patch_stride': self.patch_stride,
+                    'num_blocks': self.num_blocks,
+                    'large_size': self.large_size,
+                    'small_size': self.small_size,
+                    'dims': self.dims,
+                    'ffn_ratio': self.ffn_ratio,
+                    'dropout': self.dropout,
+                    'head_dropout': self.head_dropout,
+                    'pos_weight': self.pos_weight,
+                    'learning_rate': self.learning_rate,
+                    'weight_decay': self.weight_decay,
+                    'batch_size': self.batch_size,
+                    'epochs': self.epochs,
+                    'revin': self.revin,
+                    'random_state': self.random_state,
+                },
+            },
+            os.path.join(model_dir, 'model.pt'),
+        )
+        if extra:
+            with open(os.path.join(model_dir, 'extra.json'), 'w') as f:
+                json.dump(extra, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -20169,6 +20497,7 @@ TRAINERS = {
     # Single line to append to TRAINERS dict in models/trainers.py
 'torch_card_classifier': TorchCardClassifierTrainer,
     'esn_classifier': EchoStateClassifierTrainer,
+    'torch_moderntcn': TorchModernTCNTrainer,
 }
 
 
