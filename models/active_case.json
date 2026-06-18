@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "ModernTCN survived first-shot (W2 PASS @ thr=0.0 50% WR / +7.1% ann; W1 narrow miss thr=0.6 +17.5% ann) but the CPU wall blew up on splits 5-7. Pin {num_blocks=1, dims=32, batch_size=512} for wall-time safety and let train_mode sweep epochs \u2208 [10, 25], pos_weight \u2208 [1.0, 1.8], dropout \u2208 [0.0, 0.3], head_dropout \u2208 [0.0, 0.3], learning_rate \u2208 [3e-4, 3e-3] one-at-a-time. Per [[timesfm-pos-weight-2-regresses]] keep pos_weight \u2264 1.5; the score-collapse on splits 3-4 (thr=0.0 dominates) is the same calibration symptom seen in iter #2849 CARD and is the priority axis for the sweep.",
-  "claude_iter_id": 2853,
-  "designated_at": "2026-06-18T06:32:56"
+  "rationale": "Keep iter #2853's case \u2014 ModernTCN's W2 thr=0.0 PASS (50% WR, +7.1% ann) and W1 alive thr=0.6 (+17.5% ann, 10pp shy of regime floor) is the freshest sweepable signal in the registry; HP sweep should focus pos_weight / dropout / learning_rate around the iter #2853 lean pin (num_blocks=1, dims=32, epochs=15, batch=512) per its lesson.",
+  "claude_iter_id": 2854,
+  "designated_at": "2026-06-19T06:08:59"
 }

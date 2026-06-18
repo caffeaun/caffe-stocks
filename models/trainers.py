@@ -20466,13 +20466,17 @@ class TorchRWKV7Trainer(BaseTrainer):
 
         proj_in = nn.Linear(feature_dim, d_model)
         blocks = nn.ModuleList()
-        for _ in range(self.num_layers):
+        # fla's _initialize_weights divides by (num_hidden_layers - 1); clamp to ≥2.
+        nhl_for_init = max(2, self.num_layers)
+        for i in range(self.num_layers):
             blocks.append(nn.ModuleDict({
                 'norm1': nn.LayerNorm(d_model),
                 'rwkv': RWKV7Attention(
                     hidden_size=d_model,
                     num_heads=self.num_heads,
                     head_dim=self.head_dim,
+                    layer_idx=i,
+                    num_hidden_layers=nhl_for_init,
                 ),
                 'norm2': nn.LayerNorm(d_model),
                 'mlp': nn.Sequential(
@@ -20499,10 +20503,14 @@ class TorchRWKV7Trainer(BaseTrainer):
                 if x.dim() == 2:
                     x = x.unsqueeze(1)
                 h = self.proj_in(x)
+                v_first = None
                 for blk in self.blocks:
                     h_norm = blk['norm1'](h)
-                    rwkv_out = blk['rwkv'](h_norm)
+                    rwkv_out = blk['rwkv'](h_norm, v_first=v_first)
                     if isinstance(rwkv_out, tuple):
+                        # RWKV7Attention.forward returns (o, attn, past_kv, v_first)
+                        if len(rwkv_out) >= 4 and v_first is None:
+                            v_first = rwkv_out[3]
                         rwkv_out = rwkv_out[0]
                     h = h + rwkv_out
                     h = h + blk['mlp'](blk['norm2'](h))
