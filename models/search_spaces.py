@@ -1802,6 +1802,20 @@ SEARCH_SPACES: dict[str, dict] = {
     'epochs':         [20, 30, 50],
     'revin':          [True, False],
 },
+    'torch_rwkv7': {
+    'd_model':       [64, 128, 192, 256],
+    'num_layers':    [1, 2, 3],
+    'num_heads':     [2, 4, 8],
+    'head_dim':      [16, 32, 64],
+    'mlp_ratio':     [1.0, 2.0, 4.0],
+    'dropout':       [0.05, 0.10, 0.15, 0.20],
+    'lr':            (1e-4, 5e-3),
+    'weight_decay':  (1e-5, 1e-3),
+    'n_epochs':      [10, 20, 30],
+    'batch_size':    [256, 512, 1024],
+    'pos_weight':    [1.0, 1.2, 1.5],
+    'grad_clip':     [0.5, 1.0, 2.0],
+},
 }
 
 

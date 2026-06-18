@@ -20413,6 +20413,208 @@ class TorchModernTCNTrainer(BaseTrainer):
                 json.dump(extra, f, indent=2)
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+class TorchRWKV7Trainer(BaseTrainer):
+    name = 'torch_rwkv7'
+    consumes_sequences = True
+
+    def __init__(self,
+                 d_model=128,
+                 num_layers=2,
+                 num_heads=4,
+                 head_dim=32,
+                 mlp_ratio=2.0,
+                 dropout=0.10,
+                 lr=5e-4,
+                 weight_decay=1e-4,
+                 n_epochs=20,
+                 batch_size=512,
+                 pos_weight=1.5,
+                 grad_clip=1.0,
+                 seed=42):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.num_layers = int(num_layers)
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        self.mlp_ratio = float(mlp_ratio)
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.n_epochs = int(n_epochs)
+        self.batch_size = int(batch_size)
+        self.pos_weight = float(pos_weight)
+        self.grad_clip = float(grad_clip)
+        self.seed = int(seed)
+        self.model = None
+        self.feature_dim = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def _build_model(self, feature_dim):
+        from fla.layers import RWKV7Attention
+        d_model = self.d_model
+        hidden_mlp = int(d_model * self.mlp_ratio)
+
+        proj_in = nn.Linear(feature_dim, d_model)
+        blocks = nn.ModuleList()
+        for _ in range(self.num_layers):
+            blocks.append(nn.ModuleDict({
+                'norm1': nn.LayerNorm(d_model),
+                'rwkv': RWKV7Attention(
+                    hidden_size=d_model,
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                ),
+                'norm2': nn.LayerNorm(d_model),
+                'mlp': nn.Sequential(
+                    nn.Linear(d_model, hidden_mlp),
+                    nn.GELU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(hidden_mlp, d_model),
+                    nn.Dropout(self.dropout),
+                ),
+            }))
+        head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 1),
+        )
+
+        class _RWKV7Net(nn.Module):
+            def __init__(self, proj_in, blocks, head):
+                super().__init__()
+                self.proj_in = proj_in
+                self.blocks = blocks
+                self.head = head
+
+            def forward(self, x):
+                if x.dim() == 2:
+                    x = x.unsqueeze(1)
+                h = self.proj_in(x)
+                for blk in self.blocks:
+                    h_norm = blk['norm1'](h)
+                    rwkv_out = blk['rwkv'](h_norm)
+                    if isinstance(rwkv_out, tuple):
+                        rwkv_out = rwkv_out[0]
+                    h = h + rwkv_out
+                    h = h + blk['mlp'](blk['norm2'](h))
+                pooled = h.mean(dim=1)
+                logits = self.head(pooled).squeeze(-1)
+                return logits
+
+        return _RWKV7Net(proj_in, blocks, head)
+
+    def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        X_tr = np.asarray(X_tr, dtype=np.float32)
+        y_tr = np.asarray(y_tr, dtype=np.float32)
+        if X_tr.ndim == 2:
+            X_tr = X_tr.reshape(-1, 1, X_tr.shape[-1])
+        if X_val is not None:
+            X_val = np.asarray(X_val, dtype=np.float32)
+            if X_val.ndim == 2:
+                X_val = X_val.reshape(-1, 1, X_val.shape[-1])
+            y_val = np.asarray(y_val, dtype=np.float32)
+
+        N, L, F = X_tr.shape
+        self.feature_dim = F
+        self.model = self._build_model(F).to(self.device)
+
+        X_t = torch.from_numpy(X_tr)
+        y_t = torch.from_numpy(y_tr)
+        opt = optim.AdamW(self.model.parameters(),
+                          lr=self.lr,
+                          weight_decay=self.weight_decay)
+        pos_w = torch.tensor([self.pos_weight], device=self.device, dtype=torch.float32)
+        crit = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+
+        best_val = float('inf')
+        best_state = None
+        n_batches = max(1, (N + self.batch_size - 1) // self.batch_size)
+
+        for epoch in range(self.n_epochs):
+            self.model.train()
+            perm = torch.randperm(N)
+            for b in range(n_batches):
+                idx = perm[b * self.batch_size:(b + 1) * self.batch_size]
+                if idx.numel() == 0:
+                    continue
+                xb = X_t[idx].to(self.device)
+                yb = y_t[idx].to(self.device)
+                opt.zero_grad()
+                logits = self.model(xb)
+                loss = crit(logits, yb)
+                loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                opt.step()
+
+            if X_val is not None and y_val is not None and len(X_val) > 0:
+                self.model.eval()
+                with torch.no_grad():
+                    Xv = torch.from_numpy(X_val).to(self.device)
+                    vlogits = self.model(Xv).detach().cpu()
+                    vloss = crit(vlogits.to(self.device),
+                                 torch.from_numpy(y_val).to(self.device)).item()
+                if vloss < best_val:
+                    best_val = vloss
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self.model.state_dict().items()}
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X):
+        if self.model is None:
+            raise RuntimeError('TorchRWKV7Trainer.predict_proba called before fit()')
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 2:
+            X = X.reshape(-1, 1, X.shape[-1])
+        self.model.eval()
+        with torch.no_grad():
+            X_t = torch.from_numpy(X).to(self.device)
+            logits = self.model(X_t).detach().cpu()
+            probs = torch.sigmoid(logits).numpy()
+        return probs.astype(np.float32).reshape(-1)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(),
+                       os.path.join(model_dir, 'rwkv7.pt'))
+        meta = {
+            'd_model': self.d_model,
+            'num_layers': self.num_layers,
+            'num_heads': self.num_heads,
+            'head_dim': self.head_dim,
+            'mlp_ratio': self.mlp_ratio,
+            'dropout': self.dropout,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            'n_epochs': self.n_epochs,
+            'batch_size': self.batch_size,
+            'pos_weight': self.pos_weight,
+            'grad_clip': self.grad_clip,
+            'seed': self.seed,
+            'feature_dim': self.feature_dim,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'rwkv7_meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+        return model_dir
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -20501,6 +20703,7 @@ TRAINERS = {
 'torch_card_classifier': TorchCardClassifierTrainer,
     'esn_classifier': EchoStateClassifierTrainer,
     'torch_moderntcn': TorchModernTCNTrainer,
+    'torch_rwkv7': TorchRWKV7Trainer,
 }
 
 
