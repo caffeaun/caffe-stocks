@@ -6,7 +6,7 @@
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Pivot from torch_rwkv7 (Modal-blocked, train_mode can't sweep it either) to torch_card_classifier \u2014 last claude iter #2851 hit FIRST CARD wp=1/7 with W6 thr=0.6 ann=+440%/WR 52.2%/DD 6.9% (4x amplified from #2849). CPU-feasible ~3min/split; per [[card-inference-nudge]] pin (n_samples=10, inference_stride=5) and sweep n_timesteps/hidden/epochs (do NOT sweep pos_weight per [[card-first-shot-w6-w7-jackpot]]). Highest-EV current CPU lane while Modal is blocked.",
-  "claude_iter_id": 2855,
-  "designated_at": "2026-06-19T12:10:54"
+  "rationale": "Keep prior active_case forward \u2014 torch_rwkv7 is dead until Modal billing clears (NotFoundError, train_mode cannot sweep it either). torch_card_classifier is the strongest CPU-feasible base while Modal is blocked: FIRST CARD wp=1/7 at iter #2851 with W6 thr=0.6 ann=+440%/WR 52.2%/DD 6.9% (per [[card-inference-nudge-w6-jackpot]]); pin (n_samples=10, inference_stride=5) and sweep n_timesteps/hidden/epochs (do NOT sweep pos_weight per [[card-first-shot-w6-w7-jackpot]] and [[card-bear-dd-not-class-imbalance]] lesson #2850).",
+  "claude_iter_id": 2856,
+  "designated_at": "2026-06-19T18:04:56"
 }
