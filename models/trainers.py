@@ -20707,6 +20707,253 @@ class TorchRWKV7Trainer(BaseTrainer):
         return model_dir
 
 
+# models/trainers.py — append at end (before TRAINERS dict)
+import math
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _InceptionBlockV1(nn.Module):
+    """Multi-kernel 2D inception block used inside TimesBlock."""
+    def __init__(self, in_ch, out_ch, num_kernels=6):
+        super().__init__()
+        self.kernels = nn.ModuleList([
+            nn.Conv2d(in_ch, out_ch, kernel_size=2 * i + 1, padding=i)
+            for i in range(num_kernels)
+        ])
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return sum(k(x) for k in self.kernels) / len(self.kernels)
+
+
+def _fft_for_period(x, k):
+    """FFT period detection. Returns list of int periods + per-period amplitude weights (B, k)."""
+    L = x.shape[1]
+    xf = torch.fft.rfft(x, dim=1)
+    freqs = xf.abs().mean(0).mean(-1)
+    freqs[0] = 0.0
+    k_eff = min(k, max(1, freqs.shape[0] - 1))
+    _, top_idx = torch.topk(freqs, k_eff)
+    periods = (L // top_idx.clamp(min=1)).clamp(min=1).detach().cpu().numpy().tolist()
+    weights = xf.abs().mean(-1)[:, top_idx]
+    return periods, weights
+
+
+class _TimesBlock(nn.Module):
+    def __init__(self, d_model, d_ff, num_kernels, top_k):
+        super().__init__()
+        self.top_k = top_k
+        self.conv = nn.Sequential(
+            _InceptionBlockV1(d_model, d_ff, num_kernels),
+            nn.GELU(),
+            _InceptionBlockV1(d_ff, d_model, num_kernels),
+        )
+
+    def forward(self, x):
+        B, L, N = x.shape
+        periods, weights = _fft_for_period(x, self.top_k)
+        outs = []
+        for p in periods:
+            p = max(int(p), 1)
+            if L % p != 0:
+                pad_len = ((L // p) + 1) * p - L
+                pad = x.new_zeros(B, pad_len, N)
+                x_pad = torch.cat([x, pad], dim=1)
+                length = L + pad_len
+            else:
+                x_pad = x
+                length = L
+            out = x_pad.reshape(B, length // p, p, N).permute(0, 3, 1, 2).contiguous()
+            out = self.conv(out)
+            out = out.permute(0, 2, 3, 1).reshape(B, length, N)[:, :L, :]
+            outs.append(out)
+        stacked = torch.stack(outs, dim=-1)
+        soft = F.softmax(weights, dim=1)
+        soft = soft.unsqueeze(1).unsqueeze(1).expand(-1, L, N, -1)
+        return (stacked * soft).sum(-1) + x
+
+
+class _TimesNetClassifier(nn.Module):
+    def __init__(self, seq_len, in_ch, d_model=64, d_ff=64,
+                 e_layers=2, num_kernels=6, top_k=3, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Linear(in_ch, d_model)
+        self.blocks = nn.ModuleList([
+            _TimesBlock(d_model, d_ff, num_kernels, top_k)
+            for _ in range(e_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Linear(d_model * seq_len, 1)
+
+    def forward(self, x):
+        h = self.embed(x)
+        for blk in self.blocks:
+            h = self.norm(blk(h))
+        h = self.drop(F.gelu(h))
+        h = h.reshape(h.shape[0], -1)
+        return self.head(h).squeeze(-1)
+
+
+class TorchTimesNetTrainer(BaseTrainer):
+    name = 'torch_timesnet'
+    consumes_sequences = True
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.seq_len_target = int(kwargs.get('seq_len', 20))
+        self.d_model = int(kwargs.get('d_model', 64))
+        self.d_ff = int(kwargs.get('d_ff', 64))
+        self.e_layers = int(kwargs.get('e_layers', 2))
+        self.num_kernels = int(kwargs.get('num_kernels', 6))
+        self.top_k = int(kwargs.get('top_k', 3))
+        self.dropout = float(kwargs.get('dropout', 0.1))
+        self.lr = float(kwargs.get('lr', 1e-3))
+        self.weight_decay = float(kwargs.get('weight_decay', 1e-4))
+        self.epochs = int(kwargs.get('epochs', 30))
+        self.batch_size = int(kwargs.get('batch_size', 256))
+        self.pos_weight = float(kwargs.get('pos_weight', 1.0))
+        self.early_stopping_patience = int(kwargs.get('early_stopping_patience', 5))
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.scaler_mean = None
+        self.scaler_std = None
+        self.seq_len_actual = None
+        self.in_ch = None
+
+    def _to_sequence(self, X):
+        X = np.asarray(X)
+        if X.ndim == 3:
+            return X.astype(np.float32, copy=False)
+        if X.ndim == 2:
+            n, f = X.shape
+            L = max(1, min(self.seq_len_target, f))
+            for cand in range(L, 0, -1):
+                if f % cand == 0:
+                    L = cand
+                    break
+            c = f // L
+            return X.reshape(n, L, c).astype(np.float32, copy=False)
+        raise ValueError(f"Unsupported X shape: {X.shape}")
+
+    def _standardize_fit(self, X3d):
+        flat = X3d.reshape(-1, X3d.shape[-1])
+        self.scaler_mean = flat.mean(0).astype(np.float32)
+        self.scaler_std = (flat.std(0) + 1e-6).astype(np.float32)
+
+    def _standardize(self, X3d):
+        return (X3d - self.scaler_mean) / self.scaler_std
+
+    def fit(self, X_tr, y_tr, X_val, y_val, **kwargs):
+        Xs_tr = self._to_sequence(X_tr)
+        Xs_val = self._to_sequence(X_val)
+        self._standardize_fit(Xs_tr)
+        Xs_tr = self._standardize(Xs_tr)
+        Xs_val = self._standardize(Xs_val)
+        _, L, C = Xs_tr.shape
+        self.seq_len_actual = L
+        self.in_ch = C
+
+        eff_top_k = max(1, min(self.top_k, L // 2 if L >= 2 else 1))
+        self.model = _TimesNetClassifier(
+            seq_len=L, in_ch=C,
+            d_model=self.d_model, d_ff=self.d_ff,
+            e_layers=self.e_layers, num_kernels=self.num_kernels,
+            top_k=eff_top_k, dropout=self.dropout,
+        ).to(self.device)
+
+        opt = torch.optim.AdamW(self.model.parameters(),
+                                lr=self.lr, weight_decay=self.weight_decay)
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(self.pos_weight, device=self.device)
+        )
+
+        y_tr_arr = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        y_val_arr = np.asarray(y_val, dtype=np.float32).reshape(-1)
+        Xs_tr_t = torch.from_numpy(Xs_tr).to(self.device)
+        y_tr_t = torch.from_numpy(y_tr_arr).to(self.device)
+        Xs_val_t = torch.from_numpy(Xs_val).to(self.device)
+        y_val_t = torch.from_numpy(y_val_arr).to(self.device)
+
+        best_val = float('inf')
+        best_state = None
+        patience = 0
+        n_tr = Xs_tr_t.shape[0]
+        for epoch in range(self.epochs):
+            self.model.train()
+            perm = torch.randperm(n_tr, device=self.device)
+            for i in range(0, n_tr, self.batch_size):
+                idx = perm[i:i + self.batch_size]
+                logits = self.model(Xs_tr_t[idx])
+                loss = loss_fn(logits, y_tr_t[idx])
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                opt.step()
+            self.model.eval()
+            with torch.no_grad():
+                val_chunks = []
+                for j in range(0, Xs_val_t.shape[0], self.batch_size):
+                    val_chunks.append(self.model(Xs_val_t[j:j + self.batch_size]))
+                val_logits = torch.cat(val_chunks, dim=0)
+                val_loss = loss_fn(val_logits, y_val_t).item()
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+                patience = 0
+            else:
+                patience += 1
+                if patience >= self.early_stopping_patience:
+                    break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X):
+        Xs = self._to_sequence(X)
+        Xs = self._standardize(Xs)
+        Xs_t = torch.from_numpy(Xs).to(self.device)
+        self.model.eval()
+        out_chunks = []
+        with torch.no_grad():
+            for i in range(0, Xs_t.shape[0], self.batch_size):
+                logits = self.model(Xs_t[i:i + self.batch_size])
+                out_chunks.append(torch.sigmoid(logits).cpu().numpy())
+        return np.concatenate(out_chunks, axis=0).astype(np.float32)
+
+    def save(self, model_dir, extra=None):
+        os.makedirs(model_dir, exist_ok=True)
+        if self.model is not None:
+            torch.save(self.model.state_dict(), os.path.join(model_dir, 'timesnet.pt'))
+        meta = {
+            'name': self.name,
+            'seq_len': self.seq_len_actual,
+            'in_ch': self.in_ch,
+            'd_model': self.d_model,
+            'd_ff': self.d_ff,
+            'e_layers': self.e_layers,
+            'num_kernels': self.num_kernels,
+            'top_k': self.top_k,
+            'dropout': self.dropout,
+            'pos_weight': self.pos_weight,
+            'scaler_mean': self.scaler_mean.tolist() if self.scaler_mean is not None else None,
+            'scaler_std': self.scaler_std.tolist() if self.scaler_std is not None else None,
+        }
+        if extra:
+            meta.update(extra)
+        with open(os.path.join(model_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+
 TRAINERS = {
     'lightgbm': LightGBMTrainer,
     'lightgbm_regressor': LightGBMRegressorTrainer,
@@ -20796,6 +21043,7 @@ TRAINERS = {
     'esn_classifier': EchoStateClassifierTrainer,
     'torch_moderntcn': TorchModernTCNTrainer,
     'torch_rwkv7': TorchRWKV7Trainer,
+    'torch_timesnet': TorchTimesNetTrainer,
 }
 
 

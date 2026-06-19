@@ -1816,6 +1816,19 @@ SEARCH_SPACES: dict[str, dict] = {
     'pos_weight':    [1.0, 1.2, 1.5],
     'grad_clip':     [0.5, 1.0, 2.0],
 },
+    'torch_timesnet': {
+    'd_model':        [32, 64, 96, 128],
+    'd_ff':           [32, 64, 96, 128],
+    'e_layers':       [1, 2, 3],
+    'top_k':          [2, 3, 5],
+    'num_kernels':    [4, 6, 8],
+    'dropout':        (0.05, 0.30),
+    'lr':             (5e-4, 5e-3),
+    'weight_decay':   (1e-5, 1e-3),
+    'epochs':         [20, 30, 40],
+    'pos_weight':     (1.0, 1.8),
+    'seq_len':        [16, 20, 24],
+},
 }
 
 
