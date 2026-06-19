@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_moderntcn",
+  "trainer": "torch_card_classifier",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep iter #2853's case \u2014 ModernTCN's W2 thr=0.0 PASS (50% WR, +7.1% ann) and W1 alive thr=0.6 (+17.5% ann, 10pp shy of regime floor) is the freshest sweepable signal in the registry; HP sweep should focus pos_weight / dropout / learning_rate around the iter #2853 lean pin (num_blocks=1, dims=32, epochs=15, batch=512) per its lesson.",
-  "claude_iter_id": 2854,
-  "designated_at": "2026-06-19T06:08:59"
+  "rationale": "Pivot from torch_rwkv7 (Modal-blocked, train_mode can't sweep it either) to torch_card_classifier \u2014 last claude iter #2851 hit FIRST CARD wp=1/7 with W6 thr=0.6 ann=+440%/WR 52.2%/DD 6.9% (4x amplified from #2849). CPU-feasible ~3min/split; per [[card-inference-nudge]] pin (n_samples=10, inference_stride=5) and sweep n_timesteps/hidden/epochs (do NOT sweep pos_weight per [[card-first-shot-w6-w7-jackpot]]). Highest-EV current CPU lane while Modal is blocked.",
+  "claude_iter_id": 2855,
+  "designated_at": "2026-06-19T12:10:54"
 }

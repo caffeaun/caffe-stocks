@@ -20440,7 +20440,9 @@ class TorchRWKV7Trainer(BaseTrainer):
                  batch_size=512,
                  pos_weight=1.5,
                  grad_clip=1.0,
-                 seed=42):
+                 seed=42,
+                 use_modal=True,
+                 modal_gpu='A100-40GB'):
         super().__init__()
         self.d_model = int(d_model)
         self.num_layers = int(num_layers)
@@ -20458,6 +20460,18 @@ class TorchRWKV7Trainer(BaseTrainer):
         self.model = None
         self.feature_dim = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # fla's RWKV7Attention is Triton-only; local CPU path dies on
+        # token_shift's Triton kernel (iter #2854). Route through Modal A100
+        # mirroring torch_scarf. ML_FORCE_MODAL=1 (set in claude_mode) also
+        # forces the Modal path even if a caller passes use_modal=False.
+        self.use_modal = bool(use_modal) or bool(int(
+            os.environ.get('ML_FORCE_MODAL', '0') or '0'
+        ))
+        self.modal_gpu = str(modal_gpu)
+        self._modal_X_tr = None
+        self._modal_y_tr = None
+        self._modal_X_val = None
+        self._modal_y_val = None
 
     def _build_model(self, feature_dim):
         from fla.layers import RWKV7Attention
@@ -20520,7 +20534,75 @@ class TorchRWKV7Trainer(BaseTrainer):
 
         return _RWKV7Net(proj_in, blocks, head)
 
+    def _modal_hp(self) -> dict:
+        return {
+            'd_model': self.d_model,
+            'num_layers': self.num_layers,
+            'num_heads': self.num_heads,
+            'head_dim': self.head_dim,
+            'mlp_ratio': self.mlp_ratio,
+            'dropout': self.dropout,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            'n_epochs': self.n_epochs,
+            'batch_size': self.batch_size,
+            'pos_weight': self.pos_weight,
+            'grad_clip': self.grad_clip,
+        }
+
+    def _predict_via_modal(self, X) -> np.ndarray:
+        import time
+        import modal
+        from scripts.modal_budget import check_budget, record_call
+        # Pre-flight budget check: 240 s covers a single 7-fold gate at default
+        # HPs (d_model=128, num_layers=2, n_epochs=20, batch=512) — fla's WKV
+        # path is fast on A100.
+        check_budget(estimated_duration_s=240.0, gpu=self.modal_gpu)
+        fn = modal.Function.from_name('caffe-stocks-modal',
+                                      'train_predict_rwkv7')
+        t0 = time.monotonic()
+        try:
+            proba = fn.remote(
+                self._modal_X_tr, self._modal_y_tr,
+                self._modal_X_val, self._modal_y_val,
+                np.asarray(X, dtype=np.float32),
+                self._modal_hp(),
+                self.seed,
+            )
+            duration = time.monotonic() - t0
+            record_call(
+                trainer=self.name, duration_s=duration, gpu=self.modal_gpu,
+                status='ok',
+            )
+        except Exception:
+            duration = time.monotonic() - t0
+            record_call(
+                trainer=self.name, duration_s=duration, gpu=self.modal_gpu,
+                status='error',
+            )
+            raise
+        return np.asarray(proba, dtype=np.float32).ravel()
+
     def fit(self, X_tr, y_tr, X_val=None, y_val=None, **kwargs):
+        if self.use_modal:
+            self._modal_X_tr = np.asarray(X_tr, dtype=np.float32)
+            self._modal_y_tr = np.asarray(y_tr, dtype=np.float32).ravel()
+            if X_val is not None and y_val is not None:
+                self._modal_X_val = np.asarray(X_val, dtype=np.float32)
+                self._modal_y_val = np.asarray(y_val, dtype=np.float32).ravel()
+            else:
+                self._modal_X_val = None
+                self._modal_y_val = None
+            if self._modal_X_tr.ndim == 2:
+                self._modal_X_tr = self._modal_X_tr.reshape(
+                    -1, 1, self._modal_X_tr.shape[-1])
+            if self._modal_X_val is not None and self._modal_X_val.ndim == 2:
+                self._modal_X_val = self._modal_X_val.reshape(
+                    -1, 1, self._modal_X_val.shape[-1])
+            self.feature_dim = self._modal_X_tr.shape[-1]
+            self.device = f'modal:{self.modal_gpu}'
+            return self
+
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         X_tr = np.asarray(X_tr, dtype=np.float32)
@@ -20583,6 +20665,8 @@ class TorchRWKV7Trainer(BaseTrainer):
         return self
 
     def predict_proba(self, X):
+        if self.use_modal:
+            return self._predict_via_modal(X)
         if self.model is None:
             raise RuntimeError('TorchRWKV7Trainer.predict_proba called before fit()')
         X = np.asarray(X, dtype=np.float32)
