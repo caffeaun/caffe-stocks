@@ -20808,21 +20808,24 @@ class TorchTimesNetTrainer(BaseTrainer):
     name = 'torch_timesnet'
     consumes_sequences = True
 
-    def __init__(self, **kwargs):
+    def __init__(self, seq_len=20, d_model=64, d_ff=64, e_layers=2,
+                 num_kernels=6, top_k=3, dropout=0.1, lr=1e-3,
+                 weight_decay=1e-4, epochs=30, batch_size=256,
+                 pos_weight=1.0, early_stopping_patience=5, **kwargs):
         super().__init__()
-        self.seq_len_target = int(kwargs.get('seq_len', 20))
-        self.d_model = int(kwargs.get('d_model', 64))
-        self.d_ff = int(kwargs.get('d_ff', 64))
-        self.e_layers = int(kwargs.get('e_layers', 2))
-        self.num_kernels = int(kwargs.get('num_kernels', 6))
-        self.top_k = int(kwargs.get('top_k', 3))
-        self.dropout = float(kwargs.get('dropout', 0.1))
-        self.lr = float(kwargs.get('lr', 1e-3))
-        self.weight_decay = float(kwargs.get('weight_decay', 1e-4))
-        self.epochs = int(kwargs.get('epochs', 30))
-        self.batch_size = int(kwargs.get('batch_size', 256))
-        self.pos_weight = float(kwargs.get('pos_weight', 1.0))
-        self.early_stopping_patience = int(kwargs.get('early_stopping_patience', 5))
+        self.seq_len_target = int(seq_len)
+        self.d_model = int(d_model)
+        self.d_ff = int(d_ff)
+        self.e_layers = int(e_layers)
+        self.num_kernels = int(num_kernels)
+        self.top_k = int(top_k)
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.pos_weight = float(pos_weight)
+        self.early_stopping_patience = int(early_stopping_patience)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.scaler_mean = None

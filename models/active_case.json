@@ -1,12 +1,12 @@
 {
-  "trainer": "torch_card_classifier",
+  "trainer": "torch_timesnet",
   "feature_set": "default",
   "dataset": {
     "seq_len": 20,
     "lookahead": 10,
     "label": "v1"
   },
-  "rationale": "Keep prior active_case forward \u2014 torch_rwkv7 is dead until Modal billing clears (NotFoundError, train_mode cannot sweep it either). torch_card_classifier is the strongest CPU-feasible base while Modal is blocked: FIRST CARD wp=1/7 at iter #2851 with W6 thr=0.6 ann=+440%/WR 52.2%/DD 6.9% (per [[card-inference-nudge-w6-jackpot]]); pin (n_samples=10, inference_stride=5) and sweep n_timesteps/hidden/epochs (do NOT sweep pos_weight per [[card-first-shot-w6-w7-jackpot]] and [[card-bear-dd-not-class-imbalance]] lesson #2850).",
-  "claude_iter_id": 2856,
-  "designated_at": "2026-06-19T18:04:56"
+  "rationale": "First-shot first-shot 0/7 wp with avg_ann -13.2% but two live signals: W1 alive thr-sweep (thr=0.6 n=22 +9.4% ann 8.6% DD) and W6 +40.6% magnitude jackpot (thr=0.0); brief's structural inductive bias (FFT-period 2D-conv) confirmed; sweep epochs\u2191, dropout\u2191, pos_weight\u2193 to address score-collapse on 6/7 windows.",
+  "claude_iter_id": 2858,
+  "designated_at": "2026-06-20T12:29:06"
 }
