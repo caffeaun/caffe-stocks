@@ -120,18 +120,46 @@ def set_status(trainer: str, status: str, *, remaining_configs: int | None = Non
 def decrement(trainer: str, path: str | None = None) -> Optional[dict]:
     """Count one executed Modal config down for `trainer`'s approved job.
 
-    Flips status to ``done`` when it hits zero. Returns the updated entry,
+    Flips status to ``done`` when it hits zero, and clears the failure
+    counter (a success means the job is healthy). Returns the updated entry,
     or None if no approved job for that trainer was found."""
     reqs = load(path)
     for e in reqs:
         if e['trainer'] == trainer and e.get('status') == 'approved':
             remaining = int(e.get('remaining_configs') or 0) - 1
             e['remaining_configs'] = max(0, remaining)
+            e['consecutive_failures'] = 0
             if remaining <= 0:
                 e['status'] = 'done'
             save(reqs, path)
             return e
     return None
+
+
+def note_failure(trainer: str, error: str = '', threshold: int = 2,
+                 path: str | None = None) -> bool:
+    """Record a failed execution of `trainer`'s approved Modal job.
+
+    A job that can't run (e.g. Modal prepaid balance exhausted →
+    ResourceExhaustedError) must NOT keep preempting the local rotation every
+    fire. After `threshold` consecutive failures the job is flipped to
+    ``held`` (paused): next_approved_job ignores it, the morning ping skips it
+    (held ∉ ACTIVE_STATUSES), and train_mode falls through to the schedule.
+    Re-approve (status→'approved') once the cause is fixed. Returns True iff
+    the job was just held."""
+    reqs = load(path)
+    for e in reqs:
+        if e['trainer'] == trainer and e.get('status') == 'approved':
+            e['consecutive_failures'] = int(e.get('consecutive_failures') or 0) + 1
+            if error:
+                e['last_error'] = error[:300]
+            if e['consecutive_failures'] >= threshold:
+                e['status'] = 'held'
+                save(reqs, path)
+                return True
+            save(reqs, path)
+            return False
+    return False
 
 
 if __name__ == '__main__':  # tiny inspector

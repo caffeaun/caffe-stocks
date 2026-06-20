@@ -195,6 +195,15 @@ def main():
                     agg_features, verbose=args.verbose, X_seq=X)
             except Exception as e:
                 print(f'  ✗ failed: {e!r}')
+                # A failing approved Modal job (e.g. Modal prepaid balance
+                # exhausted → ResourceExhaustedError) must not jam the rotation
+                # by retrying every fire. Pause it after repeated failures so
+                # the next fire falls through to the schedule.
+                if modal_job is not None:
+                    held = modal_requests.note_failure(args.trainer, error=str(e))
+                    if held:
+                        print(f'  → modal request {args.trainer}: PAUSED (status=held) '
+                              f'after repeated failures — rotation resumes next fire')
                 continue
 
             wp = gate_result['windows_passed']
