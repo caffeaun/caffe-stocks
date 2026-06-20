@@ -107,6 +107,18 @@ fi
 # requests to Telegram with a cost estimate (see scripts/modal_request_ping.py
 # + models/modal_requests.json). Self-contained: sends its own Telegram asks
 # and never touches a GPU. Non-fatal.
+# Train-sweep staleness alert — pings Telegram if the hourly train_mode
+# rotation hasn't recorded an iteration in ~24h (a jammed/crashed sweep
+# records nothing). Catches stalls like the Jun-2026 Modal-job jam on day one.
+log "Checking train_mode staleness"
+set +e
+STALE_MSG=$("$PYTHON" "$HOME/projects/caffe-stocks/scripts/train_staleness_check.py" 2>/dev/null)
+set -e
+if [ -n "$STALE_MSG" ]; then
+    log "STALE: $STALE_MSG"
+    send_telegram "$STALE_MSG"
+fi
+
 log "Modal request ping"
 # Modal's workspace-level spend cap (independent of our modal_budget tracker;
 # the cap value isn't exposed by Modal's API). Set here so the ping shows a
